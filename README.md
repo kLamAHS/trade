@@ -51,8 +51,11 @@ the spec-mandated `trading_bot/logging` package must never shadow the standard l
 * Data: `alpaca-py` `StockHistoricalDataClient`, 30-minute bars, `feed: iex` by default
   (`alpaca.feed: sip` if your subscription allows), split/dividend adjusted, restricted to
   regular-session bars (09:30-16:00 America/New_York). No synthetic bars are ever created.
-* Live loop: polls for newly *completed* bars every `alpaca.poll_seconds`, attaches the
-  latest NBBO quote as `bid/ask`, feeds the bot, and flags a stale feed as `DATA_HALTED`.
+* Start-up: history is bootstrapped into the store without simulated trading, one training cycle
+  runs, and the bot goes live on the next completed bar.
+* Live loop: polls for newly *completed* bars every `alpaca.poll_seconds` (the forming bar is never
+  emitted), attaches the latest NBBO quote with its timestamp as `bid/ask`, feeds the bot, and flags
+  a stale feed (no bar for `data.stale_feed_bars` intervals inside a session) as `DATA_HALTED`.
 * Orders: the internal simulator (spec fill model) is the ledger's source of truth. With
   `alpaca.mirror_orders: true` (default) each exposure change is also submitted as a
   market order to the **paper** account; when Alpaca reports a fill, its average price
@@ -116,8 +119,21 @@ artifacts/
   curvature features, sections 10-11).
 * **EWMA variance** uses a finite kernel of 450 bars (`lambda^450 ~ 1e-12`) so streaming and batch
   values are bit-identical.
-* **Calibration** is fitted only on out-of-fold validation predictions (leave-one-fold-out for
-  fold metrics, pooled for the production model); `A = 0` always maps to `E = 0`.
+* **Calibration** is strictly chronological: fold *k*'s calibrator is fitted on out-of-sample
+  predictions that end before its validation window (earlier folds' validation predictions plus an
+  inner chronological split of fold 1's training block); the production calibrator uses all pooled
+  out-of-fold predictions. `A = 0` always maps to `E = 0`.
+* **Adaptive order `d*`** is estimated once per retraining cycle on the whole training window before
+  the folds are carved out, exactly as the section 58 pseudo-code prescribes (a single scalar with
+  negligible leakage capacity); the leakage test checks it depends only on that window.
+* **Sessions.** Early-close days (NYSE rules plus `market.early_closes`) have a 13:00 close: the time
+  features use that day's session length and the validator does not flag the short session as a gap.
+* **Live quotes.** In paper mode the NBBO quote attached to a completed bar carries its own timestamp;
+  the FeatureVector's `latest_source_timestamp` is the newest source time and the feature timestamp
+  is never earlier than it, so the section 3 guard is checked against real source times.
+* **Alpaca history** is split-adjusted only (`alpaca.adjustment: split`); dividend adjustment would
+  rescale history with information known only after each ex-dividend date and splice badly onto
+  live bars. Only bars that have closed (plus a completion grace) are ever emitted.
 * **Walk-forward** folds follow the section 38 example literally: fold k trains on the earliest
   `40 + 10(k-1)` % and validates the following 10 % after a 5-bar purge and 5-bar embargo.
 * **Score** (section 41) = `Sharpe_net - 0.25 x (mean |dQ| x bars/day) - 0.25 x (maxDD / 10 %)`.

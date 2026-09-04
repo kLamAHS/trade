@@ -49,6 +49,10 @@ class SignalEngine:
         for s in sigmas:
             self.observe_sigma(float(s))
 
+    @property
+    def has_history(self) -> bool:
+        return len(self._sigma_history) > 0
+
     def reference_volatility(self) -> float:
         if not self._sigma_history:
             return math.nan

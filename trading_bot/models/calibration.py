@@ -44,14 +44,18 @@ class Calibrator:
         else:
             qs = np.linspace(0, 1, self.bins + 1)
             edges = np.unique(np.quantile(A, qs))
+            if len(edges) < 3:
+                edges = np.array([A.min(), np.median(A), A.max()])
+                edges = np.unique(edges)
             idx = np.clip(np.searchsorted(edges, A, side="right") - 1, 0, len(edges) - 2)
-            levels = np.array([y[idx == i].mean() if np.any(idx == i) else np.nan for i in range(len(edges) - 1)])
-            # forward-fill NaNs then enforce monotonicity via cumulative max
-            for i in range(len(levels)):
-                if np.isnan(levels[i]):
-                    levels[i] = levels[i - 1] if i > 0 else 0.0
-            levels = np.maximum.accumulate(levels)
-            self._edges, self._levels = edges, levels
+            counts = np.array([np.sum(idx == i) for i in range(len(edges) - 1)], dtype=float)
+            means = np.array([y[idx == i].mean() if counts[i] > 0 else 0.0 for i in range(len(edges) - 1)])
+            centres = 0.5 * (edges[:-1] + edges[1:])
+            # Pool-adjacent-violators on the (count-weighted) bin means: the monotone least-squares fit,
+            # which lowers or raises bins as needed instead of only lifting them.
+            pav = IsotonicRegression(increasing=True, out_of_bounds="clip")
+            pav.fit(centres, means, sample_weight=np.maximum(counts, 1e-9))
+            self._edges, self._levels = edges, pav.predict(centres)
         return self
 
     def predict(self, A: np.ndarray) -> np.ndarray:

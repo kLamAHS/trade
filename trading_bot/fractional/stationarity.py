@@ -102,12 +102,17 @@ class StationaryOrderEstimator:
             x = fd[valid]
             orig = p[valid]
             kernel = int(np.argmax(valid)) if valid.any() else len(p)
-            if len(x) < 50:
+            if len(x) < 50 or not np.isfinite(x).all() or np.std(x) == 0:
                 results.append(CandidateResult(d, math.nan, math.nan, math.nan, math.nan, math.nan, len(x), kernel))
                 continue
-            adf_stat, adf_p = _adf(x, self.adf_maxlag)
-            kpss_stat, kpss_p = _kpss(x)
-            corr = float(np.corrcoef(x, orig)[0, 1]) if np.std(x) > 0 and np.std(orig) > 0 else math.nan
+            try:
+                adf_stat, adf_p = _adf(x, self.adf_maxlag)
+                kpss_stat, kpss_p = _kpss(x)
+            except Exception:
+                # A failed test never guesses: the candidate is recorded as unusable (NaN statistics).
+                results.append(CandidateResult(d, math.nan, math.nan, math.nan, math.nan, math.nan, len(x), kernel))
+                continue
+            corr = float(np.corrcoef(x, orig)[0, 1]) if np.std(orig) > 0 else math.nan
             results.append(CandidateResult(d, adf_stat, adf_p, kpss_stat, kpss_p, corr, len(x), kernel))
         return results
 

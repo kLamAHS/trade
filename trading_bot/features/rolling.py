@@ -71,6 +71,7 @@ def rolling_corr_with_index(x: np.ndarray, n: int) -> np.ndarray:
     den = np.sqrt((w_c ** 2).sum(axis=1) * (idx_c ** 2).sum())
     with np.errstate(invalid="ignore", divide="ignore"):
         corr = np.where(den > 0, num / den, 0.0)
+    corr[np.isnan(w).any(axis=1)] = np.nan   # a window containing NaN is NaN, never "no trend"
     out[n - 1:] = corr
     return out
 

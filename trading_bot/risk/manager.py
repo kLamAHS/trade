@@ -20,7 +20,8 @@ from .limits import apply_position_rules, stop_triggered
 class RiskEngine:
     def __init__(self, max_absolute_exposure: float = 1.0, maximum_holding_bars: int = 12,
                  stop_sigma_multiple: float = 4.0, daily_loss_limit: float = 0.025, drawdown_halt: float = 0.10,
-                 rebalance_threshold: float = 0.15, horizon: int = 4, ablation_failures_to_halt: int = 3):
+                 rebalance_threshold: float = 0.15, horizon: int = 4, ablation_failures_to_halt: int = 3,
+                 halt_recovery_bars: int = 13):
         self.max_abs = float(max_absolute_exposure)
         self.max_holding = int(maximum_holding_bars)
         self.stop_multiple = float(stop_sigma_multiple)
@@ -29,6 +30,8 @@ class RiskEngine:
         self.rebalance_threshold = float(rebalance_threshold)
         self.horizon = int(horizon)
         self.ablation_failures_to_halt = int(ablation_failures_to_halt)
+        self.halt_recovery_bars = int(halt_recovery_bars)
+        self.clean_bars_since_halt = 0
         # halt state
         self.daily_halt_date: Optional[date] = None
         self.drawdown_halted = False
@@ -42,18 +45,32 @@ class RiskEngine:
         r = cfg.risk
         return cls(r.max_absolute_exposure, r.maximum_holding_bars, r.stop_sigma_multiple, r.daily_loss_limit,
                    r.drawdown_halt, cfg.signal.rebalance_threshold, cfg.prediction.horizon_bars,
-                   cfg.training.ablation.consecutive_failures_to_halt)
+                   cfg.training.ablation.consecutive_failures_to_halt, cfg.data.halt_recovery_bars)
 
     # ---------------------------------------------------------------- halts
     def _event(self, kind: str, **info) -> None:
         self.events.append({"event": kind, **info})
 
     def set_data_halt(self, halted: bool, reason: str = "") -> None:
-        if halted and not self.data_halted:
-            self._event("DATA_HALT", reason=reason)
-        elif not halted and self.data_halted:
-            self._event("DATA_HALT_CLEARED")
+        """Arm (or re-arm) / clear the data halt.  Every (re)arming restarts the recovery count."""
+        if halted:
+            if not self.data_halted:
+                self._event("DATA_HALT", reason=reason)
+            self.clean_bars_since_halt = 0
+        elif self.data_halted:
+            self._event("DATA_HALT_CLEARED", clean_bars=self.clean_bars_since_halt)
+            self.clean_bars_since_halt = 0
         self.data_halted = halted
+
+    def note_clean_bar(self) -> bool:
+        """Count a clean bar while halted; returns True when the halt clears (section 35 recovery)."""
+        if not self.data_halted:
+            return False
+        self.clean_bars_since_halt += 1
+        if self.clean_bars_since_halt >= self.halt_recovery_bars:
+            self.set_data_halt(False)
+            return True
+        return False
 
     def record_retrain(self, accepted: bool, delta_score: float) -> None:
         """Update drawdown / ablation halts after a retraining cycle (sections 34, 40)."""

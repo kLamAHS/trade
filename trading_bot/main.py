@@ -54,8 +54,9 @@ def build_config(args) -> FrozenConfig:
 
 
 def _load_bars(args, cfg):
+    """Raw bars in file order; ordering/integrity is left to the DataValidator (spec section 35)."""
     from .data.calendar import SessionCalendar
-    from .data.store import BarStore
+    from .data.store import read_bars_csv
     from .data.synthetic import generate_synthetic_bars
 
     cal = SessionCalendar.from_config(cfg)
@@ -63,8 +64,26 @@ def _load_bars(args, cfg):
         return generate_synthetic_bars(int(args.synthetic), seed=int(args.seed), instrument=cfg.market.instrument,
                                        calendar=cal, memory_d=float(args.memory_d), amplitude=float(args.amplitude))
     if getattr(args, "csv", None):
-        return list(BarStore.load(args.csv, cfg.market.instrument, int(cfg.market.bar_minutes)).bars)
+        return read_bars_csv(args.csv, cfg.market.instrument, int(cfg.market.bar_minutes))
     raise SystemExit("provide --csv PATH or --synthetic N")
+
+
+def _validated_store(cfg, bars):
+    """Run bars through the validator and keep the storable ones (for train/diagnose)."""
+    from .data.store import BarStore
+    from .data.validator import DataValidator
+
+    validator = DataValidator.from_config(cfg)
+    store = BarStore(cfg.market.instrument, int(cfg.market.bar_minutes))
+    rejected = 0
+    for b in bars:
+        if validator.validate(b).storable:
+            store.append(b)
+        else:
+            rejected += 1
+    if rejected:
+        print(f"validator rejected {rejected} bar(s)")
+    return store
 
 
 def cmd_backtest(args) -> int:
@@ -102,9 +121,10 @@ def cmd_download(args) -> int:
 
     cfg = build_config(args)
     cal = SessionCalendar.from_config(cfg)
-    feed = AlpacaBarFeed(cfg.market.instrument, cal, feed=cfg.alpaca.feed, bar_minutes=int(cfg.market.bar_minutes))
-    start = datetime.now(timezone.utc) - timedelta(days=int(args.days))
-    bars = feed.fetch_history(start, datetime.now(timezone.utc) - timedelta(minutes=16))
+    feed = AlpacaBarFeed(cfg.market.instrument, cal, feed=cfg.alpaca.feed, bar_minutes=int(cfg.market.bar_minutes),
+                         adjustment=str(cfg.alpaca.get("adjustment", "split")))
+    now = datetime.now(timezone.utc)
+    bars = feed.fetch_history(now - timedelta(days=int(args.days)), now)   # forming bar dropped by the feed
     store = BarStore(cfg.market.instrument, int(cfg.market.bar_minutes), bars)
     out = Path(args.out or f"{cfg.paths.data_dir}/{cfg.market.instrument}_{cfg.market.bar_minutes}m.csv")
     store.save(out)
@@ -123,12 +143,14 @@ def cmd_paper(args) -> int:
         broker = AlpacaPaperBroker(paper=bool(cfg.alpaca.paper), fill_timeout_seconds=int(cfg.alpaca.fill_timeout_seconds))
     bot = TradingBot(cfg, run_id=args.run_id, artifacts_dir=args.artifacts, broker=broker, log=print, async_retrain=True)
     feed = AlpacaBarFeed(cfg.market.instrument, bot.calendar, feed=cfg.alpaca.feed,
-                         bar_minutes=int(cfg.market.bar_minutes), poll_seconds=int(cfg.alpaca.poll_seconds))
+                         bar_minutes=int(cfg.market.bar_minutes), poll_seconds=int(cfg.alpaca.poll_seconds),
+                         adjustment=str(cfg.alpaca.get("adjustment", "split")))
     now = datetime.now(timezone.utc)
-    history = feed.fetch_history(now - timedelta(days=int(cfg.alpaca.history_days)), now - timedelta(minutes=1))
-    print(f"bootstrapping with {len(history)} historical bars")
-    for bar in history:
-        bot.on_bar(bar)
+    history = feed.fetch_history(now - timedelta(days=int(cfg.alpaca.history_days)), now)
+    print(f"bootstrapping with {len(history)} completed historical bars (no simulated trading)")
+    bot.bootstrap(history)
+    if len(bot.store):
+        feed.seed_last_timestamp(bot.store.last().timestamp)
     print(f"state={bot.state.value} model={bot.registry.current_version}; entering live loop (Ctrl-C to stop)")
     try:
         while True:
@@ -151,12 +173,11 @@ def cmd_paper(args) -> int:
 
 def cmd_train(args) -> int:
     from .bot import TradingBot
-    from .data.store import BarStore
 
     cfg = build_config(args)
     bars = _load_bars(args, cfg)
     bot = TradingBot(cfg, run_id=args.run_id, artifacts_dir=args.artifacts, log=print)
-    store = BarStore(cfg.market.instrument, int(cfg.market.bar_minutes), bars)
+    store = _validated_store(cfg, bars)
     report = bot.trainer.retrain(store, print)
     bot._apply_report(report)
     d = report.to_dict()
@@ -168,13 +189,12 @@ def cmd_train(args) -> int:
 
 def cmd_diagnose(args) -> int:
     from .bot import TradingBot
-    from .data.store import BarStore
     from .diagnostics.fractional_analysis import FractionalDiagnostics
 
     cfg = build_config(args)
     bars = _load_bars(args, cfg)
     bot = TradingBot(cfg, run_id=args.run_id, artifacts_dir=args.artifacts, log=print)
-    store = BarStore(cfg.market.instrument, int(cfg.market.bar_minutes), bars)
+    store = _validated_store(cfg, bars)
     window = store.last(bot.trainer.window_bars)
     stationarity = bot.fractional.estimate_stationarity(window.log_close())
     bot.diagnostics.record_stationarity(stationarity)

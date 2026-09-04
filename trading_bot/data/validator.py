@@ -139,14 +139,14 @@ class DataValidator:
         self._last = bar
 
     def is_stale(self, now: datetime) -> bool:
-        """Live-mode staleness: no new bar for more than ``stale_feed_bars`` intervals inside a session."""
-        if self._last is None:
+        """Live-mode staleness: inside a session, more than ``stale_feed_bars`` completed bar
+        intervals have elapsed since the later of the last bar close and the session open."""
+        if self._last is None or not self.calendar.in_session(now):
             return False
-        loc = self.calendar.local(now)
-        if not (0 <= self.calendar.minutes_since_open(now) < self.calendar.session_minutes) or loc.weekday() >= 5:
-            return False
+        session_open = self.calendar.session_open_datetime(self.calendar.session_date(now))
+        reference = max(self._last.close_time, session_open)
         limit = timedelta(minutes=self.calendar.bar_minutes * (self.stale_feed_bars + 1))
-        return now - self._last.close_time > limit
+        return now - reference > limit
 
 
 __all__ = ["DataValidator", "ValidationResult"]

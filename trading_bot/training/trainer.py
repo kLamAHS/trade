@@ -52,6 +52,7 @@ class CandidateEvaluation:
     fold_metrics: list[ValidationMetrics]
     aggregate: ValidationMetrics
     calibrator_fold: list[Calibrator]
+    calibration_rows: list[np.ndarray]     # rows whose labels calibrated each fold (all strictly before its validation)
 
     @property
     def fold_scores(self) -> list[float]:
@@ -146,6 +147,7 @@ class ModelTrainer:
         grid = t.hyperparameter_grid
         keys = list(grid.keys())
         self.grid = [dict(zip(keys, combo)) for combo in itertools.product(*[list(grid[k]) for k in keys])]
+        self.inner_calibration_fraction = float(t.get("inner_calibration_fraction", 0.25))
         self.horizon = int(cfg.prediction.horizon_bars)
         self.software_version = software_version()
 
@@ -170,6 +172,21 @@ class ModelTrainer:
                                    ds.cost_side_exec[rows], ds.log_close[rows], ds.open_next[rows],
                                    ds.open_next2[rows], self.sim_params, M=M)
 
+    def _inner_calibration_set(self, ds: TrainingDataset, Xall: np.ndarray, train_rows: np.ndarray,
+                               combo: dict[str, Any], names) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Chronological inner split of a training block: models fitted on the earlier part predict the
+        later part (purged + embargoed), giving out-of-sample (A, Y) pairs that lie entirely before the
+        fold's validation window."""
+        n = len(train_rows)
+        split = int(n * (1.0 - self.inner_calibration_fraction))
+        inner_train = train_rows[: max(0, split - self.purge)]
+        inner_cal = train_rows[min(n, split + self.embargo):]
+        if len(inner_train) < 50 or len(inner_cal) < 20:
+            raise ValueError("training block too small for an inner calibration split")
+        reg, direction = self._fit_pair(Xall[inner_train], ds.y_norm[inner_train], ds.y_raw[inner_train], combo, names)
+        A, _ = combine(reg.predict(Xall[inner_cal]), direction.predict_proba_up(Xall[inner_cal]))
+        return A, ds.y_norm[inner_cal], inner_cal
+
     def evaluate_candidate(self, ds: TrainingDataset, folds: list[Fold], combo: dict[str, Any],
                            feature_names) -> CandidateEvaluation:
         names = tuple(feature_names)
@@ -181,28 +198,37 @@ class ModelTrainer:
             P = direction.predict_proba_up(Xall[fold.validate])
             A, _ = combine(M, P)
             preds.append(FoldPrediction(fold.index, fold.validate, M, P, A))
-        # Leave-one-fold-out calibration: fold i is calibrated on the other folds' out-of-sample predictions.
+        # Chronological calibration: fold i's g(A) is fitted only on out-of-sample predictions that lie
+        # strictly before its validation window -- the earlier folds' validation predictions, and for the
+        # first fold an inner chronological split of its own training block.  No fold metric, acceptance
+        # statistic or grid score ever sees labels from after the fold's validation window.
         fold_metrics: list[ValidationMetrics] = []
         calibrators: list[Calibrator] = []
+        calibration_rows: list[np.ndarray] = []
         E_all: list[np.ndarray] = []
         M_all: list[np.ndarray] = []
         rows_all: list[np.ndarray] = []
+        inner_A, inner_Y, inner_rows = self._inner_calibration_set(ds, Xall, folds[0].train, combo, names)
         for i, fp in enumerate(preds):
-            others_A = np.concatenate([q.A for j, q in enumerate(preds) if j != i]) if len(preds) > 1 else fp.A
-            others_Y = np.concatenate([ds.y_norm[q.rows] for j, q in enumerate(preds) if j != i]) if len(preds) > 1 else ds.y_norm[fp.rows]
-            cal = self._calibrator().fit(others_A, others_Y)
+            earlier = [q for q in preds[:i] if q.rows[-1] < fp.rows[0]]
+            cal_A = np.concatenate([inner_A] + [q.A for q in earlier])
+            cal_Y = np.concatenate([inner_Y] + [ds.y_norm[q.rows] for q in earlier])
+            cal_rows = np.concatenate([inner_rows] + [q.rows for q in earlier])
+            cal = self._calibrator().fit(cal_A, cal_Y)
             E = cal.predict(fp.A)
             fold_metrics.append(self._simulate(ds, fp.rows, E, fp.M))
             calibrators.append(cal)
+            calibration_rows.append(cal_rows)
             E_all.append(E)
             M_all.append(fp.M)
             rows_all.append(fp.rows)
         rows_cat = np.concatenate(rows_all)
         aggregate = self._simulate(ds, rows_cat, np.concatenate(E_all), np.concatenate(M_all))
-        return CandidateEvaluation(dict(combo), preds, fold_metrics, aggregate, calibrators)
+        return CandidateEvaluation(dict(combo), preds, fold_metrics, aggregate, calibrators, calibration_rows)
 
     def _metadata(self, ds: TrainingDataset, params: RegressionParams, names, validation: dict[str, Any],
-                  direction: DirectionModel, is_baseline: bool, extra: dict[str, Any]) -> ModelMetadata:
+                  direction: DirectionModel, is_baseline: bool, extra: dict[str, Any],
+                  effective_params: dict[str, Any] | None = None) -> ModelMetadata:
         payload = json.dumps({
             "start": ds.window_start.isoformat(), "end": ds.window_end.isoformat(), "checksum": ds.window_checksum,
             "schema": self.fe.schema.version, "d": ds.adaptive_d, "seed": self.seed, "cfg": self.cfg.digest(),
@@ -215,7 +241,7 @@ class ModelTrainer:
             model_id=model_id, training_start=ds.window_start.isoformat(), training_end=ds.window_end.isoformat(),
             feature_schema_version=self.fe.schema.version, feature_names=tuple(names),
             source_data_checksum=ds.window_checksum, fractional_d=ds.adaptive_d, fractional_kernel_size=ds.kernel_size,
-            normalization=norm, model_params={"regression": params.to_dict(),
+            normalization=norm, model_params={"regression": effective_params or params.to_dict(),
                                               "direction": {"C": float(self.cfg.models.direction.C)},
                                               "calibration": dict(self.cfg.models.calibration.to_dict())},
             random_seed=self.seed, validation_metrics=validation, software_version=self.software_version,
@@ -231,6 +257,7 @@ class ModelTrainer:
             return TrainingReport(None, False, None, None, {}, [], [], [], None, None, float("nan"), 0, None, None,
                                   time.time() - t0, error=f"insufficient history: {len(window)} < {self.minimum_bars}")
         previous_d = self.fe.adaptive_d
+        stationarity = None
         try:
             stationarity = self.fractional.estimate_stationarity(window.log_close())
             d_star = stationarity.d_star
@@ -276,13 +303,20 @@ class ModelTrainer:
             }
             extra = {"stationarity": stationarity.to_dict(), "baseline_feature_names": list(base_names),
                      "calibration_points": calibration.n_fit, "previous_adaptive_d": previous_d}
-            meta = self._metadata(ds, params, full_names, validation_summary, direction, False, extra)
+            meta = self._metadata(ds, params, full_names, validation_summary, direction, False, extra,
+                                  reg.effective_params())
             model = CombinedModel(reg, direction, calibration, full_names, d_star, self.horizon, meta)
             report = TrainingReport(model, acceptance.accepted, acceptance, stationarity, dict(best.params),
                                     grid_results, best.fold_metrics, baseline.fold_metrics, best.aggregate,
                                     baseline.aggregate, float(delta), len(ds), ds.window_start, ds.window_end,
                                     time.time() - t0, feature_importance=reg.feature_importance())
             return report
+        except Exception as exc:
+            # A failed retraining cycle never reaches the main loop: the previous accepted model keeps
+            # trading (spec section 37) and the failure is reported as RETRAIN_FAILED.
+            return TrainingReport(None, False, None, stationarity, {}, [], [], [], None, None, float("nan"), 0,
+                                  window[0].timestamp, window[-1].timestamp, time.time() - t0,
+                                  error=f"{type(exc).__name__}: {exc}")
         finally:
             # The live feature engine keeps its previous d until a model is promoted (atomic swap by the bot).
             self.fe.set_adaptive_d(previous_d)

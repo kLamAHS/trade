@@ -119,29 +119,45 @@ class BarStore:
 
     @classmethod
     def from_frame(cls, frame: pd.DataFrame, instrument: str, bar_minutes: int = 30) -> "BarStore":
-        store = cls(instrument, bar_minutes)
-        for row in frame.itertuples(index=False):
-            ts = pd.Timestamp(row.timestamp)
-            if ts.tzinfo is None:
-                ts = ts.tz_localize("UTC")
-            ts_py = ts.to_pydatetime().astimezone(timezone.utc)
-            bid = getattr(row, "bid", math.nan)
-            ask = getattr(row, "ask", math.nan)
-            store.append(Bar(
-                instrument=instrument, timestamp=ts_py,
-                open=float(row.open), high=float(row.high), low=float(row.low), close=float(row.close),
-                volume=float(row.volume), bar_minutes=bar_minutes,
-                bid=None if bid is None or (isinstance(bid, float) and math.isnan(bid)) else float(bid),
-                ask=None if ask is None or (isinstance(ask, float) and math.isnan(ask)) else float(ask),
-            ))
-        return store
+        """Strict constructor: raises on non-increasing timestamps (use ``bars_from_frame`` +
+        the DataValidator for untrusted files)."""
+        return cls(instrument, bar_minutes, bars_from_frame(frame, instrument, bar_minutes))
 
     @classmethod
     def load(cls, path: str | Path, instrument: str, bar_minutes: int = 30) -> "BarStore":
-        frame = pd.read_csv(path, float_precision="round_trip")
-        return cls.from_frame(frame, instrument, bar_minutes)
+        return cls.from_frame(pd.read_csv(path, float_precision="round_trip"), instrument, bar_minutes)
+
+
+def _opt(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) else f
+
+
+def bars_from_frame(frame: pd.DataFrame, instrument: str, bar_minutes: int = 30) -> list[Bar]:
+    """Rows in file order, without ordering checks: duplicates / backward timestamps are left
+    for the DataValidator to classify (spec section 35)."""
+    bars: list[Bar] = []
+    for row in frame.itertuples(index=False):
+        ts = pd.Timestamp(row.timestamp)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        ts_py = ts.to_pydatetime().astimezone(timezone.utc)
+        bars.append(Bar(instrument=instrument, timestamp=ts_py, open=float(row.open), high=float(row.high),
+                        low=float(row.low), close=float(row.close), volume=float(row.volume),
+                        bar_minutes=bar_minutes, bid=_opt(getattr(row, "bid", None)),
+                        ask=_opt(getattr(row, "ask", None))))
+    return bars
+
+
+def read_bars_csv(path: str | Path, instrument: str, bar_minutes: int = 30) -> list[Bar]:
+    return bars_from_frame(pd.read_csv(path, float_precision="round_trip"), instrument, bar_minutes)
 
 
 HistoricalStore = BarStore
 
-__all__ = ["BarStore", "HistoricalStore"]
+__all__ = ["BarStore", "HistoricalStore", "bars_from_frame", "read_bars_csv"]

@@ -27,6 +27,7 @@ from ..fractional.engine import FractionalEngine
 from ..types import FeatureVector
 from .price import conventional_return_features, fractional_price_features
 from .regime import regime_features
+from .rolling import rolling_std
 from .schema import FeatureSchema, build_schema
 from .volatility import volatility_features
 from .volume import volume_features
@@ -36,9 +37,10 @@ from .volume import volume_features
 class FeatureMatrix:
     names: tuple[str, ...]
     values: np.ndarray                   # shape (n_bars, len(names))
-    close_times: tuple[datetime, ...]    # feature timestamps (bar close)
+    close_times: tuple[datetime, ...]    # bar close times
     adaptive_d: float
     kernel_size: int
+    source_times: tuple[datetime, ...] = ()   # newest information time per bar (close, or a later quote)
 
     def column(self, name: str) -> np.ndarray:
         return self.values[:, self.names.index(name)]
@@ -115,9 +117,10 @@ class FeatureEngine:
 
         vol = volatility_features(log_close, arrays["high"], arrays["low"], close, self.fe, self.vol_windows,
                                   self.ewma_lambda, self.ewma_window, self.volatility_order, self.z_window, self.eps)
-        sigmas = vol.pop("_sigma")
+        vol.pop("_sigma")
         returns = vol.pop("_returns")
-        sigma_h = sigmas[self.sigma_window]
+        # sigma_{t,50} for labels / edge is computed on its own window so it never depends on vol_windows.
+        sigma_h = rolling_std(returns, self.sigma_window)
         cols.update(vol)
 
         cols.update(fractional_price_features(log_close, self.fe, self._adaptive_d, self.fixed_orders, self.z_window,
@@ -128,9 +131,11 @@ class FeatureEngine:
         cols.update(regime_features(log_close, returns, cols["fd_025_z"], cols["fd_075_z"], self.trend_window,
                                     self.vol_regime_short, self.vol_regime_long, self.frac_floor, self.eps))
 
-        # Section 17: cyclic time-of-day.
+        # Section 17: cyclic time-of-day, M = total minutes of the bar's own session (early closes included).
         minutes = np.array([self.calendar.minutes_since_open(ts) for ts in arrays["timestamp"]], dtype=float)
-        phase = 2.0 * math.pi * minutes / float(self.calendar.session_minutes)
+        session_len = np.array([self.calendar.session_minutes_for(self.calendar.session_date(ts))
+                                for ts in arrays["timestamp"]], dtype=float)
+        phase = 2.0 * math.pi * minutes / session_len
         cols["time_sin"] = np.sin(phase)
         cols["time_cos"] = np.cos(phase)
 
@@ -147,7 +152,9 @@ class FeatureEngine:
         names = self.schema.all_names
         matrix = np.column_stack([cols[nm] for nm in names]) if n else np.empty((0, len(names)))
         close_times = tuple(ts + _minutes(store.bar_minutes) for ts in arrays["timestamp"])
-        return FeatureMatrix(names, matrix, close_times, self._adaptive_d, self.fe.kernel_size(self._adaptive_d))
+        source_times = tuple(b.latest_source_time for b in store.bars[start:stop])
+        return FeatureMatrix(names, matrix, close_times, self._adaptive_d, self.fe.kernel_size(self._adaptive_d),
+                             source_times)
 
     def compute_latest(self, store: BarStore) -> FeatureVector:
         if not self.ready(store):
@@ -158,9 +165,15 @@ class FeatureEngine:
         return self.vector_from_matrix(fm, len(fm.close_times) - 1, store.instrument, bar_index=n - 1)
 
     def vector_from_matrix(self, fm: FeatureMatrix, i: int, instrument: str, bar_index: int) -> FeatureVector:
-        ts = fm.close_times[i]
-        return FeatureVector(instrument=instrument, timestamp=ts, latest_source_timestamp=ts, bar_index=bar_index,
-                             fractional_d=fm.adaptive_d, fractional_kernel_size=fm.kernel_size, values=fm.row(i))
+        """Feature timestamp = the bar close, or later if a source (e.g. a live quote) arrived after it.
+        ``latest_source_timestamp`` is the newest information time among all bars used, so the
+        section-3 guard is checked against real source times."""
+        close = fm.close_times[i]
+        latest_source = max(fm.source_times[: i + 1]) if fm.source_times else close
+        feature_ts = max(close, latest_source)
+        return FeatureVector(instrument=instrument, timestamp=feature_ts, latest_source_timestamp=latest_source,
+                             bar_index=bar_index, fractional_d=fm.adaptive_d, fractional_kernel_size=fm.kernel_size,
+                             values=fm.row(i), bar_close_time=close)
 
 
 def _minutes(m: int):

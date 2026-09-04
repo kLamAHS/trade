@@ -10,6 +10,7 @@ import math
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 
@@ -37,6 +38,7 @@ class Bar:
     bar_minutes: int = 30
     bid: Optional[float] = None
     ask: Optional[float] = None
+    quote_timestamp: Optional[datetime] = None   # when bid/ask were observed (None => at the bar close)
 
     def __post_init__(self) -> None:
         # Normalise numeric fields to plain Python floats so that persistence,
@@ -48,6 +50,13 @@ class Bar:
             object.__setattr__(self, name, None if v is None else float(v))
         if self.timestamp.tzinfo is None:
             raise ValueError("Bar.timestamp must be timezone-aware")
+
+    @property
+    def latest_source_time(self) -> datetime:
+        """Newest information time carried by this bar (close, or a later quote)."""
+        if self.quote_timestamp is not None and self.quote_timestamp > self.close_time:
+            return self.quote_timestamp
+        return self.close_time
 
     @property
     def close_time(self) -> datetime:
@@ -69,6 +78,7 @@ class Bar:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["timestamp"] = self.timestamp.isoformat()
+        d["quote_timestamp"] = self.quote_timestamp.isoformat() if self.quote_timestamp else None
         return d
 
 
@@ -88,13 +98,18 @@ class FeatureVector:
     fractional_d: float
     fractional_kernel_size: int
     values: Mapping[str, float]
+    bar_close_time: Optional[datetime] = None   # close of the signal bar (== timestamp unless a later source exists)
 
     def __post_init__(self) -> None:
+        if self.bar_close_time is None:
+            object.__setattr__(self, "bar_close_time", self.timestamp)
         if self.latest_source_timestamp > self.timestamp:
             raise ValueError(
                 "look-ahead violation: latest_source_timestamp "
                 f"{self.latest_source_timestamp} > feature_timestamp {self.timestamp}"
             )
+        # Feature values are read-only once the record is emitted.
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
 
     def __getitem__(self, name: str) -> float:
         return self.values[name]
@@ -111,6 +126,7 @@ class FeatureVector:
             "instrument": self.instrument,
             "timestamp": self.timestamp.isoformat(),
             "latest_source_timestamp": self.latest_source_timestamp.isoformat(),
+            "bar_close_time": self.bar_close_time.isoformat() if self.bar_close_time else None,
             "bar_index": self.bar_index,
             "fractional_d": self.fractional_d,
             "fractional_kernel_size": self.fractional_kernel_size,

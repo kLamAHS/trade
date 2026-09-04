@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+import numpy as np
+
 from .config import FrozenConfig
 from .data.calendar import SessionCalendar
 from .data.store import BarStore
@@ -63,7 +65,6 @@ class TradingBot:
         self.diagnostics = FractionalDiagnostics(root / "diagnostics")
         self.state = BotState.INITIALIZING
         self.bars_since_retrain = 0
-        self.clean_bars_since_halt = 0
         self.retrain_count = 0
         self.last_report: Optional[TrainingReport] = None
         self.reports: list[dict] = []
@@ -76,7 +77,7 @@ class TradingBot:
         self._lock = threading.Lock()
         self.minimum_bars = int(cfg.training.minimum_bars)
         self.retrain_every = int(cfg.training.retrain_every_bars)
-        self.halt_recovery_bars = int(cfg.data.halt_recovery_bars)
+        self.vol_reference_bars = int(cfg.signal.vol_reference_days) * int(cfg.market.bars_per_day)
         self.processed = 0
         self.rejected_bars = 0      # corrupt bars discarded
         self.halted_bars = 0        # stored bars that triggered a data halt (gap / extreme jump)
@@ -157,6 +158,7 @@ class TradingBot:
             with self._lock:
                 self.registry.promote(report.model)
                 self.feature_engine.set_adaptive_d(report.model.d_star)
+            self._seed_sigma_history()
             self.audit.event("MODEL_PROMOTED", model_id=report.model.version, d_star=report.model.d_star,
                              delta_score=round(report.delta_score, 4), full_score=round(report.full_score, 4),
                              baseline_score=round(report.baseline_score, 4), elapsed=round(report.elapsed_seconds, 1))
@@ -168,23 +170,63 @@ class TradingBot:
             fh.write(json.dumps(summary, default=str) + "\n")
         self._refresh_state()
 
+    def _seed_sigma_history(self) -> None:
+        """Seed the signal engine's sigma history from the store so live sigma_ref uses the same
+        trailing window (section 28) as the validation simulator did."""
+        if self.signal_engine.has_history or not self.feature_engine.ready(self.store):
+            return
+        n = len(self.store)
+        start = max(0, n - (self.vol_reference_bars + self.feature_engine.required_history))
+        with self._lock:
+            fm = self.feature_engine.compute_matrix(self.store, start, n)
+        sigma = fm.column("sigma_h")
+        sigma = sigma[np.isfinite(sigma)][-self.vol_reference_bars:]
+        self.signal_engine.seed_sigma_history(sigma.tolist())
+
+    # ---------------------------------------------------------- bootstrap
+    def bootstrap(self, bars: Iterable[Bar]) -> int:
+        """Load history without simulating trades (paper-mode start-up): validate and store every bar,
+        mark the ledger at the end, then train once so the bot can go live on the next bar."""
+        stored = 0
+        for bar in bars:
+            self.processed += 1
+            result = self.validator.validate(bar)
+            if not result.storable:
+                self.rejected_bars += 1
+                continue
+            if not result.ok:
+                self.halted_bars += 1
+            self.store.append(bar)
+            stored += 1
+        if len(self.store):
+            last = self.store.last()
+            self.ledger.mark(last.close_time, last.close, len(self.store) - 1, self.calendar.session_date(last.timestamp))
+        self.audit.event("BOOTSTRAP", bars=stored, rejected=self.rejected_bars, gaps=self.halted_bars)
+        if len(self.store) >= self.minimum_bars:
+            self.retrain(blocking=True)
+        if self.model is not None:
+            self._set_state(self.risk.state_for(self.ledger.exposure), "bootstrap complete")
+        return stored
+
     # ------------------------------------------------------------- on_bar
     def on_bar(self, bar: Bar) -> None:
         self.processed += 1
         result: ValidationResult = self.validator.validate(bar)
-        if not result.ok:
-            self._handle_bad_bar(bar, result)
-            if not result.storable:
-                return
-        else:
-            if self.risk.data_halted:
-                self.clean_bars_since_halt += 1
-                if self.clean_bars_since_halt >= self.halt_recovery_bars:
-                    self.risk.set_data_halt(False)
-                    self.audit.event("DATA_HALT_CLEARED", clean_bars=self.clean_bars_since_halt)
-        # 1. fills for orders queued at the previous bar (at this bar's open)
+        if not result.storable:
+            self._handle_rejected_bar(bar, result)
+            return
+        # 1. fills for orders queued at the previous bar, at this bar's open (before anything else
+        #    can react to this bar: a decision made on bar t never fills at bar t's open).
         if self.execution.has_pending():
             self.on_next_bar_open(bar)
+        if not result.ok:
+            # Gap / extreme jump: the bar is real data and is stored, but no new orders may be
+            # generated until halt_recovery_bars clean bars have arrived (section 35).
+            self.halted_bars += 1
+            self.risk.set_data_halt(True, ";".join(result.reasons))
+            self.audit.event("DATA_HALT", reasons=list(result.reasons), timestamp=bar.timestamp.isoformat(), stored=True)
+        elif self.risk.data_halted and self.risk.note_clean_bar():
+            self.audit.event("DATA_HALT_CLEARED", clean_bars=self.risk.halt_recovery_bars)
         # 2. store + mark
         self.store.append(bar)
         self.ledger.mark(bar.close_time, bar.close, len(self.store) - 1, self.calendar.session_date(bar.timestamp))
@@ -213,9 +255,8 @@ class TradingBot:
         if not features.is_finite(needed):
             bad = [n for n in needed if not math.isfinite(features.get(n))]
             self.risk.set_data_halt(True, f"non-finite features: {bad[:5]}")
-            self.clean_bars_since_halt = 0
             self.audit.event("DATA_HALT", reason="feature NaN/inf", features=bad[:10])
-            self._flatten_if_positioned(bar, features, "DATA_HALT_FLATTEN")
+            self._flatten_if_positioned(bar, "DATA_HALT_FLATTEN")
             self._refresh_state()
             self._record(bar, features=features, validation=result, note="non-finite features")
             return
@@ -245,8 +286,10 @@ class TradingBot:
                                        "signal_time": bar.close_time.isoformat()}
         self._record(bar, features, prediction, signal, decision, order, cost, validation=result)
 
-    def _flatten_if_positioned(self, bar: Bar, features: Optional[FeatureVector], reason: str) -> None:
-        if self.ledger.units == 0:
+    def _flatten_if_positioned(self, bar: Bar, reason: str) -> None:
+        """Queue a flattening order.  ``bar`` is the last *stored* bar: the decision is stamped with its
+        close and priced at its close, so the fill can only happen at a later bar's open."""
+        if self.ledger.units == 0 or self.execution.has_pending():
             return
         order = self.execution.build_order(self.instrument, bar.close_time, self.ledger.units, self.ledger.exposure, 0.0,
                                            self.ledger.equity, bar.close, self.risk.state_for(self.ledger.exposure),
@@ -255,26 +298,18 @@ class TradingBot:
             self.execution.queue_for_next_bar(order)
             self._pending_signal_bar = bar
 
-    def _handle_bad_bar(self, bar: Bar, result: ValidationResult) -> None:
-        if result.storable:
-            self.halted_bars += 1
-        else:
-            self.rejected_bars += 1
-        self.clean_bars_since_halt = 0
-        if not self.risk.data_halted:
-            self.risk.set_data_halt(True, ";".join(result.reasons))
-            self.audit.event("DATA_HALT", reasons=list(result.reasons), timestamp=bar.timestamp.isoformat(),
-                             stored=result.storable)
-        if not result.storable:
-            # Corrupt input: cancel anything queued (bad input produces no trade) and flatten at the next clean bar.
-            cancelled = self.execution.pending_orders()
-            if cancelled:
-                self.audit.event("ORDERS_CANCELLED", count=len(cancelled), reason="rejected bar")
-            self._refresh_state()
-            self._record(bar, validation=result, note="rejected bar")
+    def _handle_rejected_bar(self, bar: Bar, result: ValidationResult) -> None:
+        """Corrupt input (never stored): cancel queued orders, halt, and flatten at the next clean bar."""
+        self.rejected_bars += 1
+        self.risk.set_data_halt(True, ";".join(result.reasons))
+        self.audit.event("DATA_HALT", reasons=list(result.reasons), timestamp=bar.timestamp.isoformat(), stored=False)
+        cancelled = self.execution.pending_orders()
+        if cancelled:
+            self.audit.event("ORDERS_CANCELLED", count=len(cancelled), reason="rejected bar")
         self._refresh_state()
-        if self.ledger.units != 0 and not self.execution.has_pending():
-            self._flatten_if_positioned(bar, None, "DATA_HALT_FLATTEN")
+        if len(self.store):
+            self._flatten_if_positioned(self.store.last(), "DATA_HALT_FLATTEN")
+        self._record(bar, validation=result, note="rejected bar")
 
     def _record(self, bar: Bar, features=None, prediction=None, signal=None, decision=None, order=None, cost=None,
                 validation=None, note: str = "") -> None:
@@ -282,7 +317,8 @@ class TradingBot:
                           self.ledger.state(), self.registry.current_version,
                           validation.to_dict() if validation else None,
                           {"note": note, "bars_since_retrain": self.bars_since_retrain,
-                           "risk_halt": self.risk.halt_reason(self.calendar.session_date(bar.timestamp))})
+                           "risk_halt": self.risk.halt_reason(self.calendar.session_date(bar.timestamp)),
+                           "clean_bars_since_halt": self.risk.clean_bars_since_halt})
 
     # ---------------------------------------------------------------- run
     def run(self, feed: Iterable[Bar], max_bars: int | None = None) -> dict:

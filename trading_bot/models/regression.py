@@ -58,12 +58,26 @@ class BoostedRegressor:
                 reg_alpha=p.reg_alpha, reg_lambda=p.reg_lambda, random_state=p.seed, n_jobs=p.num_threads,
                 deterministic=True, force_row_wise=True, verbose=-1)
         if p.backend == "sklearn":
+            # Fallback only: HistGradientBoosting has no row/column subsampling or L1 term, so those
+            # settings are NOT applied (see effective_params).  Early stopping is disabled because
+            # its internal holdout is a shuffled split (spec section 38: never shuffle).
             from sklearn.ensemble import HistGradientBoostingRegressor
 
             return HistGradientBoostingRegressor(
-                loss="squared_error", max_depth=p.max_depth, learning_rate=p.learning_rate, max_iter=p.n_estimators,
-                min_samples_leaf=p.min_child_samples, l2_regularization=p.reg_lambda, random_state=p.seed)
+                loss="squared_error", max_depth=p.max_depth, max_leaf_nodes=2 ** p.max_depth,
+                learning_rate=p.learning_rate, max_iter=p.n_estimators, min_samples_leaf=p.min_child_samples,
+                l2_regularization=p.reg_lambda, early_stopping=False, random_state=p.seed)
         raise ValueError(f"unknown regression backend {p.backend!r}")
+
+    def effective_params(self) -> dict[str, Any]:
+        """Parameters actually applied by the backend (recorded in the model artifact)."""
+        d = self.params.to_dict()
+        if self.params.backend == "sklearn":
+            for k in ("subsample", "colsample_bytree", "reg_alpha"):
+                d[k] = None
+            d["early_stopping"] = False
+            d["note"] = "sklearn HistGradientBoosting fallback: no subsampling / L1"
+        return d
 
     def fit(self, X: np.ndarray, y: np.ndarray, feature_names=None) -> "BoostedRegressor":
         X = np.asarray(X, dtype=float)
