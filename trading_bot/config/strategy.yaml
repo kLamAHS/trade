@@ -1,0 +1,143 @@
+# ---------------------------------------------------------------------------
+# Fractional-Memory Systematic Trading Bot -- central strategy configuration.
+#
+# Every strategy constant lives here (spec section 62).  The file is loaded once
+# into an immutable configuration object; application code never hard-codes a
+# strategy parameter.
+# ---------------------------------------------------------------------------
+
+seed: 42
+
+market:
+  instrument: SPY
+  bar_minutes: 30
+  timezone: America/New_York
+  session_open: "09:30"        # regular session open (exchange local time)
+  session_close: "16:00"       # regular session close (exchange local time)
+  bars_per_day: 13             # 390 session minutes / 30-minute bars
+  trading_days_per_year: 252
+
+data:
+  # Data-quality circuit breakers (spec section 35).
+  max_abs_log_jump: 0.10       # |log(C_t / C_{t-1})| above this is an "extreme unvalidated jump"
+  stale_feed_bars: 2           # live mode: no bar for this many bar intervals during session -> stale
+  halt_recovery_bars: 13       # consecutive clean bars required to leave DATA_HALTED
+  volume_enabled: true         # set false to disable the volume module globally (never fill silently)
+
+fractional:
+  fixed_orders: [0.25, 0.50, 0.75]
+  volatility_order: 0.40
+  adaptive_min: 0.05
+  adaptive_max: 0.95
+  adaptive_step: 0.05
+  weight_threshold: 0.00001
+  weight_threshold_run: 10     # consecutive negligible weights required to stop generation
+  max_lags: 500
+  adf_pvalue_max: 0.05
+  kpss_pvalue_min: 0.05
+  adf_maxlag: 20               # cap on ADF augmentation lags (autolag=AIC below the cap)
+
+features:
+  robust_z_window: 250         # N for rolling median / MAD (spec section 9)
+  volume_z_window: 50          # N for the volume robust z-score (spec section 16)
+  ewma_lambda: 0.94            # exponentially smoothed realized variance (spec section 8)
+  ewma_window: 450             # finite EWMA kernel length (lambda^450 ~ 1e-12): identical batch & streaming values
+  epsilon: 1.0e-12
+  vol_windows: [10, 50, 200]
+  return_lags: [1, 2, 4, 8, 16]
+  trend_window: 50
+  vol_regime_short: 20
+  vol_regime_long: 200
+  frac_regime_floor: 0.1
+  slope_lags: [1, 4]
+  use_raw_fractional_levels: false   # raw D^d p levels are recorded but only z-scored levels feed the models
+
+prediction:
+  horizon_bars: 4              # H; executable label is p_{t+H+1} - p_{t+1}
+  volatility_window: 50        # sigma_{t,50} used for label and edge normalization
+
+models:
+  regression:
+    backend: lightgbm          # lightgbm | sklearn (HistGradientBoosting fallback)
+    objective: regression      # squared error
+    max_depth: 3
+    learning_rate: 0.03
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1             # L1
+    reg_lambda: 1.0            # L2
+    num_threads: 2
+  direction:
+    C: 0.5                     # inverse L2 strength for the logistic direction model
+    max_iter: 1000
+  calibration:
+    method: isotonic           # isotonic | binned
+    bins: 20
+
+training:
+  window_bars: 10000
+  minimum_bars: 3000
+  retrain_every_bars: 250
+  walk_forward_folds: 5
+  first_train_fraction: 0.40   # fold 1 trains on the earliest 40% and validates the next 10%; fold k adds 10% (spec 38)
+  fold_validation_fraction: 0.10
+  purge_bars: 5                # H + 1
+  embargo_bars: 5
+  # Fixed, small hyperparameter search space (spec section 41).  The identical
+  # candidates are evaluated on every retraining cycle.
+  hyperparameter_grid:
+    n_estimators: [150, 300, 600]
+    min_child_samples: [50, 200]
+  score:
+    turnover_weight: 0.25
+    drawdown_weight: 0.25
+    drawdown_reference: 0.10   # drawdown penalty = max_drawdown / reference
+  acceptance:
+    min_accuracy: 0.51
+    min_correlation: 0.0
+    min_net_pnl: 0.0
+    min_profit_factor: 1.05
+    max_drawdown: 0.15
+    min_folds_beating_baseline: 3
+  ablation:
+    consecutive_failures_to_halt: 3
+
+signal:
+  cost_multiplier: 3.0         # trade only when |ER| > 3 * Cost
+  confidence_cost_multiplier: 6.0
+  rebalance_threshold: 0.15
+  vol_reference_days: 30       # sigma_ref = median sigma_50 over trailing 30 sessions
+  vol_multiplier_min: 0.25
+  vol_multiplier_max: 1.5
+
+risk:
+  max_absolute_exposure: 1.0
+  maximum_holding_bars: 12
+  stop_sigma_multiple: 4.0
+  daily_loss_limit: 0.025
+  drawdown_halt: 0.10
+
+execution:
+  commission_per_side: 0.0     # relative (fraction of notional); Alpaca equities are commission free
+  default_spread: 0.0001       # relative full spread used when bid/ask are unavailable
+  slippage_range_fraction: 0.05
+  slippage_reference: execution_bar   # execution_bar | signal_bar
+  min_order_notional: 1.0
+
+portfolio:
+  initial_capital: 100000.0
+
+paths:
+  artifacts_dir: artifacts
+  models_dir: artifacts/models
+  audit_dir: artifacts/audit
+  data_dir: artifacts/data
+  diagnostics_dir: artifacts/diagnostics
+
+alpaca:
+  paper: true
+  feed: iex
+  history_days: 1200
+  poll_seconds: 15
+  mirror_orders: true          # submit mirrored market orders to the Alpaca paper account
+  fill_timeout_seconds: 60

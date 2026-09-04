@@ -1,0 +1,8 @@
+# Overrides for quick demonstrations and tests (loaded on top of strategy.yaml).
+training:
+  window_bars: 4000
+  minimum_bars: 2500
+  retrain_every_bars: 250
+  hyperparameter_grid:
+    n_estimators: [100]
+    min_child_samples: [100]
