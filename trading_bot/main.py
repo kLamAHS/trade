@@ -6,6 +6,7 @@
     python -m trading_bot.main paper --symbol SPY
     python -m trading_bot.main train --csv bars.csv
     python -m trading_bot.main diagnose --csv bars.csv
+    python -m trading_bot.main gui                   # browser dashboard (or start.bat / start.sh)
 
 Always run as a module (``python -m trading_bot.main``) or through the
 ``trading-bot`` console script so that the ``trading_bot.logging`` package
@@ -26,6 +27,20 @@ import yaml
 from .config import DEFAULT_CONFIG_PATH, FrozenConfig, load_config
 
 
+def parse_scalar(text: str):
+    """Numbers first (PyYAML 1.1 reads '1e-3' as a string), then YAML for bools/lists/strings."""
+    t = text.strip()
+    try:
+        return int(t)
+    except ValueError:
+        pass
+    try:
+        return float(t)
+    except ValueError:
+        pass
+    return yaml.safe_load(t)
+
+
 def _parse_overrides(items: list[str] | None) -> dict:
     out: dict = {}
     for item in items or []:
@@ -36,7 +51,7 @@ def _parse_overrides(items: list[str] | None) -> dict:
         parts = key.split(".")
         for p in parts[:-1]:
             node = node.setdefault(p, {})
-        node[parts[-1]] = yaml.safe_load(value)
+        node[parts[-1]] = parse_scalar(value)
     return out
 
 
@@ -153,22 +168,50 @@ def cmd_paper(args) -> int:
         feed.seed_last_timestamp(bot.store.last().timestamp)
     print(f"state={bot.state.value} model={bot.registry.current_version}; entering live loop (Ctrl-C to stop)")
     try:
-        while True:
-            now = datetime.now(timezone.utc)
-            new_bars = feed.poll_new_bars(now)
-            for bar in new_bars:
-                bot.on_bar(bar)
-                print(f"{bar.timestamp.isoformat()} close={bar.close:.2f} state={bot.state.value} "
-                      f"exposure={bot.ledger.exposure:+.3f} equity={bot.ledger.equity:.2f}")
-            if bot.validator.is_stale(now) and not bot.risk.data_halted:
-                bot.risk.set_data_halt(True, "stale market feed")
-                bot.audit.event("DATA_HALT", reason="stale market feed", now=now.isoformat())
-            time.sleep(int(cfg.alpaca.poll_seconds))
+        run_live_loop(bot, feed, int(cfg.alpaca.poll_seconds), log=print)
     except KeyboardInterrupt:
         print("stopping")
-    summary = bot.finalize()
-    _print_summary(summary)
+    finally:
+        summary = bot.finalize()
+        _print_summary(summary)
     return 0
+
+
+def run_live_loop(bot, feed, poll_seconds: int, log=print, should_stop=None, sleep=time.sleep) -> None:
+    """Shared paper-trading loop (CLI and dashboard).
+
+    * every completed bar is processed; in a catch-up batch only the newest bar may queue orders,
+    * a feed/API failure never kills the bot: it is audited, the data halt is armed (section 35) and
+      polling resumes with back-off,
+    * a stale feed inside the session arms the data halt.
+    """
+    backoff = poll_seconds
+    while not (should_stop and should_stop()):
+        now = datetime.now(timezone.utc)
+        try:
+            new_bars = feed.poll_new_bars(now)
+            backoff = poll_seconds
+        except Exception as exc:  # transient network / API errors
+            bot.audit.event("FEED_ERROR", error=f"{type(exc).__name__}: {exc}", now=now.isoformat())
+            bot.risk.set_data_halt(True, "market feed unavailable")
+            log(f"feed error: {exc}; retrying in {backoff}s")
+            sleep(backoff)
+            backoff = min(backoff * 2, 300)
+            continue
+        for i, bar in enumerate(new_bars):
+            try:
+                bot.on_bar(bar, allow_orders=(i == len(new_bars) - 1))
+            except Exception as exc:
+                bot.audit.event("BAR_ERROR", error=f"{type(exc).__name__}: {exc}", timestamp=bar.timestamp.isoformat())
+                bot.risk.set_data_halt(True, f"processing error: {type(exc).__name__}")
+                log(f"error processing {bar.timestamp.isoformat()}: {exc}")
+                continue
+            log(f"{bar.timestamp.isoformat()} close={bar.close:.2f} state={bot.state.value} "
+                f"exposure={bot.ledger.exposure:+.3f} equity={bot.ledger.equity:.2f}")
+        if bot.validator.is_stale(now) and not bot.risk.data_halted:
+            bot.risk.set_data_halt(True, "stale market feed")
+            bot.audit.event("DATA_HALT", reason="stale market feed", now=now.isoformat())
+        sleep(poll_seconds)
 
 
 def cmd_train(args) -> int:
@@ -208,6 +251,13 @@ def cmd_diagnose(args) -> int:
     plots = bot.diagnostics.plot()
     print("diagnostics written to", bot.diagnostics.dir, "plots:", [str(p) for p in plots])
     bot.audit.close()
+    return 0
+
+
+def cmd_gui(args) -> int:
+    from .gui.server import serve
+
+    serve(settings_path=args.settings, host=args.host, port=int(args.port), open_browser=not args.no_browser)
     return 0
 
 
@@ -255,6 +305,13 @@ def build_parser() -> argparse.ArgumentParser:
     common(dg); data(dg)
     dg.add_argument("--every", type=int, default=2, help="evaluate every k-th candidate d for the OOS curve")
     dg.set_defaults(func=cmd_diagnose)
+
+    gui = sub.add_parser("gui", help="local browser dashboard (settings, API keys, run control, live status)")
+    gui.add_argument("--settings", default="settings.json", help="where the dashboard stores settings and API keys")
+    gui.add_argument("--host", default="127.0.0.1")
+    gui.add_argument("--port", default=8765, type=int)
+    gui.add_argument("--no-browser", action="store_true", help="do not open the browser automatically")
+    gui.set_defaults(func=cmd_gui)
     return p
 
 

@@ -32,7 +32,7 @@ def _clean(obj: Any) -> Any:
 
 
 class AuditLogger:
-    def __init__(self, directory: str | Path, run_id: str, echo=None):
+    def __init__(self, directory: str | Path, run_id: str, echo=None, on_event=None):
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id
@@ -40,6 +40,7 @@ class AuditLogger:
         self._fills = open(self.dir / f"{run_id}_fills.jsonl", "a", encoding="utf-8")
         self._events = open(self.dir / f"{run_id}_events.jsonl", "a", encoding="utf-8")
         self.echo = echo
+        self.on_event = on_event          # optional structured-event hook (dashboard)
         self.n_records = 0
 
     def _write(self, handle, record: dict) -> None:
@@ -69,9 +70,15 @@ class AuditLogger:
         self._write(self._fills, {"type": "fill", "run_id": self.run_id, "fill": fill, "portfolio": portfolio})
 
     def event(self, kind: str, **info: Any) -> None:
-        self._write(self._events, {"type": "event", "run_id": self.run_id, "event": kind, **info})
+        record = {"type": "event", "run_id": self.run_id, "event": kind, **info}
+        self._write(self._events, record)
         if self.echo:
             self.echo(f"[{kind}] " + ", ".join(f"{k}={v}" for k, v in info.items() if k != "details"))
+        if self.on_event:
+            try:
+                self.on_event(_clean(record))
+            except Exception:  # pragma: no cover - a UI hook must never break the bot
+                pass
 
     def close(self) -> None:
         for h in (self._bars, self._fills, self._events):

@@ -114,6 +114,8 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
     in_trade = False
     n_signals = 0
     for i in range(n):
+        if q_cur != 0.0:
+            holding += 1          # the mark at this bar's close, exactly as the live ledger counts before deciding
         # Stop check on the signal bar close relative to the entry fill.
         stop_hit = False
         if q_cur != 0.0 and math.isfinite(entry_price):
@@ -163,9 +165,7 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
                 entry_price = open_next[i]
                 entry_sigma = sigma[i]
                 entry_dir = 1 if q_new > 0 else -1
-                holding = 0          # the position is entered at the next open; the live ledger counts marks after it
-            else:
-                holding += 1
+                holding = 0          # entered at the next open; the first mark after it is counted at row i+1
         else:
             holding = 0
             entry_price = math.nan
@@ -238,8 +238,8 @@ class ModelValidator:
     @classmethod
     def from_config(cls, cfg) -> "ModelValidator":
         a = cfg.training.acceptance
-        return cls(a.min_accuracy, a.min_correlation, a.min_net_pnl, a.min_profit_factor, a.max_drawdown,
-                   a.min_folds_beating_baseline)
+        return cls(float(a.min_accuracy), float(a.min_correlation), float(a.min_net_pnl), float(a.min_profit_factor),
+                   float(a.max_drawdown), int(a.min_folds_beating_baseline))
 
     def evaluate(self, aggregate: ValidationMetrics, fold_scores: list[float],
                  baseline_fold_scores: list[float]) -> AcceptanceResult:
