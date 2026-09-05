@@ -32,7 +32,7 @@ trading-bot = "trading_bot.main:main"
 include = ["trading_bot*"]
 
 [tool.setuptools.package-data]
-trading_bot = ["config/*.yaml"]
+trading_bot = ["config/*.yaml", "gui/static/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["trading_bot/tests"]

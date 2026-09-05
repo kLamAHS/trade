@@ -100,25 +100,56 @@ class AlpacaPaperBroker:
                 "filled_avg_price": float(avg) if avg not in (None, "") else None,
                 "final": status in AlpacaPaperBroker.FINAL}
 
-    def submit(self, order: Order) -> dict[str, Any]:
-        """Submit immediately and return the broker's acknowledgement (no blocking poll)."""
+    def _submit_leg(self, symbol: str, side: str, qty: int, client_order_id: str) -> dict[str, Any]:
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
 
-        qty = int(round(order.units))
-        if qty <= 0:
-            return {"id": None, "status": "skipped", "reason": "rounds to zero shares", "final": True}
-        req = MarketOrderRequest(symbol=order.instrument, qty=qty,
-                                 side=OrderSide.BUY if order.side == "buy" else OrderSide.SELL,
-                                 time_in_force=TimeInForce.DAY, client_order_id=order.order_id[:48])
+        req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+                                 time_in_force=TimeInForce.DAY, client_order_id=client_order_id[:48])
         try:
             resp = self.client.submit_order(req)
         except Exception as exc:
-            return {"id": None, "status": "error", "reason": str(exc), "final": True}
+            return {"id": None, "status": "error", "reason": str(exc), "final": True, "qty": qty}
         out = self._summary(resp)
-        out["submitted_at"] = datetime.now(timezone.utc).isoformat()
         out["qty"] = qty
         return out
+
+    def submit(self, order: Order, wait_close_seconds: float = 5.0) -> dict[str, Any]:
+        """Submit immediately and return the broker's acknowledgement (no blocking poll).
+
+        Alpaca rejects a single order that takes a position through zero, so a flip is sent as a
+        closing leg followed by an opening leg for the remainder.
+        """
+        qty = int(round(order.units))
+        if qty <= 0:
+            return {"id": None, "status": "skipped", "reason": "rounds to zero shares", "final": True}
+        signed = qty if order.side == "buy" else -qty
+        position = self.position_qty(order.instrument) or 0.0
+        crosses = position != 0 and (position > 0) != (signed > 0) and abs(signed) > abs(position)
+        submitted_at = datetime.now(timezone.utc).isoformat()
+        if not crosses:
+            out = self._submit_leg(order.instrument, order.side, qty, order.order_id)
+            out["submitted_at"] = submitted_at
+            return out
+        close_qty = int(round(abs(position)))
+        open_qty = qty - close_qty
+        close_leg = self._submit_leg(order.instrument, order.side, close_qty, order.order_id + "c")
+        if close_leg.get("id"):
+            deadline = time.time() + wait_close_seconds
+            while time.time() < deadline and not close_leg.get("final"):
+                time.sleep(0.5)
+                close_leg = {**close_leg, **self.check(close_leg["id"])}
+        open_leg = self._submit_leg(order.instrument, order.side, open_qty, order.order_id + "o") if open_qty > 0 else None
+        out = dict(open_leg or close_leg)
+        out.update({"submitted_at": submitted_at, "qty": qty, "flip": True, "close_leg": close_leg, "open_leg": open_leg})
+        return out
+
+    def cancel(self, broker_order_id: str) -> dict[str, Any]:
+        try:
+            self.client.cancel_order_by_id(broker_order_id)
+        except Exception as exc:
+            return {"id": broker_order_id, "status": "error", "reason": str(exc), "final": False}
+        return self.check(broker_order_id)
 
     def check(self, broker_order_id: str) -> dict[str, Any]:
         try:
@@ -204,7 +235,24 @@ class ExecutionEngine:
         return self.queue.pop_all()
 
     def cancel_pending(self) -> list[Order]:
-        return self.queue.pop_all()
+        """Drop queued orders; mirrored orders that are not final are cancelled at the broker and any
+        quantity that already filled there is reported so the drift is visible in the audit trail."""
+        orders = self.queue.pop_all()
+        for order in orders:
+            ack = self.mirror_acks.pop(order.order_id, None)
+            broker_id = self.pending_mirrors.pop(order.order_id, None)
+            if self.broker is None or ack is None:
+                continue
+            if broker_id is not None:
+                status = self.broker.cancel(broker_id)
+                self.events.append({"event": "ORDER_MIRROR_CANCELLED", "order_id": order.order_id, **status})
+                filled = status.get("filled_qty") or 0.0
+            else:
+                filled = ack.get("filled_qty") or 0.0
+            if filled:
+                self.events.append({"event": "MIRROR_DRIFT_RISK", "order_id": order.order_id, "filled_qty": filled,
+                                    "note": "broker filled part of an order the ledger dropped; see reconciliation"})
+        return orders
 
     def has_pending(self) -> bool:
         return len(self.queue) > 0

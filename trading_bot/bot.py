@@ -42,7 +42,7 @@ from .types import Bar, BotState, FeatureVector
 class TradingBot:
     def __init__(self, cfg: FrozenConfig, run_id: str | None = None, artifacts_dir: str | Path | None = None,
                  broker: AlpacaPaperBroker | None = None, log: Callable[[str], None] | None = print,
-                 async_retrain: bool = False):
+                 async_retrain: bool = False, on_event: Callable[[dict], None] | None = None):
         self.cfg = cfg
         self.run_id = run_id or datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ")
         root = Path(artifacts_dir) if artifacts_dir is not None else Path(cfg.paths.artifacts_dir)
@@ -62,7 +62,8 @@ class TradingBot:
         self.signal_engine = SignalEngine.from_config(cfg)
         self.risk = RiskEngine.from_config(cfg)
         self.ledger = PortfolioLedger(float(cfg.portfolio.initial_capital), self.instrument)
-        self.audit = AuditLogger(root / "audit", self.run_id, echo=self.log)
+        self.audit = AuditLogger(root / "audit", self.run_id, echo=self.log, on_event=on_event)
+        self.last_record: Optional[dict] = None
         self.diagnostics = FractionalDiagnostics(root / "diagnostics")
         self.vol_edges = tuple(float(x) for x in (cfg.get("diagnostics", {}) or {}).get("vol_regime_edges", (0.8, 1.2)))
         self.state = BotState.INITIALIZING
@@ -125,9 +126,18 @@ class TradingBot:
 
     # ---------------------------------------------------------------- fills
     def on_next_bar_open(self, bar: Bar) -> None:
-        """Execute orders queued at the previous bar at this bar's open (spec section 57)."""
+        """Execute orders queued at the previous bar at this bar's open (spec section 57).
+
+        An order whose decision time is later than this bar's close (a quote that arrived after a
+        delivery delay) is deferred to the first bar that was still open at decision time.
+        """
         orders = self.execution.pending_orders()
         for k, order in enumerate(orders):
+            if bar.close_time <= order.signal_timestamp:
+                self.execution.queue.push(order)
+                self.audit.event("ORDER_DEFERRED", order_id=order.order_id, signal_timestamp=order.signal_timestamp.isoformat(),
+                                 bar_close=bar.close_time.isoformat())
+                continue
             try:
                 fill = self.execution.simulate_fill(order, bar, self._pending_signal_bar)
             except RuntimeError as exc:
@@ -138,6 +148,10 @@ class TradingBot:
                     self.execution.queue.push(o)
                 self._refresh_state()
                 return
+            except ValueError as exc:
+                self.execution.queue.push(order)
+                self.audit.event("ORDER_DEFERRED", order_id=order.order_id, reason=str(exc))
+                continue
             prev_trades = len(self.ledger.trades)
             prev_ctx = self._open_trade_context
             self.ledger.apply(fill)
@@ -150,7 +164,8 @@ class TradingBot:
                 self.trade_contexts.append(ctx)
             if fill.new_entry or (self.ledger.units != 0 and self._open_trade_context is None):
                 self._open_trade_context = self._pending_entry_context
-        self._pending_signal_bar = None
+        if not self.execution.has_pending():
+            self._pending_signal_bar = None
         self.execution.poll_mirrors()
         self._flush_events()
 
@@ -261,7 +276,10 @@ class TradingBot:
         return path
 
     # ------------------------------------------------------------- on_bar
-    def on_bar(self, bar: Bar) -> None:
+    def on_bar(self, bar: Bar, allow_orders: bool = True) -> None:
+        """Process one completed bar.  ``allow_orders=False`` marks a catch-up bar delivered late in a
+        batch: it is validated, stored, evaluated and audited, but no order can be queued on it because
+        the next bar's open is no longer a tradable price (spec section 42)."""
         self.processed += 1
         result: ValidationResult = self.validator.validate(bar)
         if not result.storable:
@@ -320,9 +338,15 @@ class TradingBot:
         decision = self.risk.evaluate(signal, self.ledger.state(), features, self.calendar.session_date(bar.timestamp))
         self._flush_events()
         self._refresh_state()
-        # 6. order (an unchanged, turnover-suppressed position is maintained: no order at all)
+        # 6. order (an unchanged, turnover-suppressed position is maintained: no order at all; nothing is
+        #    queued while an earlier order is still pending, nor on a late catch-up bar)
         order = None
-        if decision.reason != "TURNOVER_SUPPRESSED":
+        blocked = None
+        if self.execution.has_pending():
+            blocked = "order pending"
+        elif not allow_orders:
+            blocked = "catch-up bar: no orders"
+        if blocked is None and decision.reason != "TURNOVER_SUPPRESSED":
             if (decision.reason == "MAX_HOLDING_REENTRY" and self.ledger.units != 0
                     and direction_sign(decision.approved_exposure) == direction_sign(self.ledger.units)):
                 # Same-direction re-entry (section 31): restart the holding clock and stop reference now.
@@ -344,7 +368,7 @@ class TradingBot:
             if decision.new_entry:
                 self._pending_entry_context = self._entry_context(features, bar, signal)
             self._flush_events()
-        self._record(bar, features, prediction, signal, decision, order, cost, validation=result)
+        self._record(bar, features, prediction, signal, decision, order, cost, validation=result, note=blocked or "")
 
     def _entry_context(self, features: FeatureVector, bar: Bar, signal) -> dict:
         day = self.calendar.session_date(bar.timestamp)
@@ -385,6 +409,13 @@ class TradingBot:
     def _record(self, bar: Bar, features=None, prediction=None, signal=None, decision=None, order=None, cost=None,
                 validation=None, note: str = "") -> None:
         portfolio = self.ledger.state() if self.ledger.mark_time is not None else None
+        self.last_record = {
+            "timestamp": bar.timestamp.isoformat(), "close": bar.close, "state": self.state.value, "note": note,
+            "prediction": prediction.to_dict() if prediction else None, "signal": signal.to_dict() if signal else None,
+            "risk": decision.to_dict() if decision else None, "order": order.to_dict() if order else None,
+            "cost": cost.to_dict() if cost else None,
+            "fractional_d": features.fractional_d if features else None,
+        }
         self.audit.record(bar, self.state.value, features, prediction, signal, decision, order, cost,
                           portfolio, self.registry.current_version,
                           validation.to_dict() if validation else None,

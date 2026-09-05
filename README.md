@@ -14,6 +14,23 @@ model **without** fractional features and the bot halts the strategy
 (`FRACTIONAL_EDGE_NOT_DETECTED`) when the fractional contribution `S_F - S_0` is
 non-positive for three consecutive cycles.
 
+## Dashboard (start.bat / start.sh)
+
+Double-click **`start.bat`** on Windows (or run `./start.sh` on macOS/Linux). On first run it creates
+`.venv`, installs the dependencies and then opens a local dashboard at `http://127.0.0.1:8765/`:
+
+* **Alpaca credentials** — paste your API key ID and secret key, tick *Paper account*, press **Test
+  connection** (shows the paper account's equity and buying power) and **Save settings**. Keys are stored
+  in `settings.json` next to `start.bat`, owner-only permissions, git-ignored, never sent anywhere but
+  Alpaca. Environment variables `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` still work for the CLI.
+* **Run configuration** — symbol, backtest (synthetic bars or a CSV downloaded with the *Download* button)
+  or Alpaca paper trading, fast preset, order mirroring, initial capital and free-form config overrides.
+* **Start / Stop**, live portfolio tiles, equity chart (hover for values, table view for the numbers),
+  the fractional-contribution chart per retrain, the last decision chain, trades, events and the log.
+
+The dashboard is the `gui` sub-command (`python -m trading_bot.main gui [--port 8765] [--no-browser]`).
+It binds to localhost only.
+
 ## Quick start
 
 ```bash
