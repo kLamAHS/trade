@@ -37,9 +37,12 @@ class ValidationMetrics:
     avg_exposure: float
     equity_curve: tuple[float, ...] = field(default_factory=tuple, repr=False)
     exposures: tuple[float, ...] = field(default_factory=tuple, repr=False)
+    trade_pnls: tuple[float, ...] = field(default_factory=tuple, repr=False)
+    bar_pnls: tuple[float, ...] = field(default_factory=tuple, repr=False)
 
     def to_dict(self, include_curves: bool = False) -> dict[str, Any]:
-        d = {k: getattr(self, k) for k in self.__dataclass_fields__ if k not in ("equity_curve", "exposures")}
+        d = {k: getattr(self, k) for k in self.__dataclass_fields__
+             if k not in ("equity_curve", "exposures", "trade_pnls", "bar_pnls")}
         if include_curves:
             d["equity_curve"] = list(self.equity_curve)
             d["exposures"] = list(self.exposures)
@@ -138,21 +141,29 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
         curve[i + 1] = equity
         exposures[i] = q_new
         bar_pnl[i] = pnl
-        # trade bookkeeping (round trips)
-        if rule.new_entry or (q_cur != 0.0 and q_new == 0.0):
-            if in_trade:
-                trade_pnls.append(trade_acc)
-                trade_acc = 0.0
-                in_trade = False
+        # Round-trip bookkeeping.  Every unit of bar P&L (including exit costs) belongs to exactly one trade.
+        flipped = q_cur != 0.0 and q_new != 0.0 and (q_cur > 0) != (q_new > 0)
+        closing = q_cur != 0.0 and (q_new == 0.0 or flipped or rule.new_entry)
+        remaining = pnl
+        if closing:
+            if q_new == 0.0:
+                close_cost = cost                               # the whole turnover is the exit
+            elif flipped:
+                close_cost = abs(q_cur) * cost_side_exec[i]     # closing leg of the flip
+            else:
+                close_cost = 0.0                                # same-direction re-entry: resize cost is the new trade's
+            trade_pnls.append(trade_acc - close_cost)
+            trade_acc = 0.0
+            in_trade = False
+            remaining = pnl + close_cost
         if q_new != 0.0:
-            if not in_trade:
-                in_trade = True
-            trade_acc += pnl
+            in_trade = True
+            trade_acc += remaining
             if rule.new_entry or q_cur == 0.0:
                 entry_price = open_next[i]
                 entry_sigma = sigma[i]
                 entry_dir = 1 if q_new > 0 else -1
-                holding = 1
+                holding = 0          # the position is entered at the next open; the live ledger counts marks after it
             else:
                 holding += 1
         else:
@@ -186,7 +197,8 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
                              profit_factor=profit_factor, max_drawdown=mdd, sharpe=sharpe,
                              turnover_penalty=turnover_penalty, drawdown_penalty=float(dd_penalty), score=float(score),
                              n_trades=int(len(tp)), n_signals=n_signals, avg_exposure=float(np.mean(np.abs(exposures))) if n else 0.0,
-                             equity_curve=tuple(curve.tolist()), exposures=tuple(exposures.tolist()))
+                             equity_curve=tuple(curve.tolist()), exposures=tuple(exposures.tolist()),
+                             trade_pnls=tuple(tp.tolist()), bar_pnls=tuple(bar_pnl.tolist()))
 
 
 def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:

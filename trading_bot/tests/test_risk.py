@@ -178,7 +178,8 @@ def test_state_machine_transitions(bot_run):
     transitions = {(e["from"], e["to"]) for e in events}
     assert ("READY", "POSITIONED") in transitions and ("POSITIONED", "READY") in transitions
     assert bot.state in (BotState.READY, BotState.POSITIONED, BotState.RISK_HALTED)
-    assert all(t[0] != "INITIALIZING" for t in list(transitions)[1:]) or True
+    assert sum(1 for e in events if e["from"] == "INITIALIZING") == 1     # INITIALIZING is left exactly once
+    assert all(e["to"] != "INITIALIZING" for e in events)
 
 
 def _read_events(bot):

@@ -17,6 +17,8 @@ market:
   early_close_time: "13:00"    # half-day close
   nyse_early_close_rules: true # day after Thanksgiving, 3 July / 24 December when Mon-Thu
   early_closes: []             # extra half-day dates, ISO format, e.g. ["2026-11-27"]
+  nyse_holiday_rules: true     # rule-based NYSE full-day closures (used to detect missing sessions)
+  holidays: []                 # extra closures, ISO format, e.g. ["2025-01-09"]
   bars_per_day: 13             # 390 session minutes / 30-minute bars
   trading_days_per_year: 252
 
@@ -39,6 +41,7 @@ fractional:
   adf_pvalue_max: 0.05
   kpss_pvalue_min: 0.05
   adf_maxlag: 20               # cap on ADF augmentation lags (autolag=AIC below the cap)
+  min_observations: 50         # transformed observations required before a candidate d is testable
 
 features:
   robust_z_window: 250         # N for rolling median / MAD (spec section 9)
@@ -76,6 +79,7 @@ models:
   calibration:
     method: isotonic           # isotonic | binned
     bins: 20
+    min_points: 10             # below this the calibrator degrades to a least-squares slope through the origin
 
 training:
   window_bars: 10000
@@ -87,6 +91,8 @@ training:
   purge_bars: 5                # H + 1
   embargo_bars: 5
   inner_calibration_fraction: 0.25   # tail of the first fold's training block used for its chronological calibration
+  inner_calibration_min_rows: [50, 20]   # minimum [fit, calibration] rows for the inner split
+  min_dataset_rows: 200        # minimum valid (feature, label) rows for a training cycle
   # Fixed, small hyperparameter search space (spec section 41).  The identical
   # candidates are evaluated on every retraining cycle.
   hyperparameter_grid:
@@ -131,6 +137,11 @@ execution:
 portfolio:
   initial_capital: 100000.0
 
+diagnostics:
+  vol_regime_edges: [0.8, 1.2]     # attribution buckets on volatility_state (sigma_20 / sigma_200)
+  oos_by_d_every_retrain: false    # maintain the d -> OOSScore(d) curve on every retrain (expensive)
+  oos_by_d_step: 3                 # evaluate every k-th candidate d for that curve
+
 paths:
   artifacts_dir: artifacts
   models_dir: artifacts/models
@@ -144,5 +155,4 @@ alpaca:
   adjustment: split            # split | raw | dividend | all  (dividend adjustment uses post-bar information)
   history_days: 1200
   poll_seconds: 15
-  mirror_orders: true          # submit mirrored market orders to the Alpaca paper account
-  fill_timeout_seconds: 60
+  mirror_orders: true          # submit mirrored whole-share market orders to the Alpaca paper account

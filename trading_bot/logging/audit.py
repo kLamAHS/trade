@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
 
@@ -19,8 +20,8 @@ from ..types import Bar, FeatureVector, Fill, Order, Prediction, RiskDecision, S
 def _clean(obj: Any) -> Any:
     if isinstance(obj, float):
         return None if not math.isfinite(obj) else obj
-    if isinstance(obj, dict):
-        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, Mapping):
+        return {str(k): _clean(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_clean(v) for v in obj]
     if hasattr(obj, "to_dict"):
@@ -55,7 +56,9 @@ class AuditLogger:
             "bar": bar.to_dict(), "validation": validation,
             "fractional_d": features.fractional_d if features else None,
             "fractional_kernel_size": features.fractional_kernel_size if features else None,
-            "features": features.values if features else None,
+            "feature_timestamp": features.timestamp.isoformat() if features else None,
+            "latest_source_timestamp": features.latest_source_timestamp.isoformat() if features else None,
+            "features": dict(features.values) if features else None,
             "prediction": prediction, "cost_estimate": cost, "signal": signal, "risk": risk, "order": order,
             "portfolio": portfolio, "extra": extra or {},
         }

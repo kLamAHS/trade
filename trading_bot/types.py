@@ -255,6 +255,7 @@ class Fill:
     new_entry: bool = False
     entry_sigma: float = math.nan
     target_exposure: float = math.nan
+    mirror: Optional[Mapping[str, Any]] = None   # broker (Alpaca) mirror status, annotation only
 
     @property
     def signed_units(self) -> float:
@@ -268,6 +269,7 @@ class Fill:
         d = asdict(self)
         d["signal_timestamp"] = self.signal_timestamp.isoformat()
         d["fill_timestamp"] = self.fill_timestamp.isoformat()
+        d["mirror"] = dict(self.mirror) if self.mirror is not None else None
         return d
 
 
@@ -275,7 +277,7 @@ class Fill:
 class PortfolioSnapshot:
     """Point-in-time ledger state consumed by the risk engine."""
 
-    timestamp: datetime
+    timestamp: Optional[datetime]
     cash: float
     units: float
     mark_price: float
@@ -295,7 +297,7 @@ class PortfolioSnapshot:
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        d["timestamp"] = self.timestamp.isoformat()
+        d["timestamp"] = self.timestamp.isoformat() if self.timestamp is not None else None
         return d
 
 

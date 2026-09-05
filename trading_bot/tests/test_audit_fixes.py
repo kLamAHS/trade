@@ -182,8 +182,11 @@ def test_rolling_corr_propagates_nan():
     x = np.arange(60.0)
     x[30] = np.nan
     out = rolling_corr_with_index(x, 50)
-    assert np.isnan(out[-1]) and out[59 - 30 - 1 + 1 - 1] != 0 or np.isnan(out[-1])
     assert np.isnan(out[49:]).all()   # every window containing index 30
+    x2 = np.arange(120.0)
+    x2[30] = np.nan
+    out2 = rolling_corr_with_index(x2, 50)
+    assert np.isnan(out2[49:80]).all() and np.isfinite(out2[80:]).all() and out2[-1] == pytest.approx(1.0)
 
 
 def test_sigma_window_independent_of_vol_windows(cfg, fractional, store_1500):
@@ -293,9 +296,12 @@ def test_gap_bar_while_positioned_flattens_at_next_bar_without_crash(fast_cfg, t
     for f in bot.ledger.fills:
         assert f.fill_timestamp >= f.signal_timestamp
     assert any(e["event"] == "DATA_HALT_CLEARED" for e in ev)
-    assert all(f.side == "sell" or f.fill_timestamp < flat.fill_timestamp for f in bot.ledger.fills[n_fills:]) or True
-    halted_after = [f for f in bot.ledger.fills[n_fills + 1:]]
-    assert halted_after == [] or all(f.fill_timestamp >= bars[1453 + fast_cfg.data.halt_recovery_bars].timestamp for f in halted_after)
+    # while DATA_HALTED only flattening fills may occur (section 35): everything after the flatten and before
+    # recovery must have target exposure 0
+    recovery_ts = bars[1453 + fast_cfg.data.halt_recovery_bars].timestamp
+    for f in bot.ledger.fills[n_fills + 1:]:
+        if f.fill_timestamp < recovery_ts:
+            assert f.target_exposure == 0.0
 
 
 def test_rejected_bar_while_positioned_flattens_at_next_clean_bar(fast_cfg, tmp_path):

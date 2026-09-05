@@ -131,6 +131,20 @@ artifacts/
 * **Live quotes.** In paper mode the NBBO quote attached to a completed bar carries its own timestamp;
   the FeatureVector's `latest_source_timestamp` is the newest source time and the feature timestamp
   is never earlier than it, so the section 3 guard is checked against real source times.
+* **Sessions and holidays.** The calendar carries rule-based NYSE holidays (plus `market.holidays`), so a
+  bar that opens later than the next trading session is a *missing session* halt while a holiday gap is not.
+* **Daily loss** is measured from the previous session's closing equity, so overnight gaps and fills at
+  the open count toward the -2.5 % limit. After a drawdown halt is lifted by an accepted retrain the
+  drawdown reference is re-based to the current equity (otherwise the halt would re-arm immediately).
+* **Max-holding re-entry.** When a fresh signal re-opens a position in the same direction after 12 bars,
+  the ledger closes the trade record and restarts the holding clock and the stop reference at the
+  current mark; a turnover-suppressed position is maintained exactly (no order, no drift trimming).
+* **Trade P&L** is net of commission only: spread and slippage are already inside the fill prices.
+  The ablation baseline runs the same hyperparameter grid and is compared best-of-grid to best-of-grid.
+* **Alpaca mirror.** Mirrored whole-share market orders are submitted the moment an order is queued (in
+  live mode that is the open of the next bar); broker acknowledgements and final statuses are recorded
+  as annotations and audit events, never as the ledger's fill, so paper and backtest accounting agree.
+  Order ids are unique per run (`<run_id>-<n>`) and double as Alpaca client order ids.
 * **Alpaca history** is split-adjusted only (`alpaca.adjustment: split`); dividend adjustment would
   rescale history with information known only after each ex-dividend date and splice badly onto
   live bars. Only bars that have closed (plus a completion grace) are ever emitted.

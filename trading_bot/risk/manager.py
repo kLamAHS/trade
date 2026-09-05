@@ -72,8 +72,13 @@ class RiskEngine:
             return True
         return False
 
-    def record_retrain(self, accepted: bool, delta_score: float) -> None:
-        """Update drawdown / ablation halts after a retraining cycle (sections 34, 40)."""
+    def record_retrain(self, accepted: bool, delta_score: float) -> bool:
+        """Update drawdown / ablation halts after a retraining cycle (sections 34, 40).
+
+        Returns True when a drawdown halt was lifted, so the caller can re-base the drawdown
+        reference (otherwise the still-depressed equity would re-arm the halt on the next bar).
+        """
+        cleared_drawdown = False
         if math.isfinite(delta_score) and delta_score > 0:
             self.ablation_failures = 0
             if self.ablation_halted:
@@ -86,7 +91,9 @@ class RiskEngine:
                 self._event("FRACTIONAL_EDGE_NOT_DETECTED", consecutive_failures=self.ablation_failures)
         if accepted and self.drawdown_halted:
             self.drawdown_halted = False
+            cleared_drawdown = True
             self._event("DRAWDOWN_HALT_CLEARED")
+        return cleared_drawdown
 
     @property
     def halted(self) -> bool:
@@ -142,7 +149,10 @@ class RiskEngine:
             stop_hit = stop_triggered(portfolio.position_return, portfolio.entry_sigma, self.horizon, self.stop_multiple)
         rule = apply_position_rules(proposed, current, portfolio.holding_bars, self.max_holding, stop_hit,
                                     self.rebalance_threshold)
-        approved = float(max(-self.max_abs, min(self.max_abs, rule.exposure)))
+        if rule.reason == "TURNOVER_SUPPRESSED":
+            approved = float(current)      # maintain the existing position exactly (section 30): no drift trimming
+        else:
+            approved = float(max(-self.max_abs, min(self.max_abs, rule.exposure)))
         if rule.stop_status == "TRIGGERED":
             self._event("STOP_LOSS", position_return=portfolio.position_return, entry_sigma=portfolio.entry_sigma)
         return RiskDecision(proposed, approved, vm, daily_status, dd_status, rule.max_holding_status, rule.reason,

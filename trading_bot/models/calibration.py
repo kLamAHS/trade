@@ -12,11 +12,12 @@ from sklearn.isotonic import IsotonicRegression
 
 
 class Calibrator:
-    def __init__(self, method: str = "isotonic", bins: int = 20):
+    def __init__(self, method: str = "isotonic", bins: int = 20, min_points: int = 10):
         if method not in ("isotonic", "binned"):
             raise ValueError("calibration method must be 'isotonic' or 'binned'")
         self.method = method
         self.bins = int(bins)
+        self.min_points = int(min_points)
         self._iso: IsotonicRegression | None = None
         self._edges: np.ndarray | None = None
         self._levels: np.ndarray | None = None
@@ -28,7 +29,7 @@ class Calibrator:
         m = np.isfinite(A) & np.isfinite(y)
         A, y = A[m], y[m]
         self.n_fit = int(len(A))
-        if len(A) < 10 or np.ptp(A) == 0:
+        if len(A) < self.min_points or np.ptp(A) == 0:
             # Degenerate: fall back to identity scaled by the slope of a least-squares fit through the origin.
             denom = float(np.sum(A * A)) if len(A) else 0.0
             slope = float(np.sum(A * y) / denom) if denom > 0 else 0.0

@@ -34,8 +34,9 @@ from .portfolio.ledger import PortfolioLedger
 from .portfolio.metrics import compute_metrics
 from .risk.manager import RiskEngine
 from .strategy.signal import SignalEngine
+from .strategy.sizing import direction_sign
 from .training.trainer import ModelTrainer, TrainingReport
-from .types import Bar, BotState, FeatureVector, Order
+from .types import Bar, BotState, FeatureVector
 
 
 class TradingBot:
@@ -54,7 +55,7 @@ class TradingBot:
         self.fractional = FractionalEngine.from_config(cfg)
         self.feature_engine = FeatureEngine(cfg, self.fractional, self.calendar)
         self.registry = ModelRegistry(root / "models")
-        self.execution = ExecutionEngine.from_config(cfg, broker)
+        self.execution = ExecutionEngine.from_config(cfg, broker, id_prefix=self.run_id)
         # The trainer works on its own feature engine so the live one is never mutated mid-bar.
         self.trainer = ModelTrainer(cfg, FeatureEngine(cfg, self.fractional, self.calendar), self.fractional,
                                     self.execution.cost_model)
@@ -63,17 +64,20 @@ class TradingBot:
         self.ledger = PortfolioLedger(float(cfg.portfolio.initial_capital), self.instrument)
         self.audit = AuditLogger(root / "audit", self.run_id, echo=self.log)
         self.diagnostics = FractionalDiagnostics(root / "diagnostics")
+        self.vol_edges = tuple(float(x) for x in (cfg.get("diagnostics", {}) or {}).get("vol_regime_edges", (0.8, 1.2)))
         self.state = BotState.INITIALIZING
         self.bars_since_retrain = 0
         self.retrain_count = 0
         self.last_report: Optional[TrainingReport] = None
         self.reports: list[dict] = []
         self.trade_contexts: list[dict] = []
-        self._entry_context: Optional[dict] = None
+        self._pending_entry_context: Optional[dict] = None    # context of the entry decision awaiting its fill
+        self._open_trade_context: Optional[dict] = None       # context of the trade currently open in the ledger
         self._pending_signal_bar: Optional[Bar] = None
         self.async_retrain = async_retrain
         self._executor = ThreadPoolExecutor(max_workers=1) if async_retrain else None
         self._retrain_future: Optional[Future] = None
+        self._retrain_pending = False
         self._lock = threading.Lock()
         self.minimum_bars = int(cfg.training.minimum_bars)
         self.retrain_every = int(cfg.training.retrain_every_bars)
@@ -94,26 +98,61 @@ class TradingBot:
             return
         self._set_state(self.risk.state_for(self.ledger.exposure), "refresh")
 
+    def _flush_events(self) -> None:
+        for ev in self.risk.events:
+            self.audit.event(ev["event"], **{k: v for k, v in ev.items() if k != "event"})
+        self.risk.events.clear()
+        for ev in self.execution.events:
+            self.audit.event(ev["event"], **{k: v for k, v in ev.items() if k != "event"})
+        self.execution.events.clear()
+
     @property
     def model(self):
         return self.registry.current
 
+    def _seed_sigma_history(self) -> None:
+        """Seed the signal engine's sigma history from the store so live sigma_ref uses the same
+        trailing window (section 28) as the validation simulator did."""
+        if self.signal_engine.has_history or not self.feature_engine.ready(self.store):
+            return
+        n = len(self.store)
+        start = max(0, n - (self.vol_reference_bars + self.feature_engine.required_history))
+        with self._lock:
+            fm = self.feature_engine.compute_matrix(self.store, start, n)
+        sigma = fm.column("sigma_h")
+        sigma = sigma[np.isfinite(sigma)][-self.vol_reference_bars:]
+        self.signal_engine.seed_sigma_history(sigma.tolist())
+
     # ---------------------------------------------------------------- fills
     def on_next_bar_open(self, bar: Bar) -> None:
         """Execute orders queued at the previous bar at this bar's open (spec section 57)."""
-        for order in self.execution.pending_orders():
-            fill = self.execution.simulate_fill(order, bar, self._pending_signal_bar)
+        orders = self.execution.pending_orders()
+        for k, order in enumerate(orders):
+            try:
+                fill = self.execution.simulate_fill(order, bar, self._pending_signal_bar)
+            except RuntimeError as exc:
+                # Execution simulator unavailable (section 35): halt, keep the orders for the next bar.
+                self.risk.set_data_halt(True, str(exc))
+                self.audit.event("DATA_HALT", reason=str(exc), requeued=len(orders) - k)
+                for o in orders[k:]:
+                    self.execution.queue.push(o)
+                self._refresh_state()
+                return
             prev_trades = len(self.ledger.trades)
+            prev_ctx = self._open_trade_context
             self.ledger.apply(fill)
             self.audit.record_fill(fill, self.ledger.state())
-            if fill.new_entry and self._entry_context is not None:
-                self._entry_context["entry_time"] = fill.fill_timestamp.isoformat()
             if len(self.ledger.trades) > prev_trades:
                 trade = self.ledger.trades[-1]
-                ctx = dict(self._entry_context or {})
-                ctx["pnl"] = trade.realized_pnl - trade.costs
+                ctx = dict(prev_ctx or {})
+                ctx["pnl"] = trade.net_pnl
+                ctx["exit_reason"] = trade.exit_reason
                 self.trade_contexts.append(ctx)
+            if fill.new_entry or (self.ledger.units != 0 and self._open_trade_context is None):
+                self._open_trade_context = self._pending_entry_context
         self._pending_signal_bar = None
+        self.execution.poll_mirrors()
+        self._flush_events()
 
     # ------------------------------------------------------------- retrain
     def _maybe_apply_retrain(self) -> None:
@@ -121,15 +160,23 @@ class TradingBot:
             report = self._retrain_future.result()
             self._retrain_future = None
             self._apply_report(report)
+            if self._retrain_pending:
+                self._retrain_pending = False
+                self.retrain(blocking=False)
 
     def retrain(self, blocking: bool = True) -> Optional[TrainingReport]:
-        self.bars_since_retrain = 0
         if self.async_retrain and not blocking:
-            if self._retrain_future is None:
-                snapshot = self.store.slice(0, len(self.store))
-                self._retrain_future = self._executor.submit(self.trainer.retrain, snapshot, self.log)
-                self.audit.event("RETRAIN_STARTED", bars=len(self.store), mode="async")
+            if self._retrain_future is not None:
+                if not self._retrain_pending:
+                    self._retrain_pending = True
+                    self.audit.event("RETRAIN_DEFERRED", reason="previous cycle still running", bars=len(self.store))
+                return None
+            self.bars_since_retrain = 0
+            snapshot = self.store.slice(0, len(self.store))
+            self._retrain_future = self._executor.submit(self.trainer.retrain, snapshot, self.log)
+            self.audit.event("RETRAIN_STARTED", bars=len(self.store), mode="async")
             return None
+        self.bars_since_retrain = 0
         self.audit.event("RETRAIN_STARTED", bars=len(self.store), mode="sync")
         report = self.trainer.retrain(self.store, self.log)
         self._apply_report(report)
@@ -150,10 +197,15 @@ class TradingBot:
             self.diagnostics.record_stationarity(report.stationarity, ts)
         self.diagnostics.record_contribution(ts, report.full_score, report.baseline_score, report.delta_score,
                                              report.accepted, report.stationarity.d_star if report.stationarity else math.nan)
-        self.risk.record_retrain(report.accepted, report.delta_score)
-        for ev in self.risk.events:
-            self.audit.event(ev["event"], **{k: v for k, v in ev.items() if k != "event"})
-        self.risk.events.clear()
+        if report.oos_by_d:
+            self.diagnostics.record_oos_by_d(report.oos_by_d, ts)
+        cleared_drawdown = self.risk.record_retrain(report.accepted, report.delta_score)
+        if cleared_drawdown:
+            # The halt is lifted by an accepted retrain (section 34); drawdown is measured afresh from here,
+            # otherwise the still-depressed equity would re-arm the halt on the very next bar.
+            self.ledger.rebase_peak()
+            self.audit.event("DRAWDOWN_REBASED", equity=round(self.ledger.equity, 2))
+        self._flush_events()
         if report.accepted and report.model is not None:
             with self._lock:
                 self.registry.promote(report.model)
@@ -170,43 +222,43 @@ class TradingBot:
             fh.write(json.dumps(summary, default=str) + "\n")
         self._refresh_state()
 
-    def _seed_sigma_history(self) -> None:
-        """Seed the signal engine's sigma history from the store so live sigma_ref uses the same
-        trailing window (section 28) as the validation simulator did."""
-        if self.signal_engine.has_history or not self.feature_engine.ready(self.store):
-            return
-        n = len(self.store)
-        start = max(0, n - (self.vol_reference_bars + self.feature_engine.required_history))
-        with self._lock:
-            fm = self.feature_engine.compute_matrix(self.store, start, n)
-        sigma = fm.column("sigma_h")
-        sigma = sigma[np.isfinite(sigma)][-self.vol_reference_bars:]
-        self.signal_engine.seed_sigma_history(sigma.tolist())
-
     # ---------------------------------------------------------- bootstrap
     def bootstrap(self, bars: Iterable[Bar]) -> int:
-        """Load history without simulating trades (paper-mode start-up): validate and store every bar,
-        mark the ledger at the end, then train once so the bot can go live on the next bar."""
+        """Load history without simulating trades (paper-mode start-up): validate and store every bar
+        (with a minimal audit record each), mark the ledger at the end, then train once."""
         stored = 0
         for bar in bars:
             self.processed += 1
             result = self.validator.validate(bar)
             if not result.storable:
                 self.rejected_bars += 1
+                self.audit.record(bar, self.state.value, validation=result.to_dict(), extra={"note": "bootstrap: rejected"})
                 continue
             if not result.ok:
                 self.halted_bars += 1
+                self.risk.set_data_halt(True, ";".join(result.reasons))
+            elif self.risk.data_halted:
+                self.risk.note_clean_bar()
             self.store.append(bar)
             stored += 1
+            self.audit.record(bar, self.state.value, validation=result.to_dict(), extra={"note": "bootstrap"})
         if len(self.store):
             last = self.store.last()
             self.ledger.mark(last.close_time, last.close, len(self.store) - 1, self.calendar.session_date(last.timestamp))
-        self.audit.event("BOOTSTRAP", bars=stored, rejected=self.rejected_bars, gaps=self.halted_bars)
+            self._save_store()
+        self.audit.event("BOOTSTRAP", bars=stored, rejected=self.rejected_bars, gaps=self.halted_bars,
+                         data_halted=self.risk.data_halted)
+        self._flush_events()
         if len(self.store) >= self.minimum_bars:
             self.retrain(blocking=True)
         if self.model is not None:
             self._set_state(self.risk.state_for(self.ledger.exposure), "bootstrap complete")
         return stored
+
+    def _save_store(self) -> Path:
+        path = self.artifacts_dir / "data" / f"{self.run_id}_{self.instrument}_{self.store.bar_minutes}m.csv"
+        self.store.save(path)
+        return path
 
     # ------------------------------------------------------------- on_bar
     def on_bar(self, bar: Bar) -> None:
@@ -266,25 +318,41 @@ class TradingBot:
         cost = self.execution.estimate_cost(features)
         signal = self.signal_engine.create(prediction, features, cost)
         decision = self.risk.evaluate(signal, self.ledger.state(), features, self.calendar.session_date(bar.timestamp))
-        for ev in self.risk.events:
-            self.audit.event(ev["event"], **{k: v for k, v in ev.items() if k != "event"})
-        self.risk.events.clear()
+        self._flush_events()
         self._refresh_state()
-        # 6. order
-        order = self.execution.build_order(
-            self.instrument, bar.close_time, self.ledger.units, self.ledger.exposure, decision.approved_exposure,
-            self.ledger.equity, bar.close, self.state, reason=decision.reason, new_entry=decision.new_entry,
-            entry_sigma=features.get("sigma_h"))
+        # 6. order (an unchanged, turnover-suppressed position is maintained: no order at all)
+        order = None
+        if decision.reason != "TURNOVER_SUPPRESSED":
+            if (decision.reason == "MAX_HOLDING_REENTRY" and self.ledger.units != 0
+                    and direction_sign(decision.approved_exposure) == direction_sign(self.ledger.units)):
+                # Same-direction re-entry (section 31): restart the holding clock and stop reference now.
+                self.ledger.reenter(features.timestamp, bar.close, features.get("sigma_h"), len(self.store) - 1)
+                if self._open_trade_context is not None:
+                    trade = self.ledger.trades[-1]
+                    ctx = dict(self._open_trade_context)
+                    ctx.update({"pnl": trade.net_pnl, "exit_reason": trade.exit_reason})
+                    self.trade_contexts.append(ctx)
+                self._open_trade_context = self._entry_context(features, bar, signal)
+                self.audit.event("MAX_HOLDING_REENTRY", exposure=round(self.ledger.exposure, 4))
+            order = self.execution.build_order(
+                self.instrument, features.timestamp, self.ledger.units, self.ledger.exposure, decision.approved_exposure,
+                self.ledger.equity, bar.close, self.state, reason=decision.reason, new_entry=decision.new_entry,
+                entry_sigma=features.get("sigma_h"))
         if order is not None:
             self.execution.queue_for_next_bar(order)
             self._pending_signal_bar = bar
             if decision.new_entry:
-                self._entry_context = {"vol_state": features.get("volatility_state"),
-                                       "minutes_since_open": self.calendar.minutes_since_open(bar.timestamp),
-                                       "session_minutes": self.calendar.session_minutes,
-                                       "fractional_d": features.fractional_d, "direction": signal.direction,
-                                       "signal_time": bar.close_time.isoformat()}
+                self._pending_entry_context = self._entry_context(features, bar, signal)
+            self._flush_events()
         self._record(bar, features, prediction, signal, decision, order, cost, validation=result)
+
+    def _entry_context(self, features: FeatureVector, bar: Bar, signal) -> dict:
+        day = self.calendar.session_date(bar.timestamp)
+        return {"vol_state": features.get("volatility_state"),
+                "minutes_since_open": self.calendar.minutes_since_open(bar.timestamp),
+                "session_minutes": self.calendar.session_minutes_for(day),
+                "fractional_d": features.fractional_d, "direction": signal.direction,
+                "signal_time": features.timestamp.isoformat()}
 
     def _flatten_if_positioned(self, bar: Bar, reason: str) -> None:
         """Queue a flattening order.  ``bar`` is the last *stored* bar: the decision is stamped with its
@@ -297,24 +365,28 @@ class TradingBot:
         if order is not None:
             self.execution.queue_for_next_bar(order)
             self._pending_signal_bar = bar
+            self._flush_events()
 
     def _handle_rejected_bar(self, bar: Bar, result: ValidationResult) -> None:
         """Corrupt input (never stored): cancel queued orders, halt, and flatten at the next clean bar."""
         self.rejected_bars += 1
         self.risk.set_data_halt(True, ";".join(result.reasons))
         self.audit.event("DATA_HALT", reasons=list(result.reasons), timestamp=bar.timestamp.isoformat(), stored=False)
-        cancelled = self.execution.pending_orders()
+        cancelled = self.execution.cancel_pending()
         if cancelled:
-            self.audit.event("ORDERS_CANCELLED", count=len(cancelled), reason="rejected bar")
+            self.audit.event("ORDERS_CANCELLED", count=len(cancelled), reason="rejected bar",
+                             order_ids=[o.order_id for o in cancelled])
         self._refresh_state()
         if len(self.store):
             self._flatten_if_positioned(self.store.last(), "DATA_HALT_FLATTEN")
+        self._flush_events()
         self._record(bar, validation=result, note="rejected bar")
 
     def _record(self, bar: Bar, features=None, prediction=None, signal=None, decision=None, order=None, cost=None,
                 validation=None, note: str = "") -> None:
+        portfolio = self.ledger.state() if self.ledger.mark_time is not None else None
         self.audit.record(bar, self.state.value, features, prediction, signal, decision, order, cost,
-                          self.ledger.state(), self.registry.current_version,
+                          portfolio, self.registry.current_version,
                           validation.to_dict() if validation else None,
                           {"note": note, "bars_since_retrain": self.bars_since_retrain,
                            "risk_halt": self.risk.halt_reason(self.calendar.session_date(bar.timestamp)),
@@ -333,9 +405,10 @@ class TradingBot:
         if self._retrain_future is not None:
             self._apply_report(self._retrain_future.result())
             self._retrain_future = None
-        groups = attribution_groups(self.trade_contexts)
+        groups = attribution_groups(self.trade_contexts, self.vol_edges)
         metrics = compute_metrics(self.ledger, int(self.cfg.market.bars_per_day),
                                   int(self.cfg.market.trading_days_per_year), groups)
+        mirror = self.execution.reconcile_mirror(self.instrument, self.ledger.units)
         summary = {
             "run_id": self.run_id, "instrument": self.instrument, "bars_processed": self.processed,
             "bars_stored": len(self.store), "rejected_bars": self.rejected_bars, "halted_bars": self.halted_bars,
@@ -346,6 +419,8 @@ class TradingBot:
             "risk": {"drawdown_halted": self.risk.drawdown_halted, "ablation_halted": self.risk.ablation_halted,
                      "ablation_failures": self.risk.ablation_failures, "data_halted": self.risk.data_halted},
             "fractional_contribution": self.diagnostics.contribution,
+            "mirror_reconciliation": mirror,
+            "config": self.cfg.to_dict(), "config_digest": self.cfg.digest(),
         }
         (self.artifacts_dir / "audit").mkdir(parents=True, exist_ok=True)
         with open(self.artifacts_dir / "audit" / f"{self.run_id}_summary.json", "w", encoding="utf-8") as fh:
@@ -353,6 +428,9 @@ class TradingBot:
         with open(self.artifacts_dir / "audit" / f"{self.run_id}_trades.jsonl", "w", encoding="utf-8") as fh:
             for t in self.ledger.trades:
                 fh.write(json.dumps(t.to_dict(), default=str) + "\n")
+        if len(self.store):
+            summary["data_file"] = str(self._save_store())
+            summary["data_checksum"] = self.store.checksum()
         self.diagnostics.save_json()
         self.diagnostics.plot()
         self.audit.event("RUN_COMPLETE", equity=round(self.ledger.equity, 2), trades=len(self.ledger.trades),

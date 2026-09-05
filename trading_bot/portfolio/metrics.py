@@ -57,8 +57,7 @@ def compute_metrics(ledger: PortfolioLedger, bars_per_day: int = 13, trading_day
     bpy = bars_per_day * trading_days_per_year
     sd = float(rets.std()) if len(rets) > 1 else 0.0
     sharpe = float(rets.mean() / sd * math.sqrt(bpy)) if sd > 0 else 0.0
-    downside = rets[rets < 0]
-    dsd = float(np.sqrt(np.mean(downside ** 2))) if len(downside) else 0.0
+    dsd = float(np.sqrt(np.mean(np.minimum(rets, 0.0) ** 2))) if len(rets) else 0.0   # target-downside deviation
     sortino = float(rets.mean() / dsd * math.sqrt(bpy)) if dsd > 0 else 0.0
     if len(eq):
         peak = np.maximum.accumulate(eq)
@@ -66,12 +65,12 @@ def compute_metrics(ledger: PortfolioLedger, bars_per_day: int = 13, trading_day
     else:
         mdd = 0.0
     trades: list[TradeRecord] = list(ledger.trades)
-    tp = np.asarray([t.realized_pnl - t.costs for t in trades], dtype=float)
+    tp = np.asarray([t.net_pnl for t in trades], dtype=float)   # fill prices already carry spread/slippage
     wins = tp[tp > 0]
     losses = tp[tp < 0]
     pf = float(wins.sum() / -losses.sum()) if len(losses) and losses.sum() < 0 else (float("inf") if len(wins) else 0.0)
-    longs = [t.realized_pnl - t.costs for t in trades if t.direction > 0]
-    shorts = [t.realized_pnl - t.costs for t in trades if t.direction < 0]
+    longs = [t.net_pnl for t in trades if t.direction > 0]
+    shorts = [t.net_pnl for t in trades if t.direction < 0]
     turnover = float(ledger.turnover_notional / init) if init > 0 else 0.0
     grouped: dict[str, dict[str, dict[str, float]]] = {}
     if groups:

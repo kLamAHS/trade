@@ -10,6 +10,7 @@ information required to reproduce it (spec section 56).
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -43,6 +44,8 @@ class FoldPrediction:
     M: np.ndarray
     P: np.ndarray
     A: np.ndarray
+    regressor: Optional[BoostedRegressor] = None
+    direction_model: Optional[DirectionModel] = None
 
 
 @dataclass
@@ -82,6 +85,8 @@ class TrainingReport:
     elapsed_seconds: float
     error: Optional[str] = None
     feature_importance: dict[str, float] = field(default_factory=dict)
+    baseline_params: dict[str, Any] = field(default_factory=dict)
+    oos_by_d: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def full_score(self) -> float:
@@ -99,7 +104,9 @@ class TrainingReport:
             "d_star": self.stationarity.d_star if self.stationarity else None,
             "d_star_selected_by": self.stationarity.selected_by if self.stationarity else None,
             "best_params": self.best_params,
+            "baseline_params": self.baseline_params,
             "grid_results": self.grid_results,
+            "oos_by_d": self.oos_by_d,
             "full_fold_scores": [m.score for m in self.full_fold_metrics],
             "baseline_fold_scores": [m.score for m in self.baseline_fold_metrics],
             "full_score": self.full_score,
@@ -146,15 +153,28 @@ class ModelTrainer:
         self.seed = int(cfg.seed)
         grid = t.hyperparameter_grid
         keys = list(grid.keys())
+        valid_keys = {f.name for f in dataclasses.fields(RegressionParams)} - {"backend", "seed", "num_threads"}
+        unknown = [k for k in keys if k not in valid_keys]
+        if unknown:
+            raise ValueError(f"hyperparameter_grid keys not applicable to the regression model: {unknown}")
         self.grid = [dict(zip(keys, combo)) for combo in itertools.product(*[list(grid[k]) for k in keys])]
         self.inner_calibration_fraction = float(t.get("inner_calibration_fraction", 0.25))
+        inner_min = list(t.get("inner_calibration_min_rows", [50, 20]))
+        self.inner_min_fit, self.inner_min_cal = int(inner_min[0]), int(inner_min[1])
+        self.min_dataset_rows = int(t.get("min_dataset_rows", 200))
+        d = cfg.get("diagnostics", {}) or {}
+        self.oos_by_d_every_retrain = bool(d.get("oos_by_d_every_retrain", False))
+        self.oos_by_d_step = int(d.get("oos_by_d_step", 3))
         self.horizon = int(cfg.prediction.horizon_bars)
         self.software_version = software_version()
 
     # ------------------------------------------------------------- helpers
     def _params(self, combo: dict[str, Any]) -> RegressionParams:
-        return RegressionParams.from_config(self.cfg, combo.get("n_estimators", 300),
+        """Every key of the grid combination is applied to the regression parameters."""
+        base = RegressionParams.from_config(self.cfg, combo.get("n_estimators", 300),
                                             combo.get("min_child_samples", 100), self.seed)
+        extra = {k: v for k, v in combo.items() if k not in ("n_estimators", "min_child_samples")}
+        return dataclasses.replace(base, **extra) if extra else base
 
     def _fit_pair(self, X: np.ndarray, y_norm: np.ndarray, y_raw: np.ndarray, combo: dict[str, Any],
                   names) -> tuple[BoostedRegressor, DirectionModel]:
@@ -165,7 +185,7 @@ class ModelTrainer:
 
     def _calibrator(self) -> Calibrator:
         c = self.cfg.models.calibration
-        return Calibrator(method=str(c.method), bins=int(c.bins))
+        return Calibrator(method=str(c.method), bins=int(c.bins), min_points=int(c.get("min_points", 10)))
 
     def _simulate(self, ds: TrainingDataset, rows: np.ndarray, E: np.ndarray, M: np.ndarray | None = None) -> ValidationMetrics:
         return simulate_validation(E, ds.y_norm[rows], ds.sigma[rows], ds.sigma_ref[rows], ds.cost_roundtrip[rows],
@@ -181,7 +201,7 @@ class ModelTrainer:
         split = int(n * (1.0 - self.inner_calibration_fraction))
         inner_train = train_rows[: max(0, split - self.purge)]
         inner_cal = train_rows[min(n, split + self.embargo):]
-        if len(inner_train) < 50 or len(inner_cal) < 20:
+        if len(inner_train) < self.inner_min_fit or len(inner_cal) < self.inner_min_cal:
             raise ValueError("training block too small for an inner calibration split")
         reg, direction = self._fit_pair(Xall[inner_train], ds.y_norm[inner_train], ds.y_raw[inner_train], combo, names)
         A, _ = combine(reg.predict(Xall[inner_cal]), direction.predict_proba_up(Xall[inner_cal]))
@@ -197,7 +217,7 @@ class ModelTrainer:
             M = reg.predict(Xall[fold.validate])
             P = direction.predict_proba_up(Xall[fold.validate])
             A, _ = combine(M, P)
-            preds.append(FoldPrediction(fold.index, fold.validate, M, P, A))
+            preds.append(FoldPrediction(fold.index, fold.validate, M, P, A, reg, direction))
         # Chronological calibration: fold i's g(A) is fitted only on out-of-sample predictions that lie
         # strictly before its validation window -- the earlier folds' validation predictions, and for the
         # first fold an inner chronological split of its own training block.  No fold metric, acceptance
@@ -263,8 +283,8 @@ class ModelTrainer:
             d_star = stationarity.d_star
             _log(f"d* = {d_star:.2f} ({stationarity.selected_by})")
             ds = self.builder.build(window, d_star)
-            if len(ds) < 200:
-                raise ValueError(f"too few valid training rows: {len(ds)}")
+            if len(ds) < self.min_dataset_rows:
+                raise ValueError(f"too few valid training rows: {len(ds)} < {self.min_dataset_rows}")
             folds = walk_forward_folds(len(ds), self.n_folds, self.first_train_fraction,
                                        self.fold_validation_fraction, self.purge, self.embargo)
             full_names = ds.feature_names
@@ -281,12 +301,20 @@ class ModelTrainer:
             grid_results = [{"params": e.params, "score": e.mean_score, "fold_scores": e.fold_scores,
                              "aggregate": e.aggregate.to_dict()} for e in evaluations]
 
-            # Ablation baseline: identical procedure without fractional features (section 40).
-            baseline = self.evaluate_candidate(ds, folds, best.params, base_names)
+            # Ablation baseline: the identical procedure (same grid, same selection rule) without the
+            # fractional features (section 40), so best-of-grid is compared with best-of-grid.
+            base_evals = [self.evaluate_candidate(ds, folds, combo, base_names) for combo in self.grid]
+            baseline = max(base_evals, key=lambda e: e.mean_score)
             delta = best.mean_score - baseline.mean_score
             acceptance = self.validator.evaluate(best.aggregate, best.fold_scores, baseline.fold_scores)
-            _log(f"baseline score={baseline.mean_score:.3f} delta={delta:.3f} accepted={acceptance.accepted} "
-                 f"{'; '.join(acceptance.reasons)}")
+            _log(f"baseline {baseline.params}: score={baseline.mean_score:.3f} delta={delta:.3f} "
+                 f"accepted={acceptance.accepted} {'; '.join(acceptance.reasons)}")
+            oos_rows: list[dict[str, Any]] = []
+            if self.oos_by_d_every_retrain:
+                from ..diagnostics.fractional_analysis import FractionalDiagnostics
+
+                candidates = [c.d for c in stationarity.candidates][:: max(1, self.oos_by_d_step)]
+                oos_rows = FractionalDiagnostics.oos_score_by_d(self, history, candidates, combo=best.params, log=_log)
 
             # Final refit on the whole window; calibration from pooled out-of-fold predictions.
             Xall = ds.columns(full_names)
@@ -298,18 +326,21 @@ class ModelTrainer:
             validation_summary = {
                 "aggregate": best.aggregate.to_dict(), "fold_scores": best.fold_scores,
                 "baseline_fold_scores": baseline.fold_scores, "baseline_aggregate": baseline.aggregate.to_dict(),
-                "delta_score": delta, "acceptance": acceptance.to_dict(),
-                "grid": grid_results, "n_folds": len(folds), "purge": self.purge, "embargo": self.embargo,
+                "baseline_params": baseline.params, "delta_score": delta, "acceptance": acceptance.to_dict(),
+                "grid": grid_results, "baseline_grid": [{"params": e.params, "score": e.mean_score} for e in base_evals],
+                "n_folds": len(folds), "purge": self.purge, "embargo": self.embargo,
             }
             extra = {"stationarity": stationarity.to_dict(), "baseline_feature_names": list(base_names),
-                     "calibration_points": calibration.n_fit, "previous_adaptive_d": previous_d}
+                     "calibration_points": calibration.n_fit, "previous_adaptive_d": previous_d,
+                     "config": self.cfg.to_dict()}
             meta = self._metadata(ds, params, full_names, validation_summary, direction, False, extra,
                                   reg.effective_params())
             model = CombinedModel(reg, direction, calibration, full_names, d_star, self.horizon, meta)
             report = TrainingReport(model, acceptance.accepted, acceptance, stationarity, dict(best.params),
                                     grid_results, best.fold_metrics, baseline.fold_metrics, best.aggregate,
                                     baseline.aggregate, float(delta), len(ds), ds.window_start, ds.window_end,
-                                    time.time() - t0, feature_importance=reg.feature_importance())
+                                    time.time() - t0, feature_importance=reg.feature_importance(),
+                                    baseline_params=dict(baseline.params), oos_by_d=oos_rows)
             return report
         except Exception as exc:
             # A failed retraining cycle never reaches the main loop: the previous accepted model keeps

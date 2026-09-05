@@ -22,6 +22,65 @@ def _parse_hhmm(text: str) -> time:
     return time(int(hh), int(mm))
 
 
+def _observed(d: date) -> date:
+    """Weekend holidays are observed on the adjacent weekday (Saturday -> Friday, Sunday -> Monday)."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    nxt = date(year + (month == 12), (month % 12) + 1, 1)
+    last = nxt - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def easter_sunday(year: int) -> date:
+    """Anonymous Gregorian computus."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def nyse_holidays(year: int) -> set[date]:
+    """Rule-based NYSE full-day closures for ``year`` (regular holidays only; ad-hoc closures such as
+    national days of mourning must be supplied through ``market.holidays``)."""
+    out = {
+        _observed(date(year, 1, 1)),                       # New Year's Day
+        _nth_weekday(year, 1, 0, 3),                       # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),                       # Presidents' Day
+        easter_sunday(year) - timedelta(days=2),           # Good Friday
+        _last_weekday(year, 5, 0),                         # Memorial Day
+        _observed(date(year, 7, 4)),                       # Independence Day
+        _nth_weekday(year, 9, 0, 1),                       # Labor Day
+        _nth_weekday(year, 11, 3, 4),                      # Thanksgiving
+        _observed(date(year, 12, 25)),                     # Christmas
+    }
+    if year >= 2022:
+        out.add(_observed(date(year, 6, 19)))              # Juneteenth
+    # New Year's Day falling on a Saturday is not observed on the preceding Friday by the NYSE.
+    if date(year, 1, 1).weekday() == 5:
+        out.discard(date(year - 1, 12, 31))
+    return out
+
+
 def nyse_early_closes(year: int) -> set[date]:
     """Rule-based NYSE 13:00 early closes for ``year``."""
     out: set[date] = set()
@@ -47,13 +106,17 @@ class SessionCalendar:
     early_close: time = time(13, 0)
     early_closes: frozenset[date] = field(default_factory=frozenset)   # explicit additions from config
     use_nyse_early_close_rules: bool = True
+    holidays: frozenset[date] = field(default_factory=frozenset)       # explicit closures from config
+    use_nyse_holiday_rules: bool = True
 
     @classmethod
     def from_config(cls, cfg) -> "SessionCalendar":
         m = cfg.market
         extra = frozenset(date.fromisoformat(str(d)) for d in (m.get("early_closes") or ()))
+        holidays = frozenset(date.fromisoformat(str(d)) for d in (m.get("holidays") or ()))
         return cls(m.timezone, _parse_hhmm(m.session_open), _parse_hhmm(m.session_close), int(m.bar_minutes),
-                   _parse_hhmm(m.get("early_close_time", "13:00")), extra, bool(m.get("nyse_early_close_rules", True)))
+                   _parse_hhmm(m.get("early_close_time", "13:00")), extra, bool(m.get("nyse_early_close_rules", True)),
+                   holidays, bool(m.get("nyse_holiday_rules", True)))
 
     # ------------------------------------------------------------ basics
     @property
@@ -67,6 +130,20 @@ class SessionCalendar:
 
     def session_date(self, ts: datetime) -> date:
         return self.local(ts).date()
+
+    def is_holiday(self, d: date) -> bool:
+        if d in self.holidays:
+            return True
+        return self.use_nyse_holiday_rules and d in nyse_holidays(d.year)
+
+    def is_trading_day(self, d: date) -> bool:
+        return d.weekday() < 5 and not self.is_holiday(d)
+
+    def next_trading_day(self, d: date) -> date:
+        nxt = d + timedelta(days=1)
+        while not self.is_trading_day(nxt):
+            nxt += timedelta(days=1)
+        return nxt
 
     def is_early_close(self, d: date) -> bool:
         if d in self.early_closes:
@@ -134,4 +211,4 @@ class SessionCalendar:
         return 0 <= self.minutes_since_open(ts) < self.session_minutes_for(loc.date())
 
 
-__all__ = ["SessionCalendar", "nyse_early_closes"]
+__all__ = ["SessionCalendar", "nyse_early_closes", "nyse_holidays", "easter_sunday"]

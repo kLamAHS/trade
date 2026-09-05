@@ -106,8 +106,15 @@ class DataValidator:
                     halt.append(f"missing bar: expected {expected.isoformat()}, got {bar.timestamp.isoformat()}")
                 else:
                     halt.append(f"missing bar: session ended early after {prev.timestamp.isoformat()}")
-        elif self.calendar.minutes_since_open(bar.timestamp) != 0:
-            halt.append("missing bar: session did not start at the open")
+        else:
+            # prev closed its session: the next bar must open the *next trading session*.
+            prev_day = self.calendar.session_date(prev.timestamp)
+            bar_day = self.calendar.session_date(bar.timestamp)
+            expected_day = self.calendar.next_trading_day(prev_day)
+            if bar_day > expected_day:
+                halt.append(f"missing session(s): expected {expected_day.isoformat()}, got {bar_day.isoformat()}")
+            if self.calendar.minutes_since_open(bar.timestamp) != 0:
+                halt.append("missing bar: session did not start at the open")
         if prev.close > 0 and bar.close > 0:
             jump = abs(math.log(bar.close / prev.close))
             if jump > self.max_abs_log_jump:

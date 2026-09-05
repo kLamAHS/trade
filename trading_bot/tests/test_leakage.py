@@ -8,11 +8,12 @@ import numpy as np
 import pytest
 
 from trading_bot.data.store import BarStore
+from trading_bot.data.synthetic import generate_synthetic_bars
 from trading_bot.execution.cost_model import CostModel
 from trading_bot.fractional.engine import FractionalEngine
 from trading_bot.fractional.stationarity import StationaryOrderEstimator
 from trading_bot.models.direction import DirectionModel
-from trading_bot.training.dataset import TrainingDatasetBuilder
+from trading_bot.training.dataset import TrainingDataset, TrainingDatasetBuilder
 from trading_bot.training.walkforward import walk_forward_folds
 from trading_bot.types import Bar
 
@@ -80,28 +81,62 @@ def test_walk_forward_folds_are_chronological_with_purge_and_embargo():
     assert folds[0].train[-1] == int(2000 * 0.4) - 5 - 1
 
 
-def test_scaling_statistics_exclude_validation_rows():
-    rng = np.random.RandomState(0)
-    X = rng.randn(500, 4)
-    y = rng.randn(500)
-    train, val = np.arange(0, 300), np.arange(320, 500)
-    X[val] += 50.0  # validation rows are wildly shifted
-    m = DirectionModel().fit(X[train], y[train])
-    assert np.allclose(m.scaler_mean, X[train].mean(axis=0))
-    assert np.allclose(m.scaler_scale, X[train].std(axis=0))
+def test_scaling_statistics_exclude_validation_rows(fast_cfg, fractional, bars_1500):
+    """The trainer's per-fold direction models scale with training-row statistics only."""
+    from trading_bot.training.trainer import ModelTrainer
+    from trading_bot.features.engine import FeatureEngine
+    from trading_bot.data.calendar import SessionCalendar
+
+    store = BarStore("SYN", 30, bars_1500)
+    trainer = ModelTrainer(fast_cfg, FeatureEngine(fast_cfg, fractional, SessionCalendar()), fractional,
+                           CostModel.from_config(fast_cfg))
+    ds = trainer.builder.build(store, 0.4)
+    folds = walk_forward_folds(len(ds), trainer.n_folds, trainer.first_train_fraction, trainer.fold_validation_fraction,
+                               trainer.purge, trainer.embargo)
+    ev = trainer.evaluate_candidate(ds, folds, trainer.grid[0], ds.feature_names)
+    Xall = ds.columns(ds.feature_names)
+    for fold, fp in zip(folds, ev.fold_predictions):
+        assert np.allclose(fp.direction_model.scaler_mean, Xall[fold.train].mean(axis=0))
+        assert np.allclose(fp.direction_model.scaler_scale, Xall[fold.train].std(axis=0))
+    # Shifting a fold's *own* validation rows must not change that fold's fitted scaler or regressor
+    # (validation blocks are training data for *later* folds, so only the fold itself is checked).
+    for i, fold in enumerate(folds):
+        ds_shift = TrainingDataset(**{**ds.__dict__, "X": ds.X.copy()})
+        ds_shift.X[fold.validate] += 25.0
+        ev2 = trainer.evaluate_candidate(ds_shift, folds[: i + 1], trainer.grid[0], ds.feature_names)
+        fp, fp2 = ev.fold_predictions[i], ev2.fold_predictions[i]
+        assert np.allclose(fp.direction_model.scaler_mean, fp2.direction_model.scaler_mean)
+        assert np.allclose(fp.direction_model.scaler_scale, fp2.direction_model.scaler_scale)
+        assert np.allclose(fp.regressor.predict(Xall[:5]), fp2.regressor.predict(Xall[:5]))
+        assert np.allclose(ev.calibrator_fold[i].predict(np.array([0.3, -0.3])), ev2.calibrator_fold[i].predict(np.array([0.3, -0.3])))
 
 
-def test_fractional_order_uses_only_training_interval():
-    rng = np.random.RandomState(6)
-    p = np.cumsum(rng.randn(2500)) / 100 + 5
-    est = StationaryOrderEstimator(candidates=[0.2, 0.5, 0.8], adf_maxlag=5)
-    interval = p[:1800]
-    d_a = est.estimate(interval).d_star
-    q = p.copy()
-    q[1800:] += np.linspace(0, 50, 700)   # corrupt the future
-    d_b = est.estimate(q[:1800]).d_star
-    assert d_a == d_b
-    assert est.estimate(interval).to_dict() == est.estimate(q[:1800]).to_dict()
+def test_fractional_order_uses_only_training_interval(fast_cfg, fractional):
+    """d* of a retrain equals the estimate on the training window alone and ignores bars outside it."""
+    from trading_bot.training.trainer import ModelTrainer
+    from trading_bot.features.engine import FeatureEngine
+    from trading_bot.data.calendar import SessionCalendar
+
+    cfg = fast_cfg.with_overrides({"training": {"window_bars": 1500, "minimum_bars": 1400},
+                                   "fractional": {"adaptive_min": 0.2, "adaptive_step": 0.25}})
+    bars = generate_synthetic_bars(1900, seed=9, instrument="SYN")
+    est = FractionalEngine.from_config(cfg)
+    trainer = ModelTrainer(cfg, FeatureEngine(cfg, est, SessionCalendar()), est, CostModel.from_config(cfg))
+    store = BarStore("SYN", 30, bars)
+    report = trainer.retrain(store)
+    window = store.last(1500)
+    assert report.stationarity.d_star == est.estimate_stationarity(window.log_close()).d_star
+    # corrupt everything *before* the window: d* must not change
+    corrupted = [Bar(b.instrument, b.timestamp, b.open * 3, b.high * 3.2, b.low * 2.9, b.close * 3, b.volume, 30)
+                 for b in bars[:400]] + bars[400:]
+    report2 = trainer.retrain(BarStore("SYN", 30, corrupted))
+    assert report2.stationarity.d_star == report.stationarity.d_star
+    assert report2.stationarity.to_dict() == report.stationarity.to_dict()
+    # corrupt the window itself: the diagnostic curve changes
+    inside = bars[:1300] + [Bar(b.instrument, b.timestamp, b.open, b.high * 1.01, b.low, b.close * (1 + 0.002 * ((i % 7) - 3)),
+                                b.volume, 30) for i, b in enumerate(bars[1300:])]
+    report3 = trainer.retrain(BarStore("SYN", 30, inside))
+    assert report3.stationarity.to_dict() != report.stationarity.to_dict()
 
 
 def test_execution_shift_all_fills_after_signal(bot_run):

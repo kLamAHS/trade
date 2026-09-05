@@ -1,9 +1,15 @@
 """Execution engine: fill simulation (spec section 43), state-consistent order
 handling (section 44) and an optional Alpaca paper-trading mirror.
 
-Fill model:
+Fill model (the ledger's source of truth in every mode):
     buy : Open_{t+1} + Spread/2 + Slippage
     sell: Open_{t+1} - Spread/2 - Slippage
+
+Alpaca mirror: when a broker is attached, every order is submitted to the paper
+account the moment it is queued (in live mode that instant is the open of bar
+t+1).  The broker's response and later fill status are recorded on the Fill as
+an annotation (``Fill.mirror``) and as audit events; they never replace the
+simulated fill, so backtest and paper accounting stay identical.
 """
 
 from __future__ import annotations
@@ -11,7 +17,7 @@ from __future__ import annotations
 import math
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from ..types import Bar, BotState, CostEstimate, FeatureVector, Fill, Order
 from .cost_model import CostModel
@@ -34,40 +40,44 @@ class ExecutionSimulator:
         slip = self.cost_model.slippage_per_side(range_rel)
         half_spread_px = 0.5 * spread * ref
         slip_px = slip * ref
-        if order.side == "buy":
-            price = ref + half_spread_px + slip_px
-        else:
-            price = ref - half_spread_px - slip_px
+        price = ref + half_spread_px + slip_px if order.side == "buy" else ref - half_spread_px - slip_px
         return price, half_spread_px, slip_px
 
-    def simulate_fill(self, order: Order, exec_bar: Bar, signal_bar: Bar | None = None) -> Fill:
-        if exec_bar.timestamp < order.signal_timestamp:
-            raise ValueError("execution bar precedes the signal timestamp")
+    def simulate_fill(self, order: Order, exec_bar: Bar, signal_bar: Bar | None = None,
+                      mirror: Optional[dict[str, Any]] = None) -> Fill:
+        # The execution bar must still be open at the signal time: a decision can never fill on a bar
+        # that ended before it was made.  The fill is stamped at the later of the bar open and the
+        # signal time (in live mode a decision made seconds after the close fills seconds after the open).
+        if exec_bar.close_time <= order.signal_timestamp:
+            raise ValueError("execution bar ended before the signal timestamp")
         price, half_spread_px, slip_px = self.fill_price(order, exec_bar, signal_bar)
         notional = order.units * price
+        fill_time = max(exec_bar.timestamp, order.signal_timestamp)
         return Fill(order_id=order.order_id, instrument=order.instrument, signal_timestamp=order.signal_timestamp,
-                    fill_timestamp=exec_bar.timestamp, side=order.side, units=order.units, reference_price=exec_bar.open,
+                    fill_timestamp=fill_time, side=order.side, units=order.units, reference_price=exec_bar.open,
                     fill_price=price, spread_cost=half_spread_px * order.units, slippage_cost=slip_px * order.units,
                     commission=self.cost_model.commission_per_side * notional, source="simulator",
-                    new_entry=order.new_entry, entry_sigma=order.entry_sigma, target_exposure=order.target_exposure)
+                    new_entry=order.new_entry, entry_sigma=order.entry_sigma, target_exposure=order.target_exposure,
+                    mirror=mirror)
 
 
 class AlpacaPaperBroker:
-    """Mirrors exposure changes as market orders to an Alpaca paper account.
+    """Mirrors exposure changes as whole-share market orders to an Alpaca paper account.
 
-    The internal ledger remains the source of truth; when Alpaca reports a fill
-    price it replaces the simulated fill price so the audit trail records what
-    actually happened in the paper account.
+    The internal ledger remains the source of truth; broker responses are annotations.
+    Quantities are rounded to whole shares because Alpaca does not accept fractional
+    short sales, and the account position is reconciled against the ledger on request.
     """
 
+    FINAL = ("filled", "canceled", "cancelled", "expired", "rejected", "replaced", "stopped", "suspended")
+
     def __init__(self, api_key: str | None = None, secret_key: str | None = None, paper: bool = True,
-                 fill_timeout_seconds: int = 60, trading_client=None):
+                 trading_client=None):
         import os
 
         self.api_key = api_key or os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_API_KEY")
         self.secret_key = secret_key or os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("ALPACA_SECRET_KEY")
         self.paper = paper
-        self.fill_timeout = fill_timeout_seconds
         self._client = trading_client
 
     @property
@@ -80,28 +90,48 @@ class AlpacaPaperBroker:
             self._client = TradingClient(self.api_key, self.secret_key, paper=self.paper)
         return self._client
 
-    def submit(self, order: Order) -> Optional[dict]:
+    @staticmethod
+    def _summary(o) -> dict[str, Any]:
+        status = str(getattr(o, "status", "")).lower().split(".")[-1]
+        avg = getattr(o, "filled_avg_price", None)
+        qty = getattr(o, "filled_qty", None)
+        return {"id": str(getattr(o, "id", "")), "status": status,
+                "filled_qty": float(qty) if qty not in (None, "") else 0.0,
+                "filled_avg_price": float(avg) if avg not in (None, "") else None,
+                "final": status in AlpacaPaperBroker.FINAL}
+
+    def submit(self, order: Order) -> dict[str, Any]:
+        """Submit immediately and return the broker's acknowledgement (no blocking poll)."""
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
 
-        qty = round(order.units, 6)
+        qty = int(round(order.units))
         if qty <= 0:
-            return None
+            return {"id": None, "status": "skipped", "reason": "rounds to zero shares", "final": True}
         req = MarketOrderRequest(symbol=order.instrument, qty=qty,
                                  side=OrderSide.BUY if order.side == "buy" else OrderSide.SELL,
                                  time_in_force=TimeInForce.DAY, client_order_id=order.order_id[:48])
-        resp = self.client.submit_order(req)
-        deadline = time.time() + self.fill_timeout
-        while time.time() < deadline:
-            o = self.client.get_order_by_id(resp.id)
-            status = str(getattr(o, "status", "")).lower()
-            if "filled" in status and getattr(o, "filled_avg_price", None):
-                return {"id": str(o.id), "filled_avg_price": float(o.filled_avg_price),
-                        "filled_qty": float(o.filled_qty or qty), "status": status}
-            if any(s in status for s in ("canceled", "rejected", "expired")):
-                return {"id": str(o.id), "status": status}
-            time.sleep(1.0)
-        return {"id": str(resp.id), "status": "timeout"}
+        try:
+            resp = self.client.submit_order(req)
+        except Exception as exc:
+            return {"id": None, "status": "error", "reason": str(exc), "final": True}
+        out = self._summary(resp)
+        out["submitted_at"] = datetime.now(timezone.utc).isoformat()
+        out["qty"] = qty
+        return out
+
+    def check(self, broker_order_id: str) -> dict[str, Any]:
+        try:
+            return self._summary(self.client.get_order_by_id(broker_order_id))
+        except Exception as exc:
+            return {"id": broker_order_id, "status": "error", "reason": str(exc), "final": False}
+
+    def position_qty(self, symbol: str) -> Optional[float]:
+        try:
+            pos = self.client.get_open_position(symbol)
+            return float(pos.qty)
+        except Exception:
+            return 0.0 if self._client is not None else None
 
     def account_equity(self) -> Optional[float]:
         try:
@@ -122,11 +152,14 @@ class ExecutionEngine:
         self.broker = broker
         self.available = True
         self.rejected: list[tuple[Order, str]] = []
+        self.mirror_acks: dict[str, dict[str, Any]] = {}      # order_id -> broker acknowledgement
+        self.pending_mirrors: dict[str, str] = {}             # order_id -> broker order id awaiting a final status
+        self.events: list[dict[str, Any]] = []
 
     @classmethod
-    def from_config(cls, cfg, broker: AlpacaPaperBroker | None = None) -> "ExecutionEngine":
+    def from_config(cls, cfg, broker: AlpacaPaperBroker | None = None, id_prefix: str | None = None) -> "ExecutionEngine":
         e = cfg.execution
-        return cls(CostModel.from_config(cfg), OrderBuilder(e.min_order_notional), e.slippage_reference, broker)
+        return cls(CostModel.from_config(cfg), OrderBuilder(e.min_order_notional, id_prefix), e.slippage_reference, broker)
 
     # ---------------------------------------------------------------- costs
     def estimate_cost(self, market_state: FeatureVector) -> CostEstimate:
@@ -153,18 +186,24 @@ class ExecutionEngine:
     def consistent_with_state(order: Order, state: BotState) -> tuple[bool, str]:
         if state == BotState.INITIALIZING:
             return False, "orders are not allowed while INITIALIZING"
-        increases = abs(order.target_exposure) > abs(order.current_exposure) + 1e-12 or \
-            (order.target_exposure != 0 and math.copysign(1, order.target_exposure) != math.copysign(1, order.current_exposure or order.target_exposure))
         if state in (BotState.RISK_HALTED, BotState.DATA_HALTED) and order.target_exposure != 0.0:
             return False, f"only flattening orders are allowed while {state.value}"
-        if state in (BotState.RISK_HALTED, BotState.DATA_HALTED) and increases:
-            return False, f"exposure increase rejected while {state.value}"
         return True, "OK"
 
     def queue_for_next_bar(self, order: Order) -> None:
+        """Queue for the next bar's open; with a broker attached the mirror order is submitted now."""
         self.queue.push(order)
+        if self.broker is not None:
+            ack = self.broker.submit(order)
+            self.mirror_acks[order.order_id] = ack
+            self.events.append({"event": "ORDER_MIRROR", "order_id": order.order_id, **ack})
+            if ack.get("id") and not ack.get("final"):
+                self.pending_mirrors[order.order_id] = ack["id"]
 
     def pending_orders(self) -> list[Order]:
+        return self.queue.pop_all()
+
+    def cancel_pending(self) -> list[Order]:
         return self.queue.pop_all()
 
     def has_pending(self) -> bool:
@@ -174,22 +213,34 @@ class ExecutionEngine:
     def simulate_fill(self, order: Order, bar: Bar, signal_bar: Bar | None = None) -> Fill:
         if not self.available:
             raise RuntimeError("execution simulator unavailable")
-        fill = self.simulator.simulate_fill(order, bar, signal_bar)
-        if self.broker is not None:
-            try:
-                resp = self.broker.submit(order)
-            except Exception as exc:  # pragma: no cover - network dependent
-                resp = {"status": f"error: {exc}"}
-            if resp and resp.get("filled_avg_price"):
-                px = float(resp["filled_avg_price"])
-                units = float(resp.get("filled_qty", order.units))
-                fill = Fill(order_id=fill.order_id, instrument=fill.instrument, signal_timestamp=fill.signal_timestamp,
-                            fill_timestamp=datetime.now(timezone.utc), side=fill.side, units=units,
-                            reference_price=bar.open, fill_price=px,
-                            spread_cost=max(0.0, (px - bar.open) * units if order.side == "buy" else (bar.open - px) * units),
-                            slippage_cost=0.0, commission=fill.commission, source="alpaca",
-                            new_entry=fill.new_entry, entry_sigma=fill.entry_sigma, target_exposure=fill.target_exposure)
-        return fill
+        mirror = self.mirror_acks.pop(order.order_id, None)
+        if mirror is not None and order.order_id in self.pending_mirrors and self.broker is not None:
+            latest = self.broker.check(self.pending_mirrors[order.order_id])
+            mirror = {**mirror, **{k: v for k, v in latest.items() if v is not None}}
+            if latest.get("final"):
+                self.pending_mirrors.pop(order.order_id, None)
+                self.events.append({"event": "ORDER_MIRROR_FINAL", "order_id": order.order_id, **latest})
+        return self.simulator.simulate_fill(order, bar, signal_bar, mirror)
+
+    def poll_mirrors(self) -> None:
+        """Refresh broker statuses for mirrored orders that were not final at fill time."""
+        if self.broker is None or not self.pending_mirrors:
+            return
+        for order_id, broker_id in list(self.pending_mirrors.items()):
+            latest = self.broker.check(broker_id)
+            if latest.get("final"):
+                self.pending_mirrors.pop(order_id, None)
+                self.events.append({"event": "ORDER_MIRROR_FINAL", "order_id": order_id, **latest})
+
+    def reconcile_mirror(self, instrument: str, ledger_units: float, tolerance: float = 1.0) -> Optional[dict[str, Any]]:
+        """Compare the broker's position with the ledger; returns a drift record when they differ."""
+        if self.broker is None:
+            return None
+        qty = self.broker.position_qty(instrument)
+        if qty is None:
+            return None
+        return {"broker_qty": qty, "ledger_units": ledger_units, "drift": qty - ledger_units,
+                "flagged": abs(qty - ledger_units) > tolerance}
 
 
 __all__ = ["ExecutionSimulator", "ExecutionEngine", "AlpacaPaperBroker"]

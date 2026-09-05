@@ -140,7 +140,7 @@ def cmd_paper(args) -> int:
     cfg = build_config(args)
     broker = None
     if cfg.alpaca.mirror_orders and not args.no_mirror:
-        broker = AlpacaPaperBroker(paper=bool(cfg.alpaca.paper), fill_timeout_seconds=int(cfg.alpaca.fill_timeout_seconds))
+        broker = AlpacaPaperBroker(paper=bool(cfg.alpaca.paper))
     bot = TradingBot(cfg, run_id=args.run_id, artifacts_dir=args.artifacts, broker=broker, log=print, async_retrain=True)
     feed = AlpacaBarFeed(cfg.market.instrument, bot.calendar, feed=cfg.alpaca.feed,
                          bar_minutes=int(cfg.market.bar_minutes), poll_seconds=int(cfg.alpaca.poll_seconds),

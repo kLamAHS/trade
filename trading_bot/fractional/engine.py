@@ -26,7 +26,7 @@ class FractionalEngine:
             adaptive_min=f.adaptive_min, adaptive_max=f.adaptive_max, adaptive_step=f.adaptive_step,
             adf_pvalue_max=f.adf_pvalue_max, kpss_pvalue_min=f.kpss_pvalue_min,
             weight_threshold=f.weight_threshold, weight_threshold_run=f.weight_threshold_run,
-            max_lags=f.max_lags, adf_maxlag=f.adf_maxlag)
+            max_lags=f.max_lags, adf_maxlag=f.adf_maxlag, min_observations=int(f.get("min_observations", 50)))
         return cls(f.weight_threshold, f.weight_threshold_run, f.max_lags, estimator)
 
     def build_weights(self, d: float, threshold: float | None = None, max_lags: int | None = None) -> np.ndarray:

@@ -9,11 +9,15 @@ from trading_bot.fractional.weights import build_weights, kernel_length, weight_
 
 
 def test_first_weight_is_one_and_recursion_matches_binomial():
+    from scipy.special import binom
+
     for d in (0.05, 0.25, 0.4, 0.5, 0.75, 0.95):
         w = build_weights(d)
         assert w[0] == 1.0
         for k in range(1, min(len(w), 120)):
             assert abs(w[k] - weight_via_binomial(d, k)) < 1e-12
+            # independent oracle: (-1)^k * C(d, k) via the gamma-function binomial
+            assert w[k] == pytest.approx(((-1.0) ** k) * binom(d, k), rel=1e-9, abs=1e-14)
 
 
 def test_d_zero_is_identity_and_d_one_is_first_difference():

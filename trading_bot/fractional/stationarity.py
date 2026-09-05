@@ -79,7 +79,7 @@ class StationaryOrderEstimator:
     def __init__(self, adaptive_min: float = 0.05, adaptive_max: float = 0.95, adaptive_step: float = 0.05,
                  adf_pvalue_max: float = 0.05, kpss_pvalue_min: float = 0.05,
                  weight_threshold: float = 1e-5, weight_threshold_run: int = 10, max_lags: int = 500,
-                 adf_maxlag: int | None = 20, candidates: Sequence[float] | None = None):
+                 adf_maxlag: int | None = 20, candidates: Sequence[float] | None = None, min_observations: int = 50):
         if candidates is None:
             n_steps = int(round((adaptive_max - adaptive_min) / adaptive_step)) + 1
             candidates = [round(adaptive_min + i * adaptive_step, 10) for i in range(n_steps)]
@@ -90,6 +90,7 @@ class StationaryOrderEstimator:
         self.weight_threshold_run = weight_threshold_run
         self.max_lags = max_lags
         self.adf_maxlag = adf_maxlag
+        self.min_observations = int(min_observations)
 
     def evaluate(self, log_price: np.ndarray) -> list[CandidateResult]:
         p = np.asarray(log_price, dtype=float)
@@ -102,7 +103,7 @@ class StationaryOrderEstimator:
             x = fd[valid]
             orig = p[valid]
             kernel = int(np.argmax(valid)) if valid.any() else len(p)
-            if len(x) < 50 or not np.isfinite(x).all() or np.std(x) == 0:
+            if len(x) < self.min_observations or not np.isfinite(x).all() or np.std(x) == 0:
                 results.append(CandidateResult(d, math.nan, math.nan, math.nan, math.nan, math.nan, len(x), kernel))
                 continue
             try:
