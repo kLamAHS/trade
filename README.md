@@ -35,7 +35,8 @@ It binds to localhost only.
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev,plots]"
+pip install -r requirements.lock && pip install -e . --no-deps   # exact tested environment
+# or: pip install -e ".[dev,plots]"                                # latest compatible versions
 
 # 1. Synthetic end-to-end demo (random walk + stationary long-memory component)
 python -m trading_bot.main backtest --synthetic 6000 --fast --symbol SYN
@@ -136,13 +137,23 @@ artifacts/
   curvature features, sections 10-11).
 * **EWMA variance** uses a finite kernel of 450 bars (`lambda^450 ~ 1e-12`) so streaming and batch
   values are bit-identical.
+* **Paper only.** The application can only talk to Alpaca's paper endpoint; there is no setting, flag
+  or page control that enables live trading (`docs/AUDIT_RESPONSE.md`, finding 1).
+* **Fill timing.** A fill may only use a price observed at or after the decision: the next bar's open
+  in backtests; in live paper mode the NBBO quote at decision time (or a deferral to the following
+  open), optionally the broker's actual fill (`execution.live_fill_source`).
+* **Label.** `Y_t = log O_{t+1+H} - log O_{t+1}` by default (`prediction.label_price: open`): the
+  H-bar return of a position entered at the first tradable price after the signal. The strategy
+  re-evaluates that forecast every bar and re-targets exposure under turnover suppression and the
+  12-bar holding limit; the validation simulator applies exactly the live rules.
+* **Fold-local d\*.** Each walk-forward fold estimates the adaptive order on its own training block
+  and rebuilds its features with it; only the production refit uses the whole-window d\*.
+* **Outer holdout.** The newest 15 % of the training window is never used for selection; acceptance,
+  the ablation score `S_F - S_0` and the `holdout_edge` check are read there once.
 * **Calibration** is strictly chronological: fold *k*'s calibrator is fitted on out-of-sample
   predictions that end before its validation window (earlier folds' validation predictions plus an
   inner chronological split of fold 1's training block); the production calibrator uses all pooled
   out-of-fold predictions. `A = 0` always maps to `E = 0`.
-* **Adaptive order `d*`** is estimated once per retraining cycle on the whole training window before
-  the folds are carved out, exactly as the section 58 pseudo-code prescribes (a single scalar with
-  negligible leakage capacity); the leakage test checks it depends only on that window.
 * **Sessions.** Early-close days (NYSE rules plus `market.early_closes`) have a 13:00 close: the time
   features use that day's session length and the validator does not flag the short session as a gap.
 * **Live quotes.** In paper mode the NBBO quote attached to a completed bar carries its own timestamp;
@@ -174,6 +185,14 @@ artifacts/
   `data.halt_recovery_bars` consecutive clean bars.
 * **Synthetic data** (`--synthetic`) is a random walk plus a stationary ARFIMA(0, d, 0) component
   with U-shaped intraday volatility; it exists for tests and demos only.
+
+## Reproducibility and CI
+
+`requirements.lock` pins the tested environment. Every model artifact stores the data checksum,
+configuration, fractional kernel, seed, effective model parameters and the software environment
+(Python, platform, package versions, git commit), all of which enter the model id. GitHub Actions
+(`.github/workflows/ci.yml`) runs the suite and a smoke backtest on every push. See
+`docs/AUDIT_RESPONSE.md` for the changes made in response to the September 2026 source audit.
 
 ## Tests (spec sections 54-55)
 

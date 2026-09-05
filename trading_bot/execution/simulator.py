@@ -5,6 +5,18 @@ Fill model (the ledger's source of truth in every mode):
     buy : Open_{t+1} + Spread/2 + Slippage
     sell: Open_{t+1} - Spread/2 - Slippage
 
+Temporal rule: a fill may only use a price observed at or after the decision.  In a
+bar backtest the decision is stamped at the bar close, which is the next bar's open
+print, so the next open is the first tradable price.  In live paper mode the
+decision is made seconds after the close (bars arrive with a delay), so the next
+bar's open print already predates it: the fill then uses the NBBO quote observed at
+decision time (buy at ask, sell at bid, plus slippage), and if no such quote exists
+the order is deferred to the following bar's open.  It is never filled at a price
+that existed before the signal.
+
+Live trading is not supported by this application: the broker adapter refuses any
+configuration other than the Alpaca *paper* endpoint.
+
 Alpaca mirror: when a broker is attached, every order is submitted to the paper
 account the moment it is queued (in live mode that instant is the open of bar
 t+1).  The broker's response and later fill status are recorded on the Fill as
@@ -16,12 +28,16 @@ from __future__ import annotations
 
 import math
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from ..types import Bar, BotState, CostEstimate, FeatureVector, Fill, Order
 from .cost_model import CostModel
 from .orders import OrderBuilder, OrderQueue
+
+
+class FillDeferred(Exception):
+    """No price observed at/after the decision is available on this bar; fill on a later bar."""
 
 
 class ExecutionSimulator:
@@ -45,28 +61,58 @@ class ExecutionSimulator:
 
     def simulate_fill(self, order: Order, exec_bar: Bar, signal_bar: Bar | None = None,
                       mirror: Optional[dict[str, Any]] = None) -> Fill:
-        # The execution bar must still be open at the signal time: a decision can never fill on a bar
-        # that ended before it was made.  The fill is stamped at the later of the bar open and the
-        # signal time (in live mode a decision made seconds after the close fills seconds after the open).
         if exec_bar.close_time <= order.signal_timestamp:
             raise ValueError("execution bar ended before the signal timestamp")
-        price, half_spread_px, slip_px = self.fill_price(order, exec_bar, signal_bar)
+        if exec_bar.timestamp >= order.signal_timestamp:
+            # The open print occurs at/after the decision: the standard next-open fill.
+            price, half_spread_px, slip_px = self.fill_price(order, exec_bar, signal_bar)
+            reference, fill_time, source = exec_bar.open, exec_bar.timestamp, "next_open"
+        else:
+            # The bar opened before the decision was made; its open is not an available price.
+            quote_ok = (signal_bar is not None and signal_bar.bid is not None and signal_bar.ask is not None
+                        and signal_bar.quote_timestamp is not None
+                        and signal_bar.quote_timestamp >= order.signal_timestamp - timedelta(seconds=1))
+            if not quote_ok:
+                raise FillDeferred("no price observed at or after the decision on this bar")
+            range_rel = (signal_bar.high - signal_bar.low) / signal_bar.close
+            mid = 0.5 * (signal_bar.bid + signal_bar.ask)
+            slip_px = self.cost_model.slippage_per_side(range_rel) * mid
+            half_spread_px = 0.5 * (signal_bar.ask - signal_bar.bid)
+            price = (signal_bar.ask + slip_px) if order.side == "buy" else (signal_bar.bid - slip_px)
+            reference, fill_time, source = mid, max(signal_bar.quote_timestamp, order.signal_timestamp), "quote"
         notional = order.units * price
-        fill_time = max(exec_bar.timestamp, order.signal_timestamp)
         return Fill(order_id=order.order_id, instrument=order.instrument, signal_timestamp=order.signal_timestamp,
-                    fill_timestamp=fill_time, side=order.side, units=order.units, reference_price=exec_bar.open,
+                    fill_timestamp=fill_time, side=order.side, units=order.units, reference_price=reference,
                     fill_price=price, spread_cost=half_spread_px * order.units, slippage_cost=slip_px * order.units,
                     commission=self.cost_model.commission_per_side * notional, source="simulator",
                     new_entry=order.new_entry, entry_sigma=order.entry_sigma, target_exposure=order.target_exposure,
-                    mirror=mirror)
+                    mirror=mirror, price_source=source)
+
+
+class LiveTradingNotSupported(RuntimeError):
+    """Raised whenever anything other than the Alpaca paper endpoint would be used."""
+
+
+def paper_trading_client(api_key: str, secret_key: str):
+    """The only way this application constructs an Alpaca TradingClient: paper endpoint, verified."""
+    from alpaca.trading.client import TradingClient
+
+    if not api_key or not secret_key:
+        raise RuntimeError("Alpaca credentials missing: set APCA_API_KEY_ID and APCA_API_SECRET_KEY")
+    client = TradingClient(api_key, secret_key, paper=True)
+    base = str(getattr(client, "_base_url", "") or "")
+    if base and "paper" not in base.lower():
+        raise LiveTradingNotSupported(f"trading client is not on the paper endpoint ({base})")
+    return client
 
 
 class AlpacaPaperBroker:
-    """Mirrors exposure changes as whole-share market orders to an Alpaca paper account.
+    """Mirrors exposure changes as whole-share market orders to an Alpaca *paper* account.
 
-    The internal ledger remains the source of truth; broker responses are annotations.
-    Quantities are rounded to whole shares because Alpaca does not accept fractional
-    short sales, and the account position is reconciled against the ledger on request.
+    Live trading is not supported: ``paper`` must be True and the client is verified to
+    target the paper endpoint.  The internal ledger remains the source of truth; broker
+    responses are annotations.  Quantities are rounded to whole shares because Alpaca
+    does not accept fractional short sales.
     """
 
     FINAL = ("filled", "canceled", "cancelled", "expired", "rejected", "replaced", "stopped", "suspended")
@@ -75,19 +121,17 @@ class AlpacaPaperBroker:
                  trading_client=None):
         import os
 
+        if paper is not True:
+            raise LiveTradingNotSupported("live trading is not supported by this application (paper must be True)")
         self.api_key = api_key or os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_API_KEY")
         self.secret_key = secret_key or os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("ALPACA_SECRET_KEY")
-        self.paper = paper
+        self.paper = True
         self._client = trading_client
 
     @property
     def client(self):
         if self._client is None:
-            from alpaca.trading.client import TradingClient
-
-            if not self.api_key or not self.secret_key:
-                raise RuntimeError("Alpaca credentials missing: set APCA_API_KEY_ID and APCA_API_SECRET_KEY")
-            self._client = TradingClient(self.api_key, self.secret_key, paper=self.paper)
+            self._client = paper_trading_client(self.api_key, self.secret_key)
         return self._client
 
     @staticmethod
@@ -175,12 +219,16 @@ class ExecutionEngine:
     """Builds, queues and fills orders; enforces state consistency (section 44)."""
 
     def __init__(self, cost_model: CostModel, order_builder: OrderBuilder | None = None,
-                 slippage_reference: str = "execution_bar", broker: AlpacaPaperBroker | None = None):
+                 slippage_reference: str = "execution_bar", broker: AlpacaPaperBroker | None = None,
+                 live_fill_source: str = "quote"):
+        if live_fill_source not in ("quote", "broker"):
+            raise ValueError("execution.live_fill_source must be 'quote' or 'broker'")
         self.cost_model = cost_model
         self.simulator = ExecutionSimulator(cost_model, slippage_reference)
         self.builder = order_builder or OrderBuilder()
         self.queue = OrderQueue()
         self.broker = broker
+        self.live_fill_source = live_fill_source
         self.available = True
         self.rejected: list[tuple[Order, str]] = []
         self.mirror_acks: dict[str, dict[str, Any]] = {}      # order_id -> broker acknowledgement
@@ -190,7 +238,8 @@ class ExecutionEngine:
     @classmethod
     def from_config(cls, cfg, broker: AlpacaPaperBroker | None = None, id_prefix: str | None = None) -> "ExecutionEngine":
         e = cfg.execution
-        return cls(CostModel.from_config(cfg), OrderBuilder(e.min_order_notional, id_prefix), e.slippage_reference, broker)
+        return cls(CostModel.from_config(cfg), OrderBuilder(e.min_order_notional, id_prefix), e.slippage_reference, broker,
+                   str(e.get("live_fill_source", "quote")))
 
     # ---------------------------------------------------------------- costs
     def estimate_cost(self, market_state: FeatureVector) -> CostEstimate:
@@ -268,7 +317,29 @@ class ExecutionEngine:
             if latest.get("final"):
                 self.pending_mirrors.pop(order.order_id, None)
                 self.events.append({"event": "ORDER_MIRROR_FINAL", "order_id": order.order_id, **latest})
-        return self.simulator.simulate_fill(order, bar, signal_bar, mirror)
+        broker_px = (mirror or {}).get("filled_avg_price") if (mirror and mirror.get("status") == "filled") else None
+        try:
+            fill = self.simulator.simulate_fill(order, bar, signal_bar, mirror)
+        except FillDeferred:
+            if self.live_fill_source == "broker" and broker_px:
+                fill = None
+            else:
+                raise
+        if self.live_fill_source == "broker" and broker_px:
+            # Paper mode with the broker's actual fill as the ledger price (observed after the decision by
+            # construction: the mirror order was submitted at decision time).
+            px = float(broker_px)
+            units = float(mirror.get("filled_qty") or order.units) if mirror.get("qty") else order.units
+            units = min(units, order.units) if units > 0 else order.units
+            ref = fill.reference_price if fill is not None else px
+            adverse = max(0.0, (px - ref) if order.side == "buy" else (ref - px))
+            return Fill(order_id=order.order_id, instrument=order.instrument, signal_timestamp=order.signal_timestamp,
+                        fill_timestamp=max(order.signal_timestamp, bar.timestamp), side=order.side, units=units,
+                        reference_price=ref, fill_price=px, spread_cost=adverse * units, slippage_cost=0.0,
+                        commission=self.cost_model.commission_per_side * px * units, source="broker",
+                        new_entry=order.new_entry, entry_sigma=order.entry_sigma, target_exposure=order.target_exposure,
+                        mirror=mirror, price_source="broker")
+        return fill
 
     def poll_mirrors(self) -> None:
         """Refresh broker statuses for mirrored orders that were not final at fill time."""
@@ -291,4 +362,5 @@ class ExecutionEngine:
                 "flagged": abs(qty - ledger_units) > tolerance}
 
 
-__all__ = ["ExecutionSimulator", "ExecutionEngine", "AlpacaPaperBroker"]
+__all__ = ["ExecutionSimulator", "ExecutionEngine", "AlpacaPaperBroker", "FillDeferred", "LiveTradingNotSupported",
+           "paper_trading_client"]

@@ -28,7 +28,6 @@ class GuiSettings:
     synthetic_bars: int = 6000
     synthetic_seed: int = 0
     fast: bool = True
-    paper: bool = True                # Alpaca paper account (live trading is never enabled from the GUI)
     mirror_orders: bool = True
     history_days: int = 1200
     artifacts_dir: str = "artifacts"
@@ -37,7 +36,7 @@ class GuiSettings:
     config_path: str = ""             # optional alternative strategy YAML
 
     PUBLIC_FIELDS = ("api_key", "symbol", "mode", "data_source", "csv_path", "synthetic_bars", "synthetic_seed",
-                     "fast", "paper", "mirror_orders", "history_days", "artifacts_dir", "initial_capital",
+                     "fast", "mirror_orders", "history_days", "artifacts_dir", "initial_capital",
                      "overrides", "config_path")
 
     # ------------------------------------------------------------ persistence
@@ -75,8 +74,8 @@ class GuiSettings:
         changed: list[str] = []
         types = {f.name: f.type for f in fields(self)}
         for key, value in data.items():
-            if key not in types or key == "PUBLIC_FIELDS":
-                continue
+            if key not in types or key == "PUBLIC_FIELDS" or key == "paper":
+                continue          # 'paper' is not a setting: this application only ever uses the paper endpoint
             if key == "secret_key" and (value is None or value == ""):
                 continue
             current = getattr(self, key)
@@ -95,6 +94,7 @@ class GuiSettings:
 
     def public(self) -> dict[str, Any]:
         d = {k: getattr(self, k) for k in self.PUBLIC_FIELDS}
+        d["paper"] = True          # informational only; cannot be changed
         d["secret_key_set"] = bool(self.secret_key)
         d["secret_key_hint"] = ("•••• " + self.secret_key[-4:]) if len(self.secret_key) >= 8 else ("set" if self.secret_key else "")
         return d

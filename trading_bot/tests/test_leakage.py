@@ -51,18 +51,25 @@ def test_future_bar_mutation_leaves_past_labels_identical(cfg, feature_engine, b
 
 
 def test_label_definition_is_executable_forward_return(cfg, feature_engine, bars_1500):
+    """Default label: H-bar return of a position entered at the next open, O_{t+1} -> O_{t+1+H}."""
     builder = TrainingDatasetBuilder.from_config(cfg, feature_engine, CostModel.from_config(cfg))
     store = BarStore("SYN", 30, bars_1500)
     ds = builder.build(store, 0.35)
     H = cfg.prediction.horizon_bars
-    p = np.log(store.arrays()["close"])
+    o = np.log(store.arrays()["open"])
     for k in (0, 10, len(ds) - 1):
         t = ds.bar_index[k]
-        assert ds.y_raw[k] == pytest.approx(p[t + H + 1] - p[t + 1])
+        assert ds.y_raw[k] == pytest.approx(o[t + H + 1] - o[t + 1])
         assert ds.y_norm[k] == pytest.approx(ds.y_raw[k] / (ds.sigma[k] * math.sqrt(H) + 1e-12))
         assert ds.open_next[k] == store[t + 1].open
         assert ds.open_next2[k] == store[t + 2].open
     assert ds.bar_index.max() <= len(store) - (H + 2)
+    # the spec-literal close-to-close variant stays available
+    cfg_close = cfg.with_overrides({"prediction": {"label_price": "close"}})
+    ds_c = TrainingDatasetBuilder.from_config(cfg_close, feature_engine, CostModel.from_config(cfg_close)).build(store, 0.35)
+    p = np.log(store.arrays()["close"])
+    t = ds_c.bar_index[10]
+    assert ds_c.y_raw[10] == pytest.approx(p[t + H + 1] - p[t + 1])
 
 
 def test_walk_forward_folds_are_chronological_with_purge_and_embargo():
@@ -90,10 +97,12 @@ def test_scaling_statistics_exclude_validation_rows(fast_cfg, fractional, bars_1
     store = BarStore("SYN", 30, bars_1500)
     trainer = ModelTrainer(fast_cfg, FeatureEngine(fast_cfg, fractional, SessionCalendar()), fractional,
                            CostModel.from_config(fast_cfg))
+    from trading_bot.training.trainer import FoldSet
+
     ds = trainer.builder.build(store, 0.4)
-    folds = walk_forward_folds(len(ds), trainer.n_folds, trainer.first_train_fraction, trainer.fold_validation_fraction,
-                               trainer.purge, trainer.embargo)
-    ev = trainer.evaluate_candidate(ds, folds, trainer.grid[0], ds.feature_names)
+    _, _, folds = trainer._layout(len(ds))
+    fold_sets = [FoldSet(f, ds, 0.4) for f in folds]
+    ev = trainer.evaluate_candidate(fold_sets, trainer.grid[0], ds.feature_names)
     Xall = ds.columns(ds.feature_names)
     for fold, fp in zip(folds, ev.fold_predictions):
         assert np.allclose(fp.direction_model.scaler_mean, Xall[fold.train].mean(axis=0))
@@ -103,7 +112,7 @@ def test_scaling_statistics_exclude_validation_rows(fast_cfg, fractional, bars_1
     for i, fold in enumerate(folds):
         ds_shift = TrainingDataset(**{**ds.__dict__, "X": ds.X.copy()})
         ds_shift.X[fold.validate] += 25.0
-        ev2 = trainer.evaluate_candidate(ds_shift, folds[: i + 1], trainer.grid[0], ds.feature_names)
+        ev2 = trainer.evaluate_candidate([FoldSet(f, ds_shift, 0.4) for f in folds[: i + 1]], trainer.grid[0], ds.feature_names)
         fp, fp2 = ev.fold_predictions[i], ev2.fold_predictions[i]
         assert np.allclose(fp.direction_model.scaler_mean, fp2.direction_model.scaler_mean)
         assert np.allclose(fp.direction_model.scaler_scale, fp2.direction_model.scaler_scale)
@@ -112,31 +121,47 @@ def test_scaling_statistics_exclude_validation_rows(fast_cfg, fractional, bars_1
 
 
 def test_fractional_order_uses_only_training_interval(fast_cfg, fractional):
-    """d* of a retrain equals the estimate on the training window alone and ignores bars outside it."""
+    """Each fold's d* depends only on that fold's training block; the production d* only on the window."""
     from trading_bot.training.trainer import ModelTrainer
     from trading_bot.features.engine import FeatureEngine
     from trading_bot.data.calendar import SessionCalendar
 
     cfg = fast_cfg.with_overrides({"training": {"window_bars": 1500, "minimum_bars": 1400},
                                    "fractional": {"adaptive_min": 0.2, "adaptive_step": 0.25}})
-    bars = generate_synthetic_bars(1900, seed=9, instrument="SYN")
     est = FractionalEngine.from_config(cfg)
     trainer = ModelTrainer(cfg, FeatureEngine(cfg, est, SessionCalendar()), est, CostModel.from_config(cfg))
+    bars = generate_synthetic_bars(1900, seed=9, instrument="SYN")
     store = BarStore("SYN", 30, bars)
-    report = trainer.retrain(store)
     window = store.last(1500)
-    assert report.stationarity.d_star == est.estimate_stationarity(window.log_close()).d_star
-    # corrupt everything *before* the window: d* must not change
-    corrupted = [Bar(b.instrument, b.timestamp, b.open * 3, b.high * 3.2, b.low * 2.9, b.close * 3, b.volume, 30)
-                 for b in bars[:400]] + bars[400:]
-    report2 = trainer.retrain(BarStore("SYN", 30, corrupted))
-    assert report2.stationarity.d_star == report.stationarity.d_star
-    assert report2.stationarity.to_dict() == report.stationarity.to_dict()
-    # corrupt the window itself: the diagnostic curve changes
-    inside = bars[:1300] + [Bar(b.instrument, b.timestamp, b.open, b.high * 1.01, b.low, b.close * (1 + 0.002 * ((i % 7) - 3)),
-                                b.volume, 30) for i, b in enumerate(bars[1300:])]
-    report3 = trainer.retrain(BarStore("SYN", 30, inside))
-    assert report3.stationarity.to_dict() != report.stationarity.to_dict()
+    ds = trainer.builder.build(window, est.estimate_stationarity(window.log_close()).d_star)
+    inner, holdout, folds = trainer._layout(len(ds))
+    fold_sets = trainer.build_fold_sets(window, ds, folds)
+    # (a) fold k's d* equals the estimator run on the prices up to its last training label bar
+    for fs in fold_sets:
+        last_bar = trainer._last_label_bar(ds, int(fs.fold.train[-1]))
+        assert fs.d_star == est.estimate_stationarity(window.log_close()[: last_bar + 1]).d_star
+        assert last_bar < int(ds.bar_index[fs.fold.validate[0]])          # strictly before the validation block
+    # (b) mutating every bar after fold 1's training block leaves fold 1's d* (and its features) unchanged
+    cut = trainer._last_label_bar(ds, int(folds[0].train[-1])) + 1
+    wb = list(window.bars)
+    mutated = wb[:cut] + [Bar(b.instrument, b.timestamp, b.open, b.high * 1.02, b.low * 0.98,
+                              b.close * (1 + 0.004 * ((i % 5) - 2)), b.volume, 30) for i, b in enumerate(wb[cut:])]
+    window2 = BarStore("SYN", 30, mutated)
+    ds2 = trainer.builder.build(window2, ds.adaptive_d)
+    fold_sets2 = trainer.build_fold_sets(window2, ds2, folds)
+    assert fold_sets2[0].d_star == fold_sets[0].d_star
+    assert fold_sets2[0].stationarity.to_dict() == fold_sets[0].stationarity.to_dict()
+    rows = folds[0].train
+    a, b = fold_sets[0].dataset.X[rows], fold_sets2[0].dataset.X[rows]
+    assert np.array_equal(np.nan_to_num(a), np.nan_to_num(b))
+    # (c) the whole-window estimate does see the mutation (it is only used for the production refit)
+    assert est.estimate_stationarity(window2.log_close()).to_dict() != est.estimate_stationarity(window.log_close()).to_dict()
+    # (d) the holdout model's d* uses only the inner block
+    report = trainer.retrain(store)
+    assert report.error is None and len(report.fold_d_stars) == len(folds)
+    inner_last = trainer._last_label_bar(ds, int(inner[-1]))
+    assert report.holdout_d_star == est.estimate_stationarity(window.log_close()[: inner_last + 1]).d_star
+    assert inner_last < int(ds.bar_index[holdout[0]])
 
 
 def test_execution_shift_all_fills_after_signal(bot_run):

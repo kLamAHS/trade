@@ -227,22 +227,27 @@ class ModelValidator:
     """Model acceptance criteria (spec section 39)."""
 
     def __init__(self, min_accuracy: float = 0.51, min_correlation: float = 0.0, min_net_pnl: float = 0.0,
-                 min_profit_factor: float = 1.05, max_drawdown: float = 0.15, min_folds_beating_baseline: int = 3):
+                 min_profit_factor: float = 1.05, max_drawdown: float = 0.15, min_folds_beating_baseline: int = 3,
+                 require_holdout_edge: bool = True):
         self.min_accuracy = min_accuracy
         self.min_correlation = min_correlation
         self.min_net_pnl = min_net_pnl
         self.min_profit_factor = min_profit_factor
         self.max_drawdown = max_drawdown
         self.min_folds_beating_baseline = min_folds_beating_baseline
+        self.require_holdout_edge = require_holdout_edge
 
     @classmethod
     def from_config(cls, cfg) -> "ModelValidator":
         a = cfg.training.acceptance
         return cls(float(a.min_accuracy), float(a.min_correlation), float(a.min_net_pnl), float(a.min_profit_factor),
-                   float(a.max_drawdown), int(a.min_folds_beating_baseline))
+                   float(a.max_drawdown), int(a.min_folds_beating_baseline), bool(a.get("require_holdout_edge", True)))
 
     def evaluate(self, aggregate: ValidationMetrics, fold_scores: list[float],
-                 baseline_fold_scores: list[float]) -> AcceptanceResult:
+                 baseline_fold_scores: list[float], holdout_delta: float | None = None) -> AcceptanceResult:
+        """``aggregate`` is the sample the section-39 metrics are read from (the untouched outer holdout
+        when configured); ``holdout_delta`` is S_F - S_0 on that holdout, required positive when
+        ``require_holdout_edge`` is set."""
         beating = sum(1 for f, b in zip(fold_scores, baseline_fold_scores) if f > b)
         checks = {
             "accuracy": aggregate.accuracy > self.min_accuracy,
@@ -252,9 +257,12 @@ class ModelValidator:
             "max_drawdown": aggregate.max_drawdown < self.max_drawdown,
             "beats_baseline": beating >= self.min_folds_beating_baseline,
         }
+        if holdout_delta is not None and self.require_holdout_edge:
+            checks["holdout_edge"] = bool(holdout_delta > 0)
         values = {"accuracy": aggregate.accuracy, "correlation": aggregate.correlation, "net_pnl": aggregate.net_pnl,
                   "profit_factor": aggregate.profit_factor, "max_drawdown": aggregate.max_drawdown,
-                  "beats_baseline": float(beating), "folds_beating_baseline": float(beating)}
+                  "beats_baseline": float(beating), "folds_beating_baseline": float(beating),
+                  "holdout_edge": float(holdout_delta) if holdout_delta is not None else float("nan")}
         reasons = tuple(f"{k} failed ({values[k]:.4f})" for k, ok in checks.items() if not ok)
         return AcceptanceResult(all(checks.values()), checks, values, beating, reasons)
 

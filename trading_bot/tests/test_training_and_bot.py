@@ -25,7 +25,8 @@ FAST = {"market": {"instrument": "SYN"},
         "training": {"window_bars": 1600, "minimum_bars": 1400, "retrain_every_bars": 250,
                      "hyperparameter_grid": {"n_estimators": [40], "min_child_samples": [50]},
                      "acceptance": {"min_accuracy": 0.0, "min_correlation": -1.0, "min_net_pnl": -1.0,
-                                    "min_profit_factor": 0.0, "max_drawdown": 1.0, "min_folds_beating_baseline": 0}},
+                                    "min_profit_factor": 0.0, "max_drawdown": 1.0, "min_folds_beating_baseline": 0,
+                                    "require_holdout_edge": False}},
         "models": {"regression": {"num_threads": 1}}}
 
 

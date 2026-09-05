@@ -78,15 +78,17 @@ def test_late_quote_order_is_deferred_not_crashing(fast_cfg, tmp_path):
     order = bot.execution.build_order("SYN", b.close_time + timedelta(minutes=35), 0.0, 0.0, 0.3, 100000.0, b.close,
                                       BotState.READY)
     bot.execution.queue_for_next_bar(order)
-    bot.on_bar(bars[1451])                              # bar closes before the signal time -> deferred, no exception
+    bot.on_bar(bars[1451])                              # bar closed before the signal time -> deferred, no exception
     assert bot.execution.has_pending() and not bot.ledger.fills
-    assert any(e["event"] == "ORDER_DEFERRED" for e in _events(bot))
-    bot.on_bar(bars[1452])                              # this bar was still open at decision time -> fills
+    bot.on_bar(bars[1452])                              # opened before the decision and no quote -> deferred again
+    assert bot.execution.has_pending() and not bot.ledger.fills
+    assert sum(1 for e in _events(bot) if e["event"] == "ORDER_DEFERRED") >= 2
+    bot.on_bar(bars[1453])                              # first bar whose open print is after the decision -> fills
     assert len(bot.ledger.fills) == 1
     assert all(o.order_id != order.order_id for o in bot.execution.queue.peek())   # the model may queue a new one
     fill = bot.ledger.fills[0]
-    assert fill.fill_timestamp == order.signal_timestamp and fill.reference_price == bars[1452].open
-    assert fill.fill_timestamp >= fill.signal_timestamp
+    assert fill.fill_timestamp == bars[1453].timestamp and fill.reference_price == bars[1453].open
+    assert fill.price_source == "next_open" and fill.fill_timestamp >= fill.signal_timestamp
 
 
 def test_no_new_order_while_one_is_pending(fast_cfg, tmp_path):

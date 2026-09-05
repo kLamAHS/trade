@@ -59,7 +59,8 @@ features:
   use_raw_fractional_levels: false   # raw D^d p levels are recorded but only z-scored levels feed the models
 
 prediction:
-  horizon_bars: 4              # H; executable label is p_{t+H+1} - p_{t+1}
+  horizon_bars: 4              # H bars
+  label_price: open            # open: Y = log O_{t+1+H} - log O_{t+1} (executable); close: spec-literal close-to-close
   volatility_window: 50        # sigma_{t,50} used for label and edge normalization
 
 models:
@@ -93,6 +94,8 @@ training:
   inner_calibration_fraction: 0.25   # tail of the first fold's training block used for its chronological calibration
   inner_calibration_min_rows: [50, 20]   # minimum [fit, calibration] rows for the inner split
   min_dataset_rows: 200        # minimum valid (feature, label) rows for a training cycle
+  outer_holdout_fraction: 0.15 # newest rows never used for selection; acceptance and the ablation score are read there (0 disables)
+  fold_local_d: true           # estimate d* per fold from that fold's training block only (false: whole-window d* everywhere)
   # Fixed, small hyperparameter search space (spec section 41).  The identical
   # candidates are evaluated on every retraining cycle.
   hyperparameter_grid:
@@ -109,6 +112,7 @@ training:
     min_profit_factor: 1.05
     max_drawdown: 0.15
     min_folds_beating_baseline: 3
+    require_holdout_edge: true # S_F - S_0 on the untouched holdout must be positive for promotion
   ablation:
     consecutive_failures_to_halt: 3
 
@@ -132,6 +136,7 @@ execution:
   default_spread: 0.0001       # relative full spread used when bid/ask are unavailable
   slippage_range_fraction: 0.05
   slippage_reference: execution_bar   # execution_bar | signal_bar
+  live_fill_source: quote      # paper mode when the next open predates the decision: quote (NBBO at decision) | broker (actual Alpaca fill)
   min_order_notional: 1.0
 
 portfolio:
@@ -150,7 +155,7 @@ paths:
   diagnostics_dir: artifacts/diagnostics
 
 alpaca:
-  paper: true
+  paper: true                  # must stay true: live trading is not supported by this application
   feed: iex
   adjustment: split            # split | raw | dividend | all  (dividend adjustment uses post-bar information)
   history_days: 1200

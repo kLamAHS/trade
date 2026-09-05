@@ -256,6 +256,7 @@ class Fill:
     entry_sigma: float = math.nan
     target_exposure: float = math.nan
     mirror: Optional[Mapping[str, Any]] = None   # broker (Alpaca) mirror status, annotation only
+    price_source: str = "next_open"              # next_open | quote | broker: where the fill price was observed
 
     @property
     def signed_units(self) -> float:

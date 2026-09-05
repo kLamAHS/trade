@@ -25,7 +25,7 @@ from .data.store import BarStore
 from .data.validator import DataValidator, ValidationResult
 from .diagnostics.attribution import attribution_groups
 from .diagnostics.fractional_analysis import FractionalDiagnostics
-from .execution.simulator import AlpacaPaperBroker, ExecutionEngine
+from .execution.simulator import AlpacaPaperBroker, ExecutionEngine, FillDeferred, LiveTradingNotSupported
 from .features.engine import FeatureEngine
 from .fractional.engine import FractionalEngine
 from .logging.audit import AuditLogger
@@ -43,6 +43,8 @@ class TradingBot:
     def __init__(self, cfg: FrozenConfig, run_id: str | None = None, artifacts_dir: str | Path | None = None,
                  broker: AlpacaPaperBroker | None = None, log: Callable[[str], None] | None = print,
                  async_retrain: bool = False, on_event: Callable[[dict], None] | None = None):
+        if cfg.alpaca.get("paper", True) is not True:
+            raise LiveTradingNotSupported("alpaca.paper must be true: live trading is not supported by this application")
         self.cfg = cfg
         self.run_id = run_id or datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ")
         root = Path(artifacts_dir) if artifacts_dir is not None else Path(cfg.paths.artifacts_dir)
@@ -148,7 +150,7 @@ class TradingBot:
                     self.execution.queue.push(o)
                 self._refresh_state()
                 return
-            except ValueError as exc:
+            except (FillDeferred, ValueError) as exc:
                 self.execution.queue.push(order)
                 self.audit.event("ORDER_DEFERRED", order_id=order.order_id, reason=str(exc))
                 continue

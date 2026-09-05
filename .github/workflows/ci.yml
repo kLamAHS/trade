@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install -e . --no-deps
+      - name: Unit, numerical, leakage, execution, risk and end-to-end tests
+        run: pytest -q -p no:warnings
+      - name: Smoke backtest through the CLI
+        run: python -m trading_bot.main backtest --synthetic 1600 --fast --symbol SYN --quiet --set training.minimum_bars=1400 --set training.window_bars=1400 --artifacts /tmp/ci-artifacts
