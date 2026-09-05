@@ -146,8 +146,9 @@ def test_alpaca_feed_drops_forming_bar_and_polls_incrementally():
     assert feed.last_timestamp is None                             # fetch_history never advances the cursor
     got = feed.poll_new_bars(now)
     assert [b.timestamp for b in got] == starts[:2]
-    assert got[-1].bid == 101.0 and got[-1].ask == 101.2 and got[-1].quote_timestamp == quote.timestamp
-    assert got[-1].latest_source_time == quote.timestamp
+    assert got[-1].bid == 101.0 and got[-1].ask == 101.2
+    assert got[-1].quote_timestamp == now and got[-1].observed_at == now     # standing NBBO observed at fetch time
+    assert got[-1].latest_source_time == now
     assert feed.poll_new_bars(now) == []                            # nothing new
     later = starts[2] + timedelta(minutes=31)                       # 11:01 -> 10:30 bar complete
     got2 = feed.poll_new_bars(later)

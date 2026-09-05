@@ -140,14 +140,18 @@ artifacts/
 * **Paper only.** The application can only talk to Alpaca's paper endpoint; there is no setting, flag
   or page control that enables live trading (`docs/AUDIT_RESPONSE.md`, finding 1).
 * **Fill timing.** A fill may only use a price observed at or after the decision: the next bar's open
-  in backtests; in live paper mode the NBBO quote at decision time (or a deferral to the following
-  open), optionally the broker's actual fill (`execution.live_fill_source`).
+  in backtests; in live paper mode (where every bar carries its receipt time) the standing NBBO fetched
+  with the bar, or a deferral to the first open after the decision, optionally the broker's actual fill
+  (`execution.live_fill_source`).
 * **Label.** `Y_t = log O_{t+1+H} - log O_{t+1}` by default (`prediction.label_price: open`): the
-  H-bar return of a position entered at the first tradable price after the signal. The strategy
-  re-evaluates that forecast every bar and re-targets exposure under turnover suppression and the
-  12-bar holding limit; the validation simulator applies exactly the live rules.
+  H-bar return of a position entered at the first tradable price after the signal. By default the
+  strategy re-evaluates that forecast every bar and re-targets exposure under turnover suppression and
+  the 12-bar holding limit (`signal.reevaluate_every_bars: 4` holds each entry to the forecast horizon
+  instead). The validation simulator applies the same position-level rules as the live bot; the
+  portfolio-level circuit breakers (daily loss, drawdown, data halts) are not simulated.
 * **Fold-local d\*.** Each walk-forward fold estimates the adaptive order on its own training block
-  and rebuilds its features with it; only the production refit uses the whole-window d\*.
+  and rebuilds its features with it; the deployed model uses the holdout-validated d\* (estimated on
+  the inner block), and the whole-window d\* is recorded for diagnostics only.
 * **Outer holdout.** The newest 15 % of the training window is never used for selection; acceptance,
   the ablation score `S_F - S_0` and the `holdout_edge` check are read there once.
 * **Calibration** is strictly chronological: fold *k*'s calibrator is fitted on out-of-sample

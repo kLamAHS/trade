@@ -39,6 +39,7 @@ class Bar:
     bid: Optional[float] = None
     ask: Optional[float] = None
     quote_timestamp: Optional[datetime] = None   # when bid/ask were observed (None => at the bar close)
+    observed_at: Optional[datetime] = None       # when the bar was received (live feeds); None => at the close
 
     def __post_init__(self) -> None:
         # Normalise numeric fields to plain Python floats so that persistence,
@@ -53,10 +54,14 @@ class Bar:
 
     @property
     def latest_source_time(self) -> datetime:
-        """Newest information time carried by this bar (close, or a later quote)."""
-        if self.quote_timestamp is not None and self.quote_timestamp > self.close_time:
-            return self.quote_timestamp
-        return self.close_time
+        """Newest information time carried by this bar: its close, a later quote, or its receipt time.
+        In a live feed this is when the bot could first act on the bar, so every decision stamped
+        with it is later than the next bar's open print."""
+        latest = self.close_time
+        for ts in (self.quote_timestamp, self.observed_at):
+            if ts is not None and ts > latest:
+                latest = ts
+        return latest
 
     @property
     def close_time(self) -> datetime:
@@ -79,6 +84,7 @@ class Bar:
         d = asdict(self)
         d["timestamp"] = self.timestamp.isoformat()
         d["quote_timestamp"] = self.quote_timestamp.isoformat() if self.quote_timestamp else None
+        d["observed_at"] = self.observed_at.isoformat() if self.observed_at else None
         return d
 
 

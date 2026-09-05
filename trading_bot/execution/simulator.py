@@ -71,7 +71,7 @@ class ExecutionSimulator:
             # The bar opened before the decision was made; its open is not an available price.
             quote_ok = (signal_bar is not None and signal_bar.bid is not None and signal_bar.ask is not None
                         and signal_bar.quote_timestamp is not None
-                        and signal_bar.quote_timestamp >= order.signal_timestamp - timedelta(seconds=1))
+                        and signal_bar.quote_timestamp >= order.signal_timestamp)
             if not quote_ok:
                 raise FillDeferred("no price observed at or after the decision on this bar")
             range_rel = (signal_bar.high - signal_bar.low) / signal_bar.close
@@ -93,6 +93,21 @@ class LiveTradingNotSupported(RuntimeError):
     """Raised whenever anything other than the Alpaca paper endpoint would be used."""
 
 
+def verify_paper_client(client) -> None:
+    """Refuse any real alpaca-py TradingClient that is not on the paper endpoint.  Test doubles (objects
+    that are not TradingClient instances) are accepted as they cannot reach a brokerage."""
+    try:
+        from alpaca.trading.client import TradingClient
+    except Exception:  # pragma: no cover - alpaca-py absent
+        return
+    if not isinstance(client, TradingClient):
+        return
+    base = getattr(client, "_base_url", None)
+    sandbox = getattr(client, "_sandbox", None)
+    if sandbox is False or base is None or "paper" not in str(base).lower():
+        raise LiveTradingNotSupported(f"trading client is not on the paper endpoint (base_url={base!r}, sandbox={sandbox!r})")
+
+
 def paper_trading_client(api_key: str, secret_key: str):
     """The only way this application constructs an Alpaca TradingClient: paper endpoint, verified."""
     from alpaca.trading.client import TradingClient
@@ -100,9 +115,7 @@ def paper_trading_client(api_key: str, secret_key: str):
     if not api_key or not secret_key:
         raise RuntimeError("Alpaca credentials missing: set APCA_API_KEY_ID and APCA_API_SECRET_KEY")
     client = TradingClient(api_key, secret_key, paper=True)
-    base = str(getattr(client, "_base_url", "") or "")
-    if base and "paper" not in base.lower():
-        raise LiveTradingNotSupported(f"trading client is not on the paper endpoint ({base})")
+    verify_paper_client(client)
     return client
 
 
@@ -126,6 +139,8 @@ class AlpacaPaperBroker:
         self.api_key = api_key or os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_API_KEY")
         self.secret_key = secret_key or os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("ALPACA_SECRET_KEY")
         self.paper = True
+        if trading_client is not None:
+            verify_paper_client(trading_client)
         self._client = trading_client
 
     @property
@@ -185,8 +200,30 @@ class AlpacaPaperBroker:
                 close_leg = {**close_leg, **self.check(close_leg["id"])}
         open_leg = self._submit_leg(order.instrument, order.side, open_qty, order.order_id + "o") if open_qty > 0 else None
         out = dict(open_leg or close_leg)
-        out.update({"submitted_at": submitted_at, "qty": qty, "flip": True, "close_leg": close_leg, "open_leg": open_leg})
+        legs = [leg for leg in (close_leg, open_leg) if leg]
+        out.update({"submitted_at": submitted_at, "qty": qty, "flip": True, "close_leg": close_leg, "open_leg": open_leg,
+                    "filled_qty": float(sum(float(leg.get("filled_qty") or 0.0) for leg in legs)),
+                    "final": all(leg.get("final") for leg in legs),
+                    "status": "filled" if all(leg.get("status") == "filled" for leg in legs) else out.get("status")})
         return out
+
+    def refresh_flip(self, ack: dict[str, Any]) -> dict[str, Any]:
+        """Re-check both legs of a flip and aggregate their filled quantities / final status."""
+        legs = []
+        for key in ("close_leg", "open_leg"):
+            leg = ack.get(key)
+            if leg and leg.get("id") and not leg.get("final"):
+                leg = {**leg, **self.check(leg["id"])}
+            if leg:
+                legs.append(leg)
+        if not legs:
+            return ack
+        filled = float(sum(float(leg.get("filled_qty") or 0.0) for leg in legs))
+        prices = [(float(leg.get("filled_qty") or 0.0), leg.get("filled_avg_price")) for leg in legs if leg.get("filled_avg_price")]
+        avg = (sum(q * float(p) for q, p in prices) / sum(q for q, _ in prices)) if prices and sum(q for q, _ in prices) > 0 else ack.get("filled_avg_price")
+        return {**ack, "close_leg": legs[0] if ack.get("close_leg") else None, "open_leg": legs[-1] if ack.get("open_leg") else None,
+                "filled_qty": filled, "filled_avg_price": avg, "final": all(leg.get("final") for leg in legs),
+                "status": "filled" if all(leg.get("status") == "filled" for leg in legs) else legs[-1].get("status")}
 
     def cancel(self, broker_order_id: str) -> dict[str, Any]:
         try:
@@ -310,14 +347,21 @@ class ExecutionEngine:
     def simulate_fill(self, order: Order, bar: Bar, signal_bar: Bar | None = None) -> Fill:
         if not self.available:
             raise RuntimeError("execution simulator unavailable")
-        mirror = self.mirror_acks.pop(order.order_id, None)
-        if mirror is not None and order.order_id in self.pending_mirrors and self.broker is not None:
-            latest = self.broker.check(self.pending_mirrors[order.order_id])
-            mirror = {**mirror, **{k: v for k, v in latest.items() if v is not None}}
-            if latest.get("final"):
+        # Peek at the mirror acknowledgement; it is only consumed once a Fill is actually produced, so a
+        # deferred order re-checks the broker on the next attempt instead of losing its annotation.
+        mirror = self.mirror_acks.get(order.order_id)
+        if mirror is not None and self.broker is not None and not mirror.get("final"):
+            if mirror.get("flip"):
+                mirror = self.broker.refresh_flip(mirror)
+            elif order.order_id in self.pending_mirrors:
+                latest = self.broker.check(self.pending_mirrors[order.order_id])
+                mirror = {**mirror, **{k: v for k, v in latest.items() if v is not None}}
+            self.mirror_acks[order.order_id] = mirror
+            if mirror.get("final"):
                 self.pending_mirrors.pop(order.order_id, None)
-                self.events.append({"event": "ORDER_MIRROR_FINAL", "order_id": order.order_id, **latest})
-        broker_px = (mirror or {}).get("filled_avg_price") if (mirror and mirror.get("status") == "filled") else None
+                self.events.append({"event": "ORDER_MIRROR_FINAL", "order_id": order.order_id,
+                                    **{k: v for k, v in mirror.items() if k not in ("close_leg", "open_leg")}})
+        broker_px = mirror.get("filled_avg_price") if (mirror and mirror.get("status") == "filled") else None
         try:
             fill = self.simulator.simulate_fill(order, bar, signal_bar, mirror)
         except FillDeferred:
@@ -325,12 +369,13 @@ class ExecutionEngine:
                 fill = None
             else:
                 raise
+        self.mirror_acks.pop(order.order_id, None)
         if self.live_fill_source == "broker" and broker_px:
             # Paper mode with the broker's actual fill as the ledger price (observed after the decision by
             # construction: the mirror order was submitted at decision time).
             px = float(broker_px)
-            units = float(mirror.get("filled_qty") or order.units) if mirror.get("qty") else order.units
-            units = min(units, order.units) if units > 0 else order.units
+            filled = float(mirror.get("filled_qty") or 0.0)
+            units = min(filled, order.units) if 0 < filled < order.units else order.units
             ref = fill.reference_price if fill is not None else px
             adverse = max(0.0, (px - ref) if order.side == "buy" else (ref - px))
             return Fill(order_id=order.order_id, instrument=order.instrument, signal_timestamp=order.signal_timestamp,
@@ -363,4 +408,4 @@ class ExecutionEngine:
 
 
 __all__ = ["ExecutionSimulator", "ExecutionEngine", "AlpacaPaperBroker", "FillDeferred", "LiveTradingNotSupported",
-           "paper_trading_client"]
+           "paper_trading_client", "verify_paper_client"]

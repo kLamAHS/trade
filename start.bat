@@ -8,7 +8,7 @@ set "PY="
 where py >nul 2>nul && set "PY=py -3"
 if not defined PY where python >nul 2>nul && set "PY=python"
 if not defined PY (
-  echo Python 3.10 or newer was not found. Install it from https://www.python.org/downloads/
+  echo Python 3.11 or newer was not found. Install it from https://www.python.org/downloads/
   echo and tick "Add python.exe to PATH" in the installer, then run start.bat again.
   pause
   exit /b 1
@@ -24,9 +24,10 @@ set "VPY=.venv\Scripts\python.exe"
 rem ---- install / update dependencies when needed ----------------------------
 "%VPY%" -c "import trading_bot, lightgbm, alpaca, sklearn, statsmodels" >nul 2>nul
 if errorlevel 1 (
-  echo Installing dependencies ^(first run only, this can take a few minutes^) ...
+  echo Installing the pinned dependencies ^(first run only, this can take a few minutes^) ...
   "%VPY%" -m pip install --upgrade pip >nul
-  "%VPY%" -m pip install -e ".[dev,plots]" || goto :fail
+  "%VPY%" -m pip install -r requirements.lock || goto :fail
+  "%VPY%" -m pip install -e . --no-deps || goto :fail
 )
 
 rem ---- launch the dashboard -------------------------------------------------

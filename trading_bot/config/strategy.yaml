@@ -120,6 +120,7 @@ signal:
   cost_multiplier: 3.0         # trade only when |ER| > 3 * Cost
   confidence_cost_multiplier: 6.0
   rebalance_threshold: 0.15
+  reevaluate_every_bars: 1     # 1 = re-target every bar (spec 30/31); set to prediction.horizon_bars to hold each entry to the forecast horizon
   vol_reference_days: 30       # sigma_ref = median sigma_50 over trailing 30 sessions
   vol_multiplier_min: 0.25
   vol_multiplier_max: 1.5

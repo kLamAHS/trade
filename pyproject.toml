@@ -7,7 +7,7 @@ name = "fractional-trading-bot"
 version = "0.1.0"
 description = "Fractional-memory systematic trading bot with an Alpaca paper-trading front end and an internal execution simulator."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "numpy>=1.26",

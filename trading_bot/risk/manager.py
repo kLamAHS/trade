@@ -21,7 +21,7 @@ class RiskEngine:
     def __init__(self, max_absolute_exposure: float = 1.0, maximum_holding_bars: int = 12,
                  stop_sigma_multiple: float = 4.0, daily_loss_limit: float = 0.025, drawdown_halt: float = 0.10,
                  rebalance_threshold: float = 0.15, horizon: int = 4, ablation_failures_to_halt: int = 3,
-                 halt_recovery_bars: int = 13):
+                 halt_recovery_bars: int = 13, reevaluate_every: int = 1):
         self.max_abs = float(max_absolute_exposure)
         self.max_holding = int(maximum_holding_bars)
         self.stop_multiple = float(stop_sigma_multiple)
@@ -31,6 +31,7 @@ class RiskEngine:
         self.horizon = int(horizon)
         self.ablation_failures_to_halt = int(ablation_failures_to_halt)
         self.halt_recovery_bars = int(halt_recovery_bars)
+        self.reevaluate_every = int(reevaluate_every)
         self.clean_bars_since_halt = 0
         # halt state
         self.daily_halt_date: Optional[date] = None
@@ -38,6 +39,7 @@ class RiskEngine:
         self.ablation_halted = False
         self.data_halted = False
         self.ablation_failures = 0
+        self._last_failure_span = None
         self.events: list[dict] = []
 
     @classmethod
@@ -45,7 +47,8 @@ class RiskEngine:
         r = cfg.risk
         return cls(r.max_absolute_exposure, r.maximum_holding_bars, r.stop_sigma_multiple, r.daily_loss_limit,
                    r.drawdown_halt, cfg.signal.rebalance_threshold, cfg.prediction.horizon_bars,
-                   cfg.training.ablation.consecutive_failures_to_halt, cfg.data.halt_recovery_bars)
+                   cfg.training.ablation.consecutive_failures_to_halt, cfg.data.halt_recovery_bars,
+                   int(cfg.signal.get("reevaluate_every_bars", 1)))
 
     # ---------------------------------------------------------------- halts
     def _event(self, kind: str, **info) -> None:
@@ -72,23 +75,34 @@ class RiskEngine:
             return True
         return False
 
-    def record_retrain(self, accepted: bool, delta_score: float) -> bool:
+    def record_retrain(self, accepted: bool, delta_score: float, sample_span=None) -> bool:
         """Update drawdown / ablation halts after a retraining cycle (sections 34, 40).
 
-        Returns True when a drawdown halt was lifted, so the caller can re-base the drawdown
-        reference (otherwise the still-depressed equity would re-arm the halt on the next bar).
+        ``sample_span`` is the (start, end) of the sample ΔS was measured on (the outer holdout).
+        Consecutive holdouts overlap heavily, so a non-positive ΔS only counts as a *new* failure when
+        its sample does not overlap the sample of the last counted failure; an overlapping repeat is
+        audited but not counted.  Returns True when a drawdown halt was lifted, so the caller can
+        re-base the drawdown reference.
         """
         cleared_drawdown = False
         if math.isfinite(delta_score) and delta_score > 0:
             self.ablation_failures = 0
+            self._last_failure_span = None
             if self.ablation_halted:
                 self._event("FRACTIONAL_EDGE_RESTORED", delta_score=delta_score)
             self.ablation_halted = False
         else:
-            self.ablation_failures += 1
-            if self.ablation_failures >= self.ablation_failures_to_halt and not self.ablation_halted:
-                self.ablation_halted = True
-                self._event("FRACTIONAL_EDGE_NOT_DETECTED", consecutive_failures=self.ablation_failures)
+            last = getattr(self, "_last_failure_span", None)
+            overlaps = (sample_span is not None and last is not None and sample_span[0] <= last[1])
+            if overlaps:
+                self._event("FRACTIONAL_EDGE_FAILURE_REPEAT", delta_score=delta_score,
+                            note="overlapping holdout sample: not counted as a new failure")
+            else:
+                self.ablation_failures += 1
+                self._last_failure_span = sample_span
+                if self.ablation_failures >= self.ablation_failures_to_halt and not self.ablation_halted:
+                    self.ablation_halted = True
+                    self._event("FRACTIONAL_EDGE_NOT_DETECTED", consecutive_failures=self.ablation_failures)
         if accepted and self.drawdown_halted:
             self.drawdown_halted = False
             cleared_drawdown = True
@@ -148,8 +162,8 @@ class RiskEngine:
         if portfolio.units != 0 and portfolio.entry_sigma is not None:
             stop_hit = stop_triggered(portfolio.position_return, portfolio.entry_sigma, self.horizon, self.stop_multiple)
         rule = apply_position_rules(proposed, current, portfolio.holding_bars, self.max_holding, stop_hit,
-                                    self.rebalance_threshold)
-        if rule.reason == "TURNOVER_SUPPRESSED":
+                                    self.rebalance_threshold, self.reevaluate_every)
+        if rule.reason in ("TURNOVER_SUPPRESSED", "HOLD_TO_HORIZON"):
             approved = float(current)      # maintain the existing position exactly (section 30): no drift trimming
         else:
             approved = float(max(-self.max_abs, min(self.max_abs, rule.exposure)))

@@ -32,12 +32,14 @@ def stop_triggered(position_return: float, sigma_entry: float, horizon: int, mul
 
 
 def apply_position_rules(q_raw: float, q_current: float, holding_bars: int, max_holding_bars: int,
-                         stop_hit: bool, rebalance_threshold: float) -> PositionRuleResult:
+                         stop_hit: bool, rebalance_threshold: float, reevaluate_every: int = 1) -> PositionRuleResult:
     """Combine the emergency stop, maximum holding time and turnover suppression.
 
     * Stop hit            -> flat (section 32).
     * Holding >= maximum  -> flat unless the *fresh* signal independently opens a
                              position, in which case it is a new entry (section 31).
+    * Between re-evaluation points (``reevaluate_every`` > 1: hold-to-horizon mode) an
+                             open position is maintained unchanged.
     * Otherwise           -> turnover suppression (section 30); a change of
                              direction (including from flat) counts as a new entry.
     """
@@ -48,6 +50,8 @@ def apply_position_rules(q_raw: float, q_current: float, holding_bars: int, max_
         if q_raw != 0.0:
             return PositionRuleResult(float(q_raw), True, "MAX_HOLDING_REENTRY", "EXPIRED", "OK")
         return PositionRuleResult(0.0, False, "MAX_HOLDING_EXIT", "EXPIRED", "OK")
+    if in_position and reevaluate_every > 1 and holding_bars % reevaluate_every != 0:
+        return PositionRuleResult(float(q_current), False, "HOLD_TO_HORIZON", "OK", "OK")
     q = turnover_suppressed(q_raw, q_current, rebalance_threshold)
     new_entry = q != 0.0 and direction_sign(q) != direction_sign(q_current)
     reason = "OK" if q == q_raw else "TURNOVER_SUPPRESSED"

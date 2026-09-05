@@ -52,6 +52,8 @@ class FoldSet:
     dataset: TrainingDataset
     d_star: float
     stationarity: Optional[StationarityResult] = None
+    fixed: bool = False                       # diagnostics: d fixed by the caller, no fold-local estimation
+    window: Optional[BarStore] = None         # the price history the fold was carved from
 
 
 @dataclass
@@ -119,6 +121,8 @@ class TrainingReport:
     holdout_metrics: Optional[ValidationMetrics] = None
     baseline_holdout_metrics: Optional[ValidationMetrics] = None
     holdout_rows: int = 0
+    holdout_span: Optional[tuple[datetime, datetime]] = None   # first/last bar timestamps of the holdout rows
+    d_full: float = float("nan")                                # whole-window d* (diagnostics only)
 
     @property
     def fold_full_score(self) -> float:
@@ -147,6 +151,8 @@ class TrainingReport:
             "fold_d_stars": self.fold_d_stars,
             "holdout_d_star": self.holdout_d_star,
             "holdout_rows": self.holdout_rows,
+            "holdout_span": [t.isoformat() for t in self.holdout_span] if self.holdout_span else None,
+            "d_full": self.d_full,
             "best_params": self.best_params,
             "baseline_params": self.baseline_params,
             "grid_results": self.grid_results,
@@ -172,9 +178,22 @@ class TrainingReport:
 
 
 def git_commit() -> str:
+    """Commit of the repository that contains *this package* (not the process cwd), with a ``-dirty``
+    suffix when the package's working tree has uncommitted changes; ``nogit`` for wheel installs."""
+    from pathlib import Path
+
+    pkg = Path(__file__).resolve().parents[1]
     try:
-        sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
-        return sha.stdout.strip() if sha.returncode == 0 else "nogit"
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=pkg, capture_output=True, text=True, timeout=5)
+        if top.returncode != 0 or not str(pkg).startswith(top.stdout.strip()):
+            return "nogit"
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=pkg, capture_output=True, text=True, timeout=5)
+        if sha.returncode != 0:
+            return "nogit"
+        status = subprocess.run(["git", "status", "--porcelain", "--", str(pkg)], cwd=pkg, capture_output=True,
+                                text=True, timeout=5)
+        dirty = status.returncode == 0 and status.stdout.strip() != ""
+        return sha.stdout.strip() + ("-dirty" if dirty else "")
     except Exception:  # pragma: no cover
         return "nogit"
 
@@ -283,13 +302,16 @@ class ModelTrainer:
                 d = st.d_star
             else:
                 d, st = ds_ref.adaptive_d, None
-            if d not in cache:
-                ds_i = ds_ref if d == ds_ref.adaptive_d else self.builder.build(window, d)
-                if not np.array_equal(ds_i.bar_index, ds_ref.bar_index):
-                    raise ValueError("fold dataset rows differ from the reference dataset (kernel/warm-up mismatch)")
-                cache[d] = ds_i
-            sets.append(FoldSet(fold, cache[d], d, st))
+            sets.append(FoldSet(fold, self._dataset_for(window, ds_ref, d, cache), d, st, fixed_d is not None, window))
         return sets
+
+    def _dataset_for(self, window: BarStore, ds_ref: TrainingDataset, d: float, cache: dict) -> TrainingDataset:
+        if d not in cache:
+            ds_i = ds_ref if d == ds_ref.adaptive_d else self.builder.build(window, d)
+            if not np.array_equal(ds_i.bar_index, ds_ref.bar_index):
+                raise ValueError("dataset rows differ from the reference dataset (kernel/warm-up mismatch)")
+            cache[d] = ds_i
+        return cache[d]
 
     def evaluate_candidate(self, fold_sets: list[FoldSet], combo: dict[str, Any], feature_names) -> CandidateEvaluation:
         names = tuple(feature_names)
@@ -312,8 +334,7 @@ class ModelTrainer:
         M_all: list[np.ndarray] = []
         rows_all: list[np.ndarray] = []
         first = fold_sets[0]
-        inner_A, inner_Y, inner_rows = self._inner_calibration_set(first.dataset, first.dataset.columns(names),
-                                                                   first.fold.train, combo, names)
+        inner_A, inner_Y, inner_rows = self._inner_calibration_set(first, combo, names)
         ref_ds = fold_sets[0].dataset          # labels / simulation inputs are identical across d
         for i, fp in enumerate(preds):
             earlier = [q for q in preds[:i] if q.rows[-1] < fp.rows[0]]
@@ -332,14 +353,21 @@ class ModelTrainer:
         aggregate = self._simulate(ref_ds, rows_cat, np.concatenate(E_all), np.concatenate(M_all))
         return CandidateEvaluation(dict(combo), preds, fold_metrics, aggregate, calibrators, calibration_rows)
 
-    def _inner_calibration_set(self, ds: TrainingDataset, Xall: np.ndarray, train_rows: np.ndarray,
-                               combo: dict[str, Any], names) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _inner_calibration_set(self, first: FoldSet, combo: dict[str, Any], names) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Chronological inner split of the first fold's training block.  The models (and, with
+        fold-local d, the adaptive order itself) are fitted on the earlier part only, so the (A, Y)
+        pairs from the later part are out of sample in every respect."""
+        ds, train_rows = first.dataset, first.fold.train
         n = len(train_rows)
         split = int(n * (1.0 - self.inner_calibration_fraction))
         inner_train = train_rows[: max(0, split - self.purge)]
         inner_cal = train_rows[min(n, split + self.embargo):]
         if len(inner_train) < self.inner_min_fit or len(inner_cal) < self.inner_min_cal:
             raise ValueError("training block too small for an inner calibration split")
+        if self.fold_local_d and not first.fixed and first.window is not None:
+            st = self._estimate_d(first.window, self._last_label_bar(ds, int(inner_train[-1])))
+            ds = self._dataset_for(first.window, ds, st.d_star, {})
+        Xall = ds.columns(tuple(names))
         reg, direction = self._fit_pair(Xall[inner_train], ds.y_norm[inner_train], ds.y_raw[inner_train], combo, names)
         A, _ = combine(reg.predict(Xall[inner_cal]), direction.predict_proba_up(Xall[inner_cal]))
         return A, ds.y_norm[inner_cal], inner_cal
@@ -351,11 +379,11 @@ class ModelTrainer:
         d* comes from the inner block only, the models are refit on the inner block, the calibrator is
         fitted on the candidate's inner out-of-fold predictions, and the holdout rows are predicted once.
         """
-        st = self._estimate_d(window, self._last_label_bar(ds_ref, int(inner_rows[-1]))) if self.fold_local_d else None
-        d_h = st.d_star if st is not None else ds_ref.adaptive_d
-        ds_h = ds_ref if d_h == ds_ref.adaptive_d else self.builder.build(window, d_h)
-        if not np.array_equal(ds_h.bar_index, ds_ref.bar_index):
-            raise ValueError("holdout dataset rows differ from the reference dataset")
+        # The holdout's d* always comes from the inner block, whatever fold_local_d says: the holdout
+        # must never influence the deployed feature definition it is scoring.
+        st = self._estimate_d(window, self._last_label_bar(ds_ref, int(inner_rows[-1])))
+        d_h = st.d_star
+        ds_h = self._dataset_for(window, ds_ref, d_h, {})
         X = ds_h.columns(tuple(names))
         reg, direction = self._fit_pair(X[inner_rows], ds_h.y_norm[inner_rows], ds_h.y_raw[inner_rows],
                                         candidate.params, names)
@@ -470,9 +498,14 @@ class ModelTrainer:
                 candidates = [c.d for c in stationarity.candidates][:: max(1, self.oos_by_d_step)]
                 oos_rows = FractionalDiagnostics.oos_score_by_d(self, history, candidates, combo=best.params, log=_log)
 
-            # Final production refit on the whole window; calibration from every out-of-fold prediction.
-            Xall = ds.columns(full_names)
-            reg, direction = self._fit_pair(Xall, ds.y_norm, ds.y_raw, best.params, full_names)
+            # Final production refit on the whole window with the *validated* feature definition: the
+            # holdout's d* (estimated on the inner block) when a holdout exists, so the deployed adaptive
+            # channel is the one whose out-of-sample score was accepted.  Calibration pools every
+            # out-of-fold prediction.  The whole-window d* is kept for diagnostics only.
+            d_prod = holdout_full.d_star if holdout_full is not None else d_full
+            ds_prod = self._dataset_for(window, ds, d_prod, {})
+            Xall = ds_prod.columns(full_names)
+            reg, direction = self._fit_pair(Xall, ds_prod.y_norm, ds_prod.y_raw, best.params, full_names)
             pooled_A = [fp.A for fp in best.fold_predictions]
             pooled_Y = [ds.y_norm[fp.rows] for fp in best.fold_predictions]
             if holdout_full is not None:
@@ -494,10 +527,15 @@ class ModelTrainer:
             }
             extra = {"stationarity": stationarity.to_dict(), "baseline_feature_names": list(base_names),
                      "calibration_points": calibration.n_fit, "previous_adaptive_d": previous_d,
-                     "config": self.cfg.to_dict(), "label_price": self.builder.label_price}
-            meta = self._metadata(ds, params, full_names, validation_summary, direction, False, extra,
+                     "config": self.cfg.to_dict(), "label_price": self.builder.label_price,
+                     "d_full": d_full, "d_production": d_prod}
+            meta = self._metadata(ds_prod, params, full_names, validation_summary, direction, False, extra,
                                   reg.effective_params())
-            model = CombinedModel(reg, direction, calibration, full_names, d_full, self.horizon, meta)
+            model = CombinedModel(reg, direction, calibration, full_names, d_prod, self.horizon, meta)
+            holdout_span = None
+            if holdout_full is not None:
+                holdout_span = (window[int(ds.bar_index[holdout_full.rows[0]])].timestamp,
+                                window[int(ds.bar_index[holdout_full.rows[-1]])].timestamp)
             return TrainingReport(model, acceptance.accepted, acceptance, stationarity, dict(best.params),
                                   grid_results, best.fold_metrics, baseline.fold_metrics, best.aggregate,
                                   baseline.aggregate, float(delta), len(ds), ds.window_start, ds.window_end,
@@ -506,7 +544,7 @@ class ModelTrainer:
                                   holdout_d_star=holdout_full.d_star if holdout_full else float("nan"),
                                   holdout_metrics=holdout_full.metrics if holdout_full else None,
                                   baseline_holdout_metrics=holdout_base.metrics if holdout_base else None,
-                                  holdout_rows=int(len(holdout_rows)))
+                                  holdout_rows=int(len(holdout_rows)), holdout_span=holdout_span, d_full=d_full)
         except Exception as exc:
             return TrainingReport(None, False, None, stationarity, {}, [], [], [], None, None, float("nan"), 0,
                                   window[0].timestamp, window[-1].timestamp, time.time() - t0,

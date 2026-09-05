@@ -1,3 +1,6 @@
+# Pinned environment in which the test suite was run (uv pip freeze), Python 3.11, Linux x86_64,
+# generated 2026-09-05. Install with: pip install -r requirements.lock && pip install -e . --no-deps
+# Platform-conditional dependencies of the pinned wheels are listed with markers below.
 alpaca-py==0.44.0
 annotated-types==0.8.0
 certifi==2026.7.22
@@ -36,3 +39,5 @@ typing-inspection==0.4.4
 urllib3==2.7.0
 websockets==17.1
 wrapt==2.4.0
+colorama==0.4.6 ; sys_platform == 'win32'
+tzdata==2026.3 ; sys_platform == 'win32'
