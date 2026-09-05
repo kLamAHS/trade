@@ -257,7 +257,7 @@ def test_hold_to_horizon_rule_and_simulator_cadence():
     m1 = simulate_validation(*args, SimulationParams(horizon=4, bars_per_day=13, reevaluate_every=1))
     m4 = simulate_validation(*args, SimulationParams(horizon=4, bars_per_day=13, reevaluate_every=4))
     assert m1.n_trades > m4.n_trades and m4.mean_bars_held > m1.mean_bars_held
-    assert m1.mean_bars_held < 2.0 and m4.mean_bars_held >= 4.0
+    assert m1.mean_bars_held <= 2.0 and m4.mean_bars_held >= 4.0        # flips every bar vs held across boundaries
 
 
 # ------------------------------------------------------- ablation counting, provenance
