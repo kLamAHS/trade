@@ -37,6 +37,7 @@ class ModelMetadata:
     n_training_rows: int
     is_baseline: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+    environment: dict[str, Any] = field(default_factory=dict)   # python / platform / package versions / git commit
 
     def to_dict(self) -> dict[str, Any]:
         d = dict(self.__dict__)

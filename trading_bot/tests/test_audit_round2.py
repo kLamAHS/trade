@@ -203,14 +203,33 @@ def test_order_ids_are_unique_across_builders():
     assert a.order_id != b.order_id and a.order_id.startswith("runA-") and b.order_id.startswith("runB-")
 
 
-def test_fill_timestamp_never_precedes_signal_and_rejects_closed_bars():
-    sim = ExecutionSimulator(CostModel())
+def test_fill_prices_are_never_older_than_the_decision():
+    from trading_bot.execution.simulator import FillDeferred
+
+    sim = ExecutionSimulator(CostModel(default_spread=0.0002, slippage_range_fraction=0.05))
     exec_bar = Bar("SYN", T0 + timedelta(minutes=30), 100, 101, 99, 100.5, 10, 30)
-    late = Order("SYN", T0 + timedelta(minutes=30, seconds=20), "buy", 1.0, 0.5, 0.0, 100.0)
-    f = sim.simulate_fill(late, exec_bar)
-    assert f.fill_timestamp == late.signal_timestamp and f.reference_price == exec_bar.open
+    # decision at the close == next open print: standard next-open fill
     on_time = Order("SYN", T0 + timedelta(minutes=30), "buy", 1.0, 0.5, 0.0, 100.0)
-    assert sim.simulate_fill(on_time, exec_bar).fill_timestamp == exec_bar.timestamp
+    f = sim.simulate_fill(on_time, exec_bar)
+    assert f.fill_timestamp == exec_bar.timestamp and f.reference_price == exec_bar.open and f.price_source == "next_open"
+    # decision 20 s after the bar opened, no quote: the earlier open is NOT available -> deferred
+    late = Order("SYN", T0 + timedelta(minutes=30, seconds=20), "buy", 1.0, 0.5, 0.0, 100.0)
+    with pytest.raises(FillDeferred):
+        sim.simulate_fill(late, exec_bar)
+    # ... with the NBBO observed at decision time on the signal bar: fill at the ask + slippage, stamped then
+    signal_bar = Bar("SYN", T0, 99.5, 100.6, 99.4, 100.0, 10, 30, bid=100.2, ask=100.4,
+                     quote_timestamp=T0 + timedelta(minutes=30, seconds=20))
+    f2 = sim.simulate_fill(late, exec_bar, signal_bar)
+    slip = 0.05 * (100.6 - 99.4) / 100.0 * 100.3
+    assert f2.price_source == "quote" and f2.fill_timestamp == late.signal_timestamp
+    assert f2.fill_price == pytest.approx(100.4 + slip) and f2.reference_price == pytest.approx(100.3)
+    assert f2.spread_cost == pytest.approx(0.1) and f2.slippage_cost == pytest.approx(slip)
+    sell = Order("SYN", late.signal_timestamp, "sell", 2.0, -0.5, 0.0, 100.0)
+    assert sim.simulate_fill(sell, exec_bar, signal_bar).fill_price == pytest.approx(100.2 - slip)
+    # a quote older than the decision does not count
+    stale_quote = Bar("SYN", T0, 99.5, 100.6, 99.4, 100.0, 10, 30, bid=100.2, ask=100.4, quote_timestamp=T0 + timedelta(minutes=29))
+    with pytest.raises(FillDeferred):
+        sim.simulate_fill(late, exec_bar, stale_quote)
     too_late = Order("SYN", T0 + timedelta(minutes=60), "buy", 1.0, 0.5, 0.0, 100.0)
     with pytest.raises(ValueError):
         sim.simulate_fill(too_late, exec_bar)

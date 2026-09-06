@@ -35,6 +35,8 @@ class ValidationMetrics:
     n_trades: int
     n_signals: int
     avg_exposure: float
+    mean_bars_held: float = 0.0          # as-traded holding period (bars) versus the H-bar forecast horizon
+    edge_to_realised_corr: float = 0.0   # corr(E_t, realised position return while positioned)
     equity_curve: tuple[float, ...] = field(default_factory=tuple, repr=False)
     exposures: tuple[float, ...] = field(default_factory=tuple, repr=False)
     trade_pnls: tuple[float, ...] = field(default_factory=tuple, repr=False)
@@ -66,6 +68,7 @@ class SimulationParams:
     drawdown_weight: float = 0.25
     drawdown_reference: float = 0.10
     eps: float = 1e-12
+    reevaluate_every: int = 1
 
     @classmethod
     def from_config(cls, cfg) -> "SimulationParams":
@@ -80,7 +83,8 @@ class SimulationParams:
                    trading_days_per_year=int(cfg.market.trading_days_per_year),
                    turnover_weight=float(cfg.training.score.turnover_weight),
                    drawdown_weight=float(cfg.training.score.drawdown_weight),
-                   drawdown_reference=float(cfg.training.score.drawdown_reference), eps=float(cfg.features.epsilon))
+                   drawdown_reference=float(cfg.training.score.drawdown_reference), eps=float(cfg.features.epsilon),
+                   reevaluate_every=int(cfg.signal.get("reevaluate_every_bars", 1)))
 
 
 def max_drawdown(equity: np.ndarray) -> float:
@@ -110,9 +114,12 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
     gross = 0.0
     costs = 0.0
     trade_pnls: list[float] = []
+    trade_lengths: list[int] = []
+    trade_len = 0
     trade_acc = 0.0
     in_trade = False
     n_signals = 0
+    realised_pairs: list[tuple[float, float]] = []
     for i in range(n):
         if q_cur != 0.0:
             holding += 1          # the mark at this bar's close, exactly as the live ledger counts before deciding
@@ -130,7 +137,8 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
             q_raw = raw_exposure(direction, conf, vm, params.max_abs_exposure)
         else:
             q_raw = 0.0
-        rule = apply_position_rules(q_raw, q_cur, holding, params.max_holding_bars, stop_hit, params.rebalance_threshold)
+        rule = apply_position_rules(q_raw, q_cur, holding, params.max_holding_bars, stop_hit, params.rebalance_threshold,
+                                    params.reevaluate_every)
         q_new = rule.exposure
         # Execution at open_{t+1}; exposure held until open_{t+2}.
         ret = open_next2[i] / open_next[i] - 1.0
@@ -147,6 +155,8 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
         flipped = q_cur != 0.0 and q_new != 0.0 and (q_cur > 0) != (q_new > 0)
         closing = q_cur != 0.0 and (q_new == 0.0 or flipped or rule.new_entry)
         remaining = pnl
+        if q_new != 0.0 and E[i] != 0.0:
+            realised_pairs.append((E[i], q_new * ret))
         if closing:
             if q_new == 0.0:
                 close_cost = cost                               # the whole turnover is the exit
@@ -155,12 +165,15 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
             else:
                 close_cost = 0.0                                # same-direction re-entry: resize cost is the new trade's
             trade_pnls.append(trade_acc - close_cost)
+            trade_lengths.append(trade_len)
             trade_acc = 0.0
+            trade_len = 0
             in_trade = False
             remaining = pnl + close_cost
         if q_new != 0.0:
             in_trade = True
             trade_acc += remaining
+            trade_len += 1
             if rule.new_entry or q_cur == 0.0:
                 entry_price = open_next[i]
                 entry_sigma = sigma[i]
@@ -173,7 +186,14 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
         q_cur = q_new
     if in_trade:
         trade_pnls.append(trade_acc)
+        trade_lengths.append(trade_len)
     tp = np.asarray(trade_pnls)
+    mean_bars_held = float(np.mean(trade_lengths)) if trade_lengths else 0.0
+    if len(realised_pairs) >= 3:
+        rp = np.asarray(realised_pairs)
+        edge_corr = _safe_corr(rp[:, 0], rp[:, 1])
+    else:
+        edge_corr = 0.0
     wins = tp[tp > 0].sum() if len(tp) else 0.0
     losses = -tp[tp < 0].sum() if len(tp) else 0.0
     profit_factor = float(wins / losses) if losses > 0 else (float("inf") if wins > 0 else 0.0)
@@ -197,6 +217,7 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
                              profit_factor=profit_factor, max_drawdown=mdd, sharpe=sharpe,
                              turnover_penalty=turnover_penalty, drawdown_penalty=float(dd_penalty), score=float(score),
                              n_trades=int(len(tp)), n_signals=n_signals, avg_exposure=float(np.mean(np.abs(exposures))) if n else 0.0,
+                             mean_bars_held=mean_bars_held, edge_to_realised_corr=edge_corr,
                              equity_curve=tuple(curve.tolist()), exposures=tuple(exposures.tolist()),
                              trade_pnls=tuple(tp.tolist()), bar_pnls=tuple(bar_pnl.tolist()))
 
@@ -227,22 +248,27 @@ class ModelValidator:
     """Model acceptance criteria (spec section 39)."""
 
     def __init__(self, min_accuracy: float = 0.51, min_correlation: float = 0.0, min_net_pnl: float = 0.0,
-                 min_profit_factor: float = 1.05, max_drawdown: float = 0.15, min_folds_beating_baseline: int = 3):
+                 min_profit_factor: float = 1.05, max_drawdown: float = 0.15, min_folds_beating_baseline: int = 3,
+                 require_holdout_edge: bool = True):
         self.min_accuracy = min_accuracy
         self.min_correlation = min_correlation
         self.min_net_pnl = min_net_pnl
         self.min_profit_factor = min_profit_factor
         self.max_drawdown = max_drawdown
         self.min_folds_beating_baseline = min_folds_beating_baseline
+        self.require_holdout_edge = require_holdout_edge
 
     @classmethod
     def from_config(cls, cfg) -> "ModelValidator":
         a = cfg.training.acceptance
         return cls(float(a.min_accuracy), float(a.min_correlation), float(a.min_net_pnl), float(a.min_profit_factor),
-                   float(a.max_drawdown), int(a.min_folds_beating_baseline))
+                   float(a.max_drawdown), int(a.min_folds_beating_baseline), bool(a.get("require_holdout_edge", True)))
 
     def evaluate(self, aggregate: ValidationMetrics, fold_scores: list[float],
-                 baseline_fold_scores: list[float]) -> AcceptanceResult:
+                 baseline_fold_scores: list[float], holdout_delta: float | None = None) -> AcceptanceResult:
+        """``aggregate`` is the sample the section-39 metrics are read from (the untouched outer holdout
+        when configured); ``holdout_delta`` is S_F - S_0 on that holdout, required positive when
+        ``require_holdout_edge`` is set."""
         beating = sum(1 for f, b in zip(fold_scores, baseline_fold_scores) if f > b)
         checks = {
             "accuracy": aggregate.accuracy > self.min_accuracy,
@@ -252,9 +278,12 @@ class ModelValidator:
             "max_drawdown": aggregate.max_drawdown < self.max_drawdown,
             "beats_baseline": beating >= self.min_folds_beating_baseline,
         }
+        if holdout_delta is not None and self.require_holdout_edge:
+            checks["holdout_edge"] = bool(holdout_delta > 0)
         values = {"accuracy": aggregate.accuracy, "correlation": aggregate.correlation, "net_pnl": aggregate.net_pnl,
                   "profit_factor": aggregate.profit_factor, "max_drawdown": aggregate.max_drawdown,
-                  "beats_baseline": float(beating), "folds_beating_baseline": float(beating)}
+                  "beats_baseline": float(beating), "folds_beating_baseline": float(beating),
+                  "holdout_edge": float(holdout_delta) if holdout_delta is not None else float("nan")}
         reasons = tuple(f"{k} failed ({values[k]:.4f})" for k, ok in checks.items() if not ok)
         return AcceptanceResult(all(checks.values()), checks, values, beating, reasons)
 

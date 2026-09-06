@@ -100,7 +100,7 @@
         <input type="password" id="secret_key" autocomplete="off" placeholder="leave blank to keep the saved secret">
         <button type="button" id="btnShowSecret" title="show / hide">👁</button>
       </div>
-      <div class="check"><input type="checkbox" id="paper" checked><label for="paper" style="margin:0">Paper account (live trading is never enabled from this page)</label></div>
+      <div class="hint" style="margin-top:10px">🔒 <b>Paper account only.</b> This application can only connect to Alpaca's paper endpoint; live trading is not implemented and cannot be enabled from this page or from any setting.</div>
       <div class="row" style="margin-top:12px">
         <button id="btnSave">Save settings</button>
         <button id="btnTest">Test connection</button>
@@ -188,7 +188,7 @@
 <script>
 (function () {
   const $ = (id) => document.getElementById(id);
-  const fields = ["api_key", "symbol", "mode", "data_source", "csv_path", "synthetic_bars", "history_days", "initial_capital", "overrides", "paper", "fast", "mirror_orders"];
+  const fields = ["api_key", "symbol", "mode", "data_source", "csv_path", "synthetic_bars", "history_days", "initial_capital", "overrides", "fast", "mirror_orders"];
   let logSeq = 0, lastStatus = null, equityTableOpen = false;
 
   const fmtMoney = (v) => (v == null || isNaN(v)) ? "–" : v.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
@@ -242,7 +242,7 @@
     note("connHint", "Testing connection…");
     try {
       const r = await api("/api/test_connection", { settings: readForm() }); $("secret_key").value = "";
-      if (r.ok) note("connHint", `Connected: account ${r.account} (${r.status}, ${r.paper ? "paper" : "LIVE"}) · equity ${fmtMoney(r.equity)} · buying power ${fmtMoney(r.buying_power)}`, "ok");
+      if (r.ok) note("connHint", `Connected to the PAPER account ${r.account} (${r.status}) · equity ${fmtMoney(r.equity)} · buying power ${fmtMoney(r.buying_power)}`, "ok");
       else note("connHint", r.error, "bad");
     } catch (e) { note("connHint", e.message, "bad"); }
   });

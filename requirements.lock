@@ -1,0 +1,43 @@
+# Pinned environment in which the test suite was run (uv pip freeze), Python 3.11, Linux x86_64,
+# generated 2026-09-05. Install with: pip install -r requirements.lock && pip install -e . --no-deps
+# Platform-conditional dependencies of the pinned wheels are listed with markers below.
+alpaca-py==0.44.0
+annotated-types==0.8.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+cloudpickle==3.1.2
+formulaic==1.2.2
+idna==3.19
+iniconfig==2.3.0
+interface-meta==2.0.1
+joblib==1.6.0
+lightgbm==4.7.0
+msgpack==1.2.2
+narwhals==2.25.0
+numpy==2.4.6
+packaging==26.3
+pandas==3.0.5
+patsy==1.0.3
+pluggy==1.6.0
+pydantic-core==2.46.5
+pydantic==2.13.5
+pygments==2.21.0
+pytest-timeout==2.4.0
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+pytz==2026.3.post1
+pyyaml==6.0.3
+requests==2.34.2
+scikit-learn==1.9.0
+scipy==1.17.1
+six==1.17.0
+sseclient-py==1.9.0
+statsmodels==0.15.0
+threadpoolctl==3.6.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.7.0
+websockets==17.1
+wrapt==2.4.0
+colorama==0.4.6 ; sys_platform == 'win32'
+tzdata==2026.3 ; sys_platform == 'win32'

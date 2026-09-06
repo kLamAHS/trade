@@ -8,9 +8,10 @@ if [ ! -x .venv/bin/python ]; then
   "$PY" -m venv .venv
 fi
 if ! .venv/bin/python -c "import trading_bot, lightgbm, alpaca, sklearn, statsmodels" >/dev/null 2>&1; then
-  echo "Installing dependencies (first run only) ..."
+  echo "Installing the pinned dependencies (first run only) ..."
   .venv/bin/python -m pip install --upgrade pip >/dev/null
-  .venv/bin/python -m pip install -e ".[dev,plots]"
+  .venv/bin/python -m pip install -r requirements.lock
+  .venv/bin/python -m pip install -e . --no-deps
 fi
 echo "Starting the dashboard; API keys are saved to settings.json next to this script (git-ignored)."
 exec .venv/bin/python -m trading_bot.main gui "$@"

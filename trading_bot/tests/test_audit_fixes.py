@@ -146,8 +146,9 @@ def test_alpaca_feed_drops_forming_bar_and_polls_incrementally():
     assert feed.last_timestamp is None                             # fetch_history never advances the cursor
     got = feed.poll_new_bars(now)
     assert [b.timestamp for b in got] == starts[:2]
-    assert got[-1].bid == 101.0 and got[-1].ask == 101.2 and got[-1].quote_timestamp == quote.timestamp
-    assert got[-1].latest_source_time == quote.timestamp
+    assert got[-1].bid == 101.0 and got[-1].ask == 101.2
+    assert got[-1].quote_timestamp == now and got[-1].observed_at == now     # standing NBBO observed at fetch time
+    assert got[-1].latest_source_time == now
     assert feed.poll_new_bars(now) == []                            # nothing new
     later = starts[2] + timedelta(minutes=31)                       # 11:01 -> 10:30 bar complete
     got2 = feed.poll_new_bars(later)
@@ -240,9 +241,8 @@ def test_fold_calibration_is_chronological(fast_cfg, fractional):
     store = BarStore("SYN", 30, bars)
     trainer = ModelTrainer(fast_cfg, FeatureEngine(fast_cfg, fractional, NY), fractional, CostModel.from_config(fast_cfg))
     ds = trainer.builder.build(store, 0.4)
-    folds = walk_forward_folds(len(ds), trainer.n_folds, trainer.first_train_fraction, trainer.fold_validation_fraction,
-                               trainer.purge, trainer.embargo)
-    ev = trainer.evaluate_candidate(ds, folds, trainer.grid[0], ds.feature_names)
+    _, _, folds = trainer._layout(len(ds))
+    ev = trainer.evaluate_candidate(trainer.build_fold_sets(store, ds, folds, fixed_d=0.4), trainer.grid[0], ds.feature_names)
     H = fast_cfg.prediction.horizon_bars
     for fold, cal_rows in zip(folds, ev.calibration_rows):
         # every label used for calibration ends (t + H + 1) before the fold's first validation row
@@ -281,7 +281,8 @@ def test_gap_bar_while_positioned_flattens_at_next_bar_without_crash(fast_cfg, t
     last = bot.store.last()
     bot.ledger.apply(Fill("f", "SYN", last.close_time, last.close_time, "buy", 100.0, last.close, last.close, 0, 0, 0,
                           new_entry=True, entry_sigma=0.01))
-    assert bot.ledger.units == 100.0
+    units_before = bot.ledger.units                    # the model may already hold a position for this seed
+    assert units_before >= 100.0
     n_fills = len(bot.ledger.fills)
     for b in bars[1453:1470]:                         # halt-only (gap) bar at 1453
         bot.on_bar(b)
@@ -290,7 +291,7 @@ def test_gap_bar_while_positioned_flattens_at_next_bar_without_crash(fast_cfg, t
     assert bot.halted_bars == 1 and bot.rejected_bars == 0
     assert bot.ledger.units == 0.0                       # flattened while halted
     flat = bot.ledger.fills[n_fills]
-    assert flat.side == "sell" and flat.units == pytest.approx(100.0)
+    assert flat.side == "sell" and flat.units == pytest.approx(units_before)
     assert flat.signal_timestamp == bars[1453].close_time      # decided on the gap bar ...
     assert flat.fill_timestamp == bars[1454].timestamp         # ... filled at the next bar's open
     for f in bot.ledger.fills:

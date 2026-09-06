@@ -14,7 +14,7 @@ from trading_bot.gui.settings import GuiSettings
 FAST_OVERRIDES = "training.window_bars=1400\ntraining.minimum_bars=1400\ntraining.hyperparameter_grid.n_estimators=[30]\n" \
                  "training.acceptance.min_accuracy=0\ntraining.acceptance.min_correlation=-1\ntraining.acceptance.min_net_pnl=-1\n" \
                  "training.acceptance.min_profit_factor=0\ntraining.acceptance.max_drawdown=1\ntraining.acceptance.min_folds_beating_baseline=0\n" \
-                 "models.regression.num_threads=1"
+                 "training.acceptance.require_holdout_edge=false\nmodels.regression.num_threads=1"
 
 
 def test_settings_roundtrip_keeps_secret_when_blank(tmp_path):

@@ -112,6 +112,9 @@ def cmd_backtest(args) -> int:
     print(f"backtest: {len(feed)} bars of {cfg.market.instrument}, config digest {cfg.digest()}")
     summary = bot.run(feed, max_bars=args.max_bars)
     _print_summary(summary)
+    if getattr(args, "require_model", False) and summary["model_version"] == "none":
+        print("no model was accepted during the run (--require-model)")
+        return 2
     return 0
 
 
@@ -155,7 +158,7 @@ def cmd_paper(args) -> int:
     cfg = build_config(args)
     broker = None
     if cfg.alpaca.mirror_orders and not args.no_mirror:
-        broker = AlpacaPaperBroker(paper=bool(cfg.alpaca.paper))
+        broker = AlpacaPaperBroker(paper=True)          # the only supported endpoint
     bot = TradingBot(cfg, run_id=args.run_id, artifacts_dir=args.artifacts, broker=broker, log=print, async_retrain=True)
     feed = AlpacaBarFeed(cfg.market.instrument, bot.calendar, feed=cfg.alpaca.feed,
                          bar_minutes=int(cfg.market.bar_minutes), poll_seconds=int(cfg.alpaca.poll_seconds),
@@ -199,8 +202,11 @@ def run_live_loop(bot, feed, poll_seconds: int, log=print, should_stop=None, sle
             backoff = min(backoff * 2, 300)
             continue
         for i, bar in enumerate(new_bars):
+            # Only the newest bar may trade, and only if its successor has not already opened (a bar
+            # delivered a full interval late is a catch-up bar: its next open is not a tradable price).
+            current = now < bar.close_time + timedelta(minutes=bar.bar_minutes)
             try:
-                bot.on_bar(bar, allow_orders=(i == len(new_bars) - 1))
+                bot.on_bar(bar, allow_orders=(i == len(new_bars) - 1) and current)
             except Exception as exc:
                 bot.audit.event("BAR_ERROR", error=f"{type(exc).__name__}: {exc}", timestamp=bar.timestamp.isoformat())
                 bot.risk.set_data_halt(True, f"processing error: {type(exc).__name__}")
@@ -284,6 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
     common(bt); data(bt)
     bt.add_argument("--max-bars", type=int, default=None)
     bt.add_argument("--quiet", action="store_true")
+    bt.add_argument("--require-model", action="store_true", help="exit non-zero unless a model was accepted (CI smoke)")
     bt.set_defaults(func=cmd_backtest)
 
     dl = sub.add_parser("download", help="download 30-minute bars from Alpaca to CSV")

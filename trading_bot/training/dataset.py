@@ -1,6 +1,13 @@
 """TrainingDatasetBuilder: history window -> features, labels and simulation inputs.
 
-Label (spec section 19):  Y_t = p_{t+H+1} - p_{t+1},   Y~_t = Y_t / (sigma_{t,50} sqrt(H) + eps)
+Label: the return of an H-bar position entered at the first tradable price after the signal.
+
+    label_price = "open"  (default):  Y_t = log O_{t+1+H} - log O_{t+1}
+    label_price = "close" (spec 19 literal):  Y_t = log C_{t+1+H} - log C_{t+1}
+
+Both are normalised by sigma_{t,50} sqrt(H) + eps.  The open-based form is the one the
+execution model can actually realise (fills at the next open, exit H bars later at an
+open), so it is the default; the close-based form ignores the first tradable bar.
 
 Label columns live in a separate object from the feature engine; the feature
 engine never sees them (label isolation, section 54).
@@ -71,19 +78,23 @@ def reference_sigma(sigma: np.ndarray, window: int) -> np.ndarray:
 
 class TrainingDatasetBuilder:
     def __init__(self, feature_engine: FeatureEngine, cost_model: CostModel, horizon: int,
-                 vol_reference_bars: int, eps: float = 1e-12, slippage_reference: str = "execution_bar"):
+                 vol_reference_bars: int, eps: float = 1e-12, slippage_reference: str = "execution_bar",
+                 label_price: str = "open"):
+        if label_price not in ("open", "close"):
+            raise ValueError("prediction.label_price must be 'open' or 'close'")
         self.fe = feature_engine
         self.cost_model = cost_model
         self.horizon = int(horizon)
         self.vol_reference_bars = int(vol_reference_bars)
         self.eps = float(eps)
         self.slippage_reference = slippage_reference
+        self.label_price = label_price
 
     @classmethod
     def from_config(cls, cfg, feature_engine: FeatureEngine, cost_model: CostModel) -> "TrainingDatasetBuilder":
         return cls(feature_engine, cost_model, cfg.prediction.horizon_bars,
                    int(cfg.signal.vol_reference_days) * int(cfg.market.bars_per_day), cfg.features.epsilon,
-                   cfg.execution.slippage_reference)
+                   cfg.execution.slippage_reference, str(cfg.prediction.get("label_price", "open")))
 
     def build(self, window: BarStore, adaptive_d: float) -> TrainingDataset:
         self.fe.set_adaptive_d(adaptive_d)
@@ -96,10 +107,11 @@ class TrainingDatasetBuilder:
         range_rel = fm.column("range_rel")
         spread_rel = fm.column("spread_rel")
 
-        # Labels: need bars t+1 .. t+H+1.
+        # Labels: need bars t+1 .. t+H+1 (entry at the first tradable price after the signal).
+        price = log_close if self.label_price == "close" else np.log(arrays["open"])
         y_raw = np.full(n, np.nan)
         if n > H + 1:
-            y_raw[: n - (H + 1)] = log_close[H + 1:] - log_close[1: n - H]
+            y_raw[: n - (H + 1)] = price[H + 1:] - price[1: n - H]
         y_norm = y_raw / (sigma * np.sqrt(H) + self.eps)
 
         cost_rt = self.cost_model.estimate_array(range_rel, spread_rel)

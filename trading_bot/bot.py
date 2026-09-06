@@ -25,7 +25,7 @@ from .data.store import BarStore
 from .data.validator import DataValidator, ValidationResult
 from .diagnostics.attribution import attribution_groups
 from .diagnostics.fractional_analysis import FractionalDiagnostics
-from .execution.simulator import AlpacaPaperBroker, ExecutionEngine
+from .execution.simulator import AlpacaPaperBroker, ExecutionEngine, FillDeferred, LiveTradingNotSupported
 from .features.engine import FeatureEngine
 from .fractional.engine import FractionalEngine
 from .logging.audit import AuditLogger
@@ -43,6 +43,8 @@ class TradingBot:
     def __init__(self, cfg: FrozenConfig, run_id: str | None = None, artifacts_dir: str | Path | None = None,
                  broker: AlpacaPaperBroker | None = None, log: Callable[[str], None] | None = print,
                  async_retrain: bool = False, on_event: Callable[[dict], None] | None = None):
+        if cfg.alpaca.get("paper", True) is not True:
+            raise LiveTradingNotSupported("alpaca.paper must be true: live trading is not supported by this application")
         self.cfg = cfg
         self.run_id = run_id or datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ")
         root = Path(artifacts_dir) if artifacts_dir is not None else Path(cfg.paths.artifacts_dir)
@@ -75,6 +77,7 @@ class TradingBot:
         self._pending_entry_context: Optional[dict] = None    # context of the entry decision awaiting its fill
         self._open_trade_context: Optional[dict] = None       # context of the trade currently open in the ledger
         self._pending_signal_bar: Optional[Bar] = None
+        self._pending_reentry: Optional[dict] = None          # same-direction max-holding re-entry awaiting the next open
         self.async_retrain = async_retrain
         self._executor = ThreadPoolExecutor(max_workers=1) if async_retrain else None
         self._retrain_future: Optional[Future] = None
@@ -148,7 +151,7 @@ class TradingBot:
                     self.execution.queue.push(o)
                 self._refresh_state()
                 return
-            except ValueError as exc:
+            except (FillDeferred, ValueError) as exc:
                 self.execution.queue.push(order)
                 self.audit.event("ORDER_DEFERRED", order_id=order.order_id, reason=str(exc))
                 continue
@@ -214,7 +217,7 @@ class TradingBot:
                                              report.accepted, report.stationarity.d_star if report.stationarity else math.nan)
         if report.oos_by_d:
             self.diagnostics.record_oos_by_d(report.oos_by_d, ts)
-        cleared_drawdown = self.risk.record_retrain(report.accepted, report.delta_score)
+        cleared_drawdown = self.risk.record_retrain(report.accepted, report.delta_score, report.holdout_span)
         if cleared_drawdown:
             # The halt is lifted by an accepted retrain (section 34); drawdown is measured afresh from here,
             # otherwise the still-depressed equity would re-arm the halt on the very next bar.
@@ -227,6 +230,8 @@ class TradingBot:
                 self.feature_engine.set_adaptive_d(report.model.d_star)
             self._seed_sigma_history()
             self.audit.event("MODEL_PROMOTED", model_id=report.model.version, d_star=report.model.d_star,
+                             d_full=round(report.d_full, 4) if math.isfinite(report.d_full) else None,
+                             fold_d_stars=report.fold_d_stars, holdout_rows=report.holdout_rows,
                              delta_score=round(report.delta_score, 4), full_score=round(report.full_score, 4),
                              baseline_score=round(report.baseline_score, 4), elapsed=round(report.elapsed_seconds, 1))
         else:
@@ -289,6 +294,8 @@ class TradingBot:
         #    can react to this bar: a decision made on bar t never fills at bar t's open).
         if self.execution.has_pending():
             self.on_next_bar_open(bar)
+        if self._pending_reentry is not None:
+            self._apply_pending_reentry(bar)
         if not result.ok:
             # Gap / extreme jump: the bar is real data and is stored, but no new orders may be
             # generated until halt_recovery_bars clean bars have arrived (section 35).
@@ -326,7 +333,7 @@ class TradingBot:
             bad = [n for n in needed if not math.isfinite(features.get(n))]
             self.risk.set_data_halt(True, f"non-finite features: {bad[:5]}")
             self.audit.event("DATA_HALT", reason="feature NaN/inf", features=bad[:10])
-            self._flatten_if_positioned(bar, "DATA_HALT_FLATTEN")
+            self._flatten_if_positioned(bar, "DATA_HALT_FLATTEN", decision_time=features.timestamp)
             self._refresh_state()
             self._record(bar, features=features, validation=result, note="non-finite features")
             return
@@ -346,17 +353,13 @@ class TradingBot:
             blocked = "order pending"
         elif not allow_orders:
             blocked = "catch-up bar: no orders"
-        if blocked is None and decision.reason != "TURNOVER_SUPPRESSED":
+        if blocked is None and decision.reason not in ("TURNOVER_SUPPRESSED", "HOLD_TO_HORIZON"):
             if (decision.reason == "MAX_HOLDING_REENTRY" and self.ledger.units != 0
                     and direction_sign(decision.approved_exposure) == direction_sign(self.ledger.units)):
-                # Same-direction re-entry (section 31): restart the holding clock and stop reference now.
-                self.ledger.reenter(features.timestamp, bar.close, features.get("sigma_h"), len(self.store) - 1)
-                if self._open_trade_context is not None:
-                    trade = self.ledger.trades[-1]
-                    ctx = dict(self._open_trade_context)
-                    ctx.update({"pnl": trade.net_pnl, "exit_reason": trade.exit_reason})
-                    self.trade_contexts.append(ctx)
-                self._open_trade_context = self._entry_context(features, bar, signal)
+                # Same-direction re-entry (section 31): the holding clock and stop reference restart at the
+                # next bar's open, the first price observed after this decision (as the validation simulator does).
+                self._pending_reentry = {"sigma": features.get("sigma_h"), "context": self._entry_context(features, bar, signal),
+                                         "decision_time": features.timestamp}
                 self.audit.event("MAX_HOLDING_REENTRY", exposure=round(self.ledger.exposure, 4))
             order = self.execution.build_order(
                 self.instrument, features.timestamp, self.ledger.units, self.ledger.exposure, decision.approved_exposure,
@@ -370,6 +373,18 @@ class TradingBot:
             self._flush_events()
         self._record(bar, features, prediction, signal, decision, order, cost, validation=result, note=blocked or "")
 
+    def _apply_pending_reentry(self, bar: Bar) -> None:
+        pending, self._pending_reentry = self._pending_reentry, None
+        if self.ledger.units == 0:
+            return
+        self.ledger.reenter(max(bar.timestamp, pending["decision_time"]), bar.open, pending["sigma"], len(self.store))
+        if self._open_trade_context is not None and self.ledger.trades:
+            trade = self.ledger.trades[-1]
+            ctx = dict(self._open_trade_context)
+            ctx.update({"pnl": trade.net_pnl, "exit_reason": trade.exit_reason})
+            self.trade_contexts.append(ctx)
+        self._open_trade_context = pending["context"]
+
     def _entry_context(self, features: FeatureVector, bar: Bar, signal) -> dict:
         day = self.calendar.session_date(bar.timestamp)
         return {"vol_state": features.get("volatility_state"),
@@ -378,12 +393,16 @@ class TradingBot:
                 "fractional_d": features.fractional_d, "direction": signal.direction,
                 "signal_time": features.timestamp.isoformat()}
 
-    def _flatten_if_positioned(self, bar: Bar, reason: str) -> None:
-        """Queue a flattening order.  ``bar`` is the last *stored* bar: the decision is stamped with its
-        close and priced at its close, so the fill can only happen at a later bar's open."""
+    def _flatten_if_positioned(self, bar: Bar, reason: str, decision_time: Optional[datetime] = None) -> None:
+        """Queue a flattening order priced at the last stored bar's close and stamped with the real
+        decision time (that bar's latest source time, or later), so the fill can only use a price
+        observed after the decision."""
         if self.ledger.units == 0 or self.execution.has_pending():
             return
-        order = self.execution.build_order(self.instrument, bar.close_time, self.ledger.units, self.ledger.exposure, 0.0,
+        stamp = bar.latest_source_time
+        if decision_time is not None and decision_time > stamp:
+            stamp = decision_time
+        order = self.execution.build_order(self.instrument, stamp, self.ledger.units, self.ledger.exposure, 0.0,
                                            self.ledger.equity, bar.close, self.risk.state_for(self.ledger.exposure),
                                            reason=reason)
         if order is not None:
@@ -402,7 +421,11 @@ class TradingBot:
                              order_ids=[o.order_id for o in cancelled])
         self._refresh_state()
         if len(self.store):
-            self._flatten_if_positioned(self.store.last(), "DATA_HALT_FLATTEN")
+            # The decision is caused by the rejected bar's arrival: stamp it with that receipt time when
+            # known (live), never with a possibly bogus timestamp of the corrupt bar itself.
+            last = self.store.last()
+            decision_time = bar.observed_at if bar.observed_at is not None else last.latest_source_time
+            self._flatten_if_positioned(last, "DATA_HALT_FLATTEN", decision_time=max(decision_time, last.latest_source_time))
         self._flush_events()
         self._record(bar, validation=result, note="rejected bar")
 

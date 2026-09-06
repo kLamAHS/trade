@@ -52,17 +52,15 @@ class FractionalDiagnostics:
     def oos_score_by_d(trainer, history, candidates, combo=None, log=None) -> list[dict[str, Any]]:
         """Train/validate the full model for each fixed adaptive order d with the given hyperparameters
         (the production model's when called from a retrain; the first grid point otherwise)."""
-        from ..training.walkforward import walk_forward_folds
-
         window = history.last(trainer.window_bars)
         rows: list[dict[str, Any]] = []
         previous_d = trainer.fe.adaptive_d
         try:
             for d in candidates:
                 ds = trainer.builder.build(window, float(d))
-                folds = walk_forward_folds(len(ds), trainer.n_folds, trainer.first_train_fraction,
-                                           trainer.fold_validation_fraction, trainer.purge, trainer.embargo)
-                ev = trainer.evaluate_candidate(ds, folds, combo or trainer.grid[0], ds.feature_names)
+                _, _, folds = trainer._layout(len(ds))
+                fold_sets = trainer.build_fold_sets(window, ds, folds, fixed_d=float(d))
+                ev = trainer.evaluate_candidate(fold_sets, combo or trainer.grid[0], ds.feature_names)
                 agg = ev.aggregate
                 rows.append({"d": float(d), "score": ev.mean_score, "sharpe": agg.sharpe, "accuracy": agg.accuracy,
                              "net_pnl": agg.net_pnl, "max_drawdown": agg.max_drawdown})

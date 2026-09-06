@@ -78,15 +78,17 @@ def test_late_quote_order_is_deferred_not_crashing(fast_cfg, tmp_path):
     order = bot.execution.build_order("SYN", b.close_time + timedelta(minutes=35), 0.0, 0.0, 0.3, 100000.0, b.close,
                                       BotState.READY)
     bot.execution.queue_for_next_bar(order)
-    bot.on_bar(bars[1451])                              # bar closes before the signal time -> deferred, no exception
+    bot.on_bar(bars[1451])                              # bar closed before the signal time -> deferred, no exception
     assert bot.execution.has_pending() and not bot.ledger.fills
-    assert any(e["event"] == "ORDER_DEFERRED" for e in _events(bot))
-    bot.on_bar(bars[1452])                              # this bar was still open at decision time -> fills
+    bot.on_bar(bars[1452])                              # opened before the decision and no quote -> deferred again
+    assert bot.execution.has_pending() and not bot.ledger.fills
+    assert sum(1 for e in _events(bot) if e["event"] == "ORDER_DEFERRED") >= 2
+    bot.on_bar(bars[1453])                              # first bar whose open print is after the decision -> fills
     assert len(bot.ledger.fills) == 1
     assert all(o.order_id != order.order_id for o in bot.execution.queue.peek())   # the model may queue a new one
     fill = bot.ledger.fills[0]
-    assert fill.fill_timestamp == order.signal_timestamp and fill.reference_price == bars[1452].open
-    assert fill.fill_timestamp >= fill.signal_timestamp
+    assert fill.fill_timestamp == bars[1453].timestamp and fill.reference_price == bars[1453].open
+    assert fill.price_source == "next_open" and fill.fill_timestamp >= fill.signal_timestamp
 
 
 def test_no_new_order_while_one_is_pending(fast_cfg, tmp_path):
@@ -160,7 +162,7 @@ def test_live_loop_survives_feed_errors_and_batches(fast_cfg, tmp_path):
     assert recs[0]["extra"]["note"] == "catch-up bar: no orders" and recs[1]["extra"]["note"] == "catch-up bar: no orders"
 
 
-def test_feed_does_not_attach_stale_quote():
+def test_feed_marks_delayed_bars_with_their_receipt_time():
     d = date(2026, 9, 3)
     starts = [s.astimezone(UTC) for s in NY.regular_session_starts(d)]
     raw = [SimpleNamespace(timestamp=starts[0], open=100.0, high=101.0, low=99.0, close=100.5, volume=10.0)]
@@ -176,11 +178,13 @@ def test_feed_does_not_attach_stale_quote():
     late = starts[0] + timedelta(minutes=75)         # the 09:30 bar is delivered after the 10:00 bar closed
     feed = AlpacaBarFeed("SYN", NY, api_key="k", secret_key="s", data_client=C(), clock=lambda: late)
     got = feed.poll_new_bars(late)
-    assert len(got) == 1 and got[0].bid is None and got[0].latest_source_time == got[0].close_time
+    # the bar is stamped with its receipt time, so a decision on it can never be dated at the close
+    assert len(got) == 1 and got[0].observed_at == late and got[0].latest_source_time == late
+    assert got[0].bid == 100.4 and got[0].quote_timestamp == late              # standing quote at fetch time
     fresh = starts[0] + timedelta(minutes=31)
     feed2 = AlpacaBarFeed("SYN", NY, api_key="k", secret_key="s", data_client=C(), clock=lambda: fresh)
     got2 = feed2.poll_new_bars(fresh)
-    assert got2[0].bid == 100.4 and got2[0].quote_timestamp == fresh
+    assert got2[0].bid == 100.4 and got2[0].quote_timestamp == fresh and got2[0].observed_at == fresh
 
 
 class _FlipClient:

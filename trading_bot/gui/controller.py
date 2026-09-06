@@ -72,11 +72,13 @@ class BotController:
                 cfg = cfg.with_overrides(yaml.safe_load(fh) or {})
         cfg = cfg.with_overrides({"market": {"instrument": s.symbol.upper()},
                                   "portfolio": {"initial_capital": float(s.initial_capital)},
-                                  "alpaca": {"paper": bool(s.paper), "mirror_orders": bool(s.mirror_orders),
+                                  "alpaca": {"paper": True, "mirror_orders": bool(s.mirror_orders),
                                              "history_days": int(s.history_days)}})
         ov = s.override_dict()
         if ov:
             cfg = cfg.with_overrides(ov)
+        if cfg.alpaca.get("paper", True) is not True:
+            raise RuntimeError("alpaca.paper=false is not allowed: live trading is not supported by this application")
         return cfg
 
     # ------------------------------------------------------------ control
@@ -124,7 +126,7 @@ class BotController:
             broker = None
             if s.mode == "paper" and s.mirror_orders:
                 from ..execution.simulator import AlpacaPaperBroker
-                broker = AlpacaPaperBroker(s.api_key, s.secret_key, paper=bool(s.paper))
+                broker = AlpacaPaperBroker(s.api_key, s.secret_key, paper=True)
             bot = TradingBot(cfg, run_id=run_id, artifacts_dir=s.artifacts_dir, broker=broker, log=self.log,
                              async_retrain=(s.mode == "paper"), on_event=self._on_event)
             self.bot = bot
@@ -204,13 +206,13 @@ class BotController:
         if not s.has_credentials():
             return {"ok": False, "error": "enter an API key and secret first"}
         try:
-            from alpaca.trading.client import TradingClient
+            from ..execution.simulator import paper_trading_client
 
-            client = TradingClient(s.api_key, s.secret_key, paper=bool(s.paper))
+            client = paper_trading_client(s.api_key, s.secret_key)
             acct = client.get_account()
             return {"ok": True, "account": str(getattr(acct, "account_number", "")), "status": str(getattr(acct, "status", "")),
                     "equity": float(getattr(acct, "equity", 0) or 0), "cash": float(getattr(acct, "cash", 0) or 0),
-                    "buying_power": float(getattr(acct, "buying_power", 0) or 0), "paper": bool(s.paper)}
+                    "buying_power": float(getattr(acct, "buying_power", 0) or 0), "paper": True}
         except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 

@@ -175,14 +175,18 @@ class AlpacaBarFeed:
         if not completed:
             return []
         self._last_ts = completed[-1].timestamp
+        # Every live bar carries its receipt time: decisions are stamped no earlier than this, so the
+        # next bar's open print (at the close) can never be used as a fill price for them.
+        completed = [Bar(b.instrument, b.timestamp, b.open, b.high, b.low, b.close, b.volume, b.bar_minutes,
+                         observed_at=now) for b in completed]
         last = completed[-1]
-        # A quote is attached only while the bar is still "current" (its successor has not closed yet);
-        # after a delivery delay the bar keeps bid/ask = None and the default spread is used instead.
-        if now < last.close_time + timedelta(minutes=self.bar_minutes):
-            bid, ask, qts = self.latest_quote()
-            if bid is not None:
-                completed[-1] = Bar(last.instrument, last.timestamp, last.open, last.high, last.low, last.close,
-                                    last.volume, last.bar_minutes, bid, ask, quote_timestamp=qts or now)
+        bid, ask, qts = self.latest_quote()
+        if bid is not None:
+            # The latest NBBO is the *standing* quote at fetch time: its observation time is now, even if
+            # the exchange timestamp of the last update is older.
+            completed[-1] = Bar(last.instrument, last.timestamp, last.open, last.high, last.low, last.close,
+                                last.volume, last.bar_minutes, bid, ask, quote_timestamp=max(qts or now, now),
+                                observed_at=now)
         return completed
 
     def __iter__(self) -> Iterator[Bar]:  # pragma: no cover - long-running live loop

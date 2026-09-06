@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install -e . --no-deps
+      - name: Unit, numerical, leakage, execution, risk and end-to-end tests
+        run: pytest -q -p no:warnings
+      - name: Smoke backtest through the CLI (must promote a model and write an artifact)
+        run: |
+          python -m trading_bot.main backtest --synthetic 2000 --seed 21 --fast --symbol SYN --quiet --require-model \
+            --set training.minimum_bars=1400 --set training.window_bars=1600 \
+            --set training.acceptance.min_accuracy=0 --set training.acceptance.min_correlation=-1 \
+            --set training.acceptance.min_net_pnl=-1 --set training.acceptance.min_profit_factor=0 \
+            --set training.acceptance.max_drawdown=1 --set training.acceptance.min_folds_beating_baseline=0 \
+            --set training.acceptance.require_holdout_edge=false --artifacts /tmp/ci-artifacts
+          test -f /tmp/ci-artifacts/models/current.json
+          python - <<'PY'
+          import glob, json
+          meta = json.load(open(sorted(glob.glob("/tmp/ci-artifacts/models/model_*/metadata.json"))[-1]))
+          assert meta["environment"]["packages"]["lightgbm"], meta["environment"]
+          assert meta["validation_metrics"]["holdout_rows"] > 0
+          print("artifact ok:", meta["model_id"], meta["environment"]["git_commit"][:12])
+          PY
