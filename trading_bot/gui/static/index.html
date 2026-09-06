@@ -77,6 +77,26 @@
   .muted { color: var(--text-muted); }
   .toggle { font-size: 12px; color: var(--text-muted); cursor: pointer; text-decoration: underline; background: none; border: 0; padding: 0; }
   .pos { color: #8ab8f5; } .neg { color: #ff9b9b; }
+  .tabs { display: flex; gap: 4px; padding: 0 22px; background: var(--surface-1); border-bottom: 1px solid var(--line); }
+  .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--text-muted); padding: 10px 14px; font-weight: 600; }
+  .tabs button.active { color: var(--text-primary); border-bottom-color: var(--series-1); }
+  .banner { border-radius: var(--radius); padding: 10px 14px; font-weight: 600; font-size: 13px; letter-spacing: .3px; }
+  .banner.synthetic { background: #3a2a1f; color: #ffc98a; border: 1px solid #6b4a2a; }
+  .banner.real { background: #1f2a3a; color: #a9c9f5; border: 1px solid #2f4a6b; }
+  .class-badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-weight: 700; font-size: 12px; letter-spacing: .6px; background: var(--surface-2); border: 1px solid var(--line); }
+  .class-badge.lvl0 { color: var(--text-secondary); } .class-badge.lvl1 { color: #fab219; } .class-badge.lvl2 { color: #8ab8f5; } .class-badge.lvl3 { color: #7fd47f; } .class-badge.lvl4 { color: #fff; background: var(--good); border-color: var(--good); }
+  .progress { height: 8px; background: var(--surface-0); border: 1px solid var(--line); border-radius: 999px; overflow: hidden; margin-top: 10px; }
+  .progress div { height: 100%; background: var(--series-1); width: 0; transition: width .4s; }
+  .runs tr { cursor: pointer; } .runs tr:hover td { background: var(--surface-2); } .runs tr.sel td { background: #1f2a3a; }
+  .clickable tbody tr { cursor: pointer; } .clickable tbody tr:hover td { background: var(--surface-2); }
+  .gate-pass { color: #7fd47f; font-weight: 600; } .gate-fail { color: #ff9b9b; font-weight: 600; } .gate-na { color: var(--text-muted); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 3px; margin-right: 6px; vertical-align: middle; background: var(--c); }
+  .seg { display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: middle; border-radius: 2px; }
+  .opts { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--text-secondary); }
+  .opts label { margin: 0; display: inline-flex; align-items: center; gap: 5px; }
+  .warn { color: #ffc98a; }
+  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--text-muted); margin: 14px 0 6px; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -89,7 +109,12 @@
   <button id="btnStop" class="danger" disabled>Stop</button>
 </header>
 
-<main>
+<nav class="tabs">
+  <button id="tabBtnTrading" class="active">Trading</button>
+  <button id="tabBtnValidation">Validation</button>
+</nav>
+
+<main id="tabTrading">
   <div class="col">
     <section class="card">
       <h2>Alpaca credentials</h2>
@@ -183,6 +208,101 @@
       <section class="card" style="flex:1"><h2>Events</h2><div id="events" class="events"></div></section>
       <section class="card" style="flex:1.4"><h2>Log</h2><div id="log" class="log"></div></section>
     </div>
+  </div>
+</main>
+
+<main id="tabValidation" style="display:none">
+  <div class="col">
+    <section class="card">
+      <h2>Validation run</h2>
+      <div class="hint">Research-grade validation of the strategy on the data selected under <b>Run configuration</b> (synthetic bars or the CSV history): rolling walk-forward with a refit per window, fractional-vs-baseline ablation, baselines, cost / timing / parameter stress, sanity and leakage tests, bootstrap and Monte Carlo, reproducibility, acceptance gates. Nothing is sent to Alpaca.</div>
+      <label for="vStages">Stages</label>
+      <select id="vStages"><option value="full">Full (all stages, includes light refits)</option><option value="quick">Quick (walk-forward, ablation, baselines, cost, timing, bootstrap, leakage)</option></select>
+      <div class="check"><input type="checkbox" id="vHoldout"><label for="vHoldout" style="margin:0">Open the locked final holdout</label></div>
+      <div class="hint warn">Opening the holdout is recorded in <code>holdout_access.jsonl</code>. Do it once, after development is finished; every further opening is flagged.</div>
+      <label for="vSynthetic">Synthetic engineering validation first (seeds, 0 = skip)</label>
+      <input type="number" id="vSynthetic" value="0" min="0" max="50">
+      <div class="row" style="margin-top:12px">
+        <button id="vRun" class="primary">Run validation</button>
+        <button id="vStop" class="danger" disabled>Stop</button>
+      </div>
+      <div class="progress"><div id="vProgress"></div></div>
+      <div id="vStatus" class="hint"></div>
+    </section>
+    <section class="card">
+      <h2>Runs</h2>
+      <div class="scroll" style="max-height:320px"><table class="runs" id="vRuns"><thead><tr><th>Run</th><th>Class</th><th>Sharpe</th><th>Win</th><th>Hold</th></tr></thead><tbody></tbody></table></div>
+      <div class="hint">Run directories live under <code>artifacts/runs/&lt;run_id&gt;/</code> (manifest.yaml, summary.json, equity/trades/fills/decisions/retrains CSV, models/, diagnostics/, plots/, logs/).</div>
+    </section>
+    <section class="card">
+      <h2>Trade audit trail</h2>
+      <div id="vTradeDetail" class="hint">Click a trade in the table to see its decision timestamps, model, forecast, sizing and every decision row from entry to exit.</div>
+    </section>
+  </div>
+
+  <div class="col">
+    <div id="vBanner" class="banner real" style="display:none"></div>
+    <section class="card">
+      <div class="row" style="justify-content:space-between;align-items:center"><h2 style="margin:0">Out-of-sample summary</h2><span id="vClass" class="class-badge lvl0">no run loaded</span></div>
+      <div id="vRunMeta" class="hint" style="margin:6px 0 12px"></div>
+      <div class="tiles">
+        <div class="tile"><div class="k">CAGR</div><div class="v" id="vCagr">–</div><div class="s" id="vCagrSub"></div></div>
+        <div class="tile"><div class="k">Max drawdown</div><div class="v" id="vDD">–</div><div class="s" id="vDDSub"></div></div>
+        <div class="tile"><div class="k">Sharpe</div><div class="v" id="vSharpe">–</div><div class="s" id="vSharpeSub"></div></div>
+        <div class="tile"><div class="k">Sortino</div><div class="v" id="vSortino">–</div><div class="s" id="vSortinoSub"></div></div>
+        <div class="tile"><div class="k">Trades</div><div class="v" id="vTrades">–</div><div class="s" id="vTradesSub"></div></div>
+        <div class="tile"><div class="k">Costs</div><div class="v" id="vCosts">–</div><div class="s" id="vCostsSub"></div></div>
+        <div class="tile"><div class="k">Windows</div><div class="v" id="vWindows">–</div><div class="s" id="vWindowsSub"></div></div>
+        <div class="tile"><div class="k">Holdout</div><div class="v" id="vHold">–</div><div class="s" id="vHoldSub"></div></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row" style="justify-content:space-between;align-items:center"><h2 style="margin:0">OOS equity</h2>
+        <div class="opts"><label><input type="checkbox" id="ovBaseline" checked>no-fractional baseline</label><label><input type="checkbox" id="ovBH">buy &amp; hold</label><label><input type="checkbox" id="ovProd">production policy</label><label><input type="checkbox" id="ovLog">log scale</label></div></div>
+      <div class="chart-wrap" style="margin-top:10px"><canvas id="vEquity" width="900" height="260"></canvas><div class="tooltip" id="vEquityTip"></div></div>
+      <div class="legend" id="vLegend"></div>
+      <h3>Underwater</h3>
+      <div class="chart-wrap"><canvas id="vUnderwater" class="small" width="900" height="130"></canvas></div>
+      <h3>Rolling Sharpe (20 sessions)</h3>
+      <div class="chart-wrap"><canvas id="vRolling" class="small" width="900" height="130"></canvas></div>
+    </section>
+
+    <section class="card">
+      <h2>Ablation: fractional − baseline per walk-forward window</h2>
+      <div class="chart-wrap"><canvas id="vDelta" class="small" width="900" height="150"></canvas><div class="tooltip" id="vDeltaTip"></div></div>
+      <div id="vAblation" class="kv" style="margin-top:10px"></div>
+    </section>
+
+    <section class="card">
+      <h2>Acceptance gates</h2>
+      <div class="scroll" style="max-height:420px"><table id="vGates"><thead><tr><th>Gate</th><th>Group</th><th>Value</th><th>Threshold</th><th>Result</th><th>Evidence</th></tr></thead><tbody></tbody></table></div>
+    </section>
+
+    <div class="row" style="align-items:stretch">
+      <section class="card" style="flex:1"><h2>Cost sensitivity</h2><div class="scroll"><table id="vCost"><thead><tr><th>Scenario</th><th>Sharpe</th><th>Return</th><th>PF</th><th>Trades</th></tr></thead><tbody></tbody></table></div><div id="vCostNote" class="hint"></div></section>
+      <section class="card" style="flex:1"><h2>Timing &amp; parameter stress</h2><div class="scroll"><table id="vStress"><thead><tr><th>Scenario</th><th>Sharpe</th><th>Return</th><th>Trades</th><th>Flag</th></tr></thead><tbody></tbody></table></div></section>
+    </div>
+
+    <div class="row" style="align-items:stretch">
+      <section class="card" style="flex:1"><h2>Sanity &amp; leakage tests</h2><div class="scroll"><table id="vSanity"><thead><tr><th>Test</th><th>Sharpe</th><th>Return</th><th>Expectation</th><th>Result</th></tr></thead><tbody></tbody></table></div><div id="vLeak" class="hint"></div></section>
+      <section class="card" style="flex:1"><h2>Bootstrap &amp; Monte Carlo</h2><div id="vBoot" class="kv"></div></section>
+    </div>
+
+    <div class="row" style="align-items:stretch">
+      <section class="card" style="flex:1"><h2>Baselines</h2><div class="scroll"><table id="vBaselines"><thead><tr><th>Strategy</th><th>Sharpe</th><th>Return</th><th>Max DD</th></tr></thead><tbody></tbody></table></div></section>
+      <section class="card" style="flex:1"><h2>Regimes (ex-ante)</h2><div class="scroll"><table id="vRegimes"><thead><tr><th>Regime</th><th>Bars</th><th>Sharpe</th><th>Return</th><th>Trades</th></tr></thead><tbody></tbody></table></div></section>
+    </div>
+
+    <section class="card">
+      <h2>Per-window results</h2>
+      <div class="scroll"><table id="vWindowsTable"><thead><tr><th>Window</th><th>OOS from</th><th>Model</th><th>d*</th><th>Accepted</th><th>Return</th><th>Sharpe</th><th>Baseline Sharpe</th><th>ΔSharpe</th><th>Trades</th></tr></thead><tbody></tbody></table></div>
+    </section>
+
+    <section class="card">
+      <h2>Trades (click for the audit trail)</h2>
+      <div class="scroll" style="max-height:340px"><table id="vTradesTable" class="clickable"><thead><tr><th>#</th><th>Decision</th><th>Executed</th><th>Dir</th><th>Model</th><th>E[Ỹ]</th><th>Exposure</th><th>Entry</th><th>Exit</th><th>Bars</th><th>Net P&amp;L</th><th>Exit</th></tr></thead><tbody></tbody></table></div>
+    </section>
   </div>
 </main>
 
@@ -396,7 +516,205 @@
     }
   }
 
-  async function pollStatus() { try { render(await api("/api/status")); } catch (e) { $("phaseText").textContent = "dashboard unreachable: " + e.message; } }
+  // ----------------------------------------------------------- tabs
+  function showTab(name) {
+    $("tabTrading").style.display = name === "trading" ? "" : "none"; $("tabValidation").style.display = name === "validation" ? "" : "none";
+    $("tabBtnTrading").className = name === "trading" ? "active" : ""; $("tabBtnValidation").className = name === "validation" ? "active" : "";
+    if (name === "validation") { loadRuns(); if (vSummary) renderValidation(vSummary); }
+  }
+  $("tabBtnTrading").addEventListener("click", () => showTab("trading")); $("tabBtnValidation").addEventListener("click", () => showTab("validation"));
+
+  // ----------------------------------------------------- validation tab
+  let vSummary = null, vRunId = null, vEquityGeom = null, vDeltaGeom = null, vTrades = [], vLastPhase = null;
+  const LEVELS = ["EXPERIMENTAL", "CANDIDATE", "VALIDATED CANDIDATE", "HOLDOUT PASSED", "PAPER ELIGIBLE"];
+  const fmtSh = (v) => (v == null || isNaN(v)) ? "–" : Number(v).toFixed(2);
+  const short = (s) => s ? String(s).replace(/^(model_|baseline_)/, "").slice(0, 8) : "–";
+
+  $("vRun").addEventListener("click", async () => {
+    const options = { stages: $("vStages").value, open_holdout: $("vHoldout").checked, with_synthetic: Number($("vSynthetic").value || 0) };
+    if (options.open_holdout && !confirm("Open the locked final holdout? This is meant to happen once, after development is finished, and is recorded in holdout_access.jsonl.")) return;
+    try { await api("/api/research/start", { settings: readForm(), options }); $("secret_key").value = ""; note("vStatus", "starting…"); }
+    catch (e) { note("vStatus", e.message, "bad"); }
+  });
+  $("vStop").addEventListener("click", async () => { try { await api("/api/research/stop", {}); } catch (e) { note("vStatus", e.message, "bad"); } });
+
+  function renderResearchStatus(r) {
+    if (!r) return;
+    $("vRun").disabled = !!r.running; $("vStop").disabled = !r.running;
+    $("vProgress").style.width = Math.round(100 * (r.progress || 0)) + "%";
+    const txt = r.phase + (r.message ? " · " + r.message : "") + (r.error ? " · " + r.error : "") + (r.run_id ? " · " + r.run_id : "");
+    note("vStatus", txt, r.phase === "error" ? "bad" : (r.phase === "finished" ? "ok" : ""));
+    if (vLastPhase !== r.phase && (r.phase === "finished" || r.phase === "error" || r.phase === "interrupted")) { loadRuns(); if (r.phase === "finished" && r.run_id) loadRun(r.run_id); }
+    vLastPhase = r.phase;
+  }
+
+  async function loadRuns() {
+    try {
+      const r = await api("/api/research/runs"); const tb = $("vRuns").querySelector("tbody"); tb.innerHTML = "";
+      for (const run of r.runs) {
+        const tr = document.createElement("tr"); if (run.run_id === vRunId) tr.className = "sel";
+        const cells = [run.run_id.replace(/^(run|syn)_/, "").slice(0, 22) + (run.kind === "synthetic" ? " (syn)" : ""), (run.classification || "–").replace(" (SYNTHETIC)", ""), fmtSh(run.sharpe), run.windows == null ? "–" : run.windows, run.holdout ? "✓" : "–"];
+        cells.forEach((v) => { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); });
+        tr.title = run.run_id + " · " + (run.created_at || "");
+        tr.addEventListener("click", () => loadRun(run.run_id)); tb.appendChild(tr);
+      }
+      if (!r.runs.length) tb.innerHTML = '<tr><td colspan="5" class="muted">no validation run yet</td></tr>';
+    } catch (e) { /* ignore */ }
+  }
+  async function loadRun(id) {
+    try {
+      vSummary = await api("/api/research/run?id=" + encodeURIComponent(id)); vRunId = id;
+      const t = await api("/api/research/trades?id=" + encodeURIComponent(id)); vTrades = t.trades || [];
+      $("vTradeDetail").innerHTML = '<span class="muted">Click a trade in the table to see its audit trail.</span>';
+      renderValidation(vSummary); loadRuns();
+    } catch (e) { console.error("cannot load run", e); note("vStatus", "cannot load run: " + e.message, "bad"); }
+  }
+
+  function tableRows(tableId, rows) {
+    const tb = $(tableId).querySelector("tbody"); tb.innerHTML = "";
+    for (const r of rows) {
+      const tr = document.createElement("tr"); if (r.onclick) tr.addEventListener("click", r.onclick);
+      r.cells.forEach((c) => { const td = document.createElement("td"); if (c && typeof c === "object") { td.textContent = c.text; if (c.cls) td.className = c.cls; } else td.textContent = c == null ? "–" : c; tr.appendChild(td); });
+      tb.appendChild(tr);
+    }
+    if (!rows.length) tb.innerHTML = '<tr><td colspan="12" class="muted">not run</td></tr>';
+  }
+  function kv(id, pairs) { const el = $(id); el.innerHTML = ""; for (const [k, v] of pairs) { const a = document.createElement("div"); a.textContent = k; const b = document.createElement("div"); b.textContent = v; el.appendChild(a); el.appendChild(b); } }
+
+  function equitySeries(s) {
+    const d = s.equity && s.equity.development; if (!d) return null;
+    const ts = d.timestamps.slice(), full = d.full.slice(), base = d.baseline.slice(), prod = d.production.slice(), pnl = d.bar_pnl.slice();
+    const segs = [{ from: 0, to: full.length - 1, label: "OOS (development)", color: "#1f2a3a" }];
+    const bh = (s.equity.baselines && s.equity.baselines.buy_and_hold) ? s.equity.baselines.buy_and_hold.slice() : null;
+    const h = s.equity.holdout;
+    if (h) {
+      const f0 = full[full.length - 1], b0 = base[base.length - 1], p0 = prod[prod.length - 1]; const start = full.length;
+      h.timestamps.forEach((t, i) => { ts.push(t); full.push(h.full[i] * f0); base.push(h.baseline[i] * b0); prod.push(h.production[i] * p0); pnl.push(h.bar_pnl[i]); });
+      segs.push({ from: start, to: full.length - 1, label: "HOLDOUT", color: "#3a2a1f" });
+    }
+    return { ts, full, base, prod, pnl, bh, segs };
+  }
+
+  function drawMulti(canvas, series, opts) {
+    const g = setupCanvas(canvas); if (!g) return null; const { ctx, w, h } = g; ctx.clearRect(0, 0, w, h);
+    const pad = { l: 60, r: 14, t: 10, b: 20 }; const n = Math.max(...series.map(s => s.data.length));
+    if (!n || n < 2) { ctx.fillStyle = css("--text-muted"); ctx.font = "12px system-ui"; ctx.fillText(opts.empty || "no data", pad.l, h / 2); return null; }
+    const tf = opts.log ? (v => Math.log(Math.max(v, 1e-9))) : (v => v);
+    let lo = Infinity, hi = -Infinity; series.forEach(s => s.data.forEach(v => { if (v != null && isFinite(v)) { const t = tf(v); lo = Math.min(lo, t); hi = Math.max(hi, t); } }));
+    if (opts.zero) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); } if (hi - lo < 1e-9) { lo -= 1; hi += 1; } const py = (hi - lo) * 0.06; lo -= py; hi += py;
+    const x = (i) => pad.l + (w - pad.l - pad.r) * i / (n - 1), y = (v) => pad.t + (h - pad.t - pad.b) * (1 - (tf(v) - lo) / (hi - lo));
+    (opts.segments || []).forEach(sg => { ctx.fillStyle = sg.color; ctx.fillRect(x(sg.from), pad.t, Math.max(1, x(sg.to) - x(sg.from)), h - pad.t - pad.b); ctx.fillStyle = css("--text-muted"); ctx.font = "10px system-ui"; ctx.textAlign = "left"; ctx.fillText(sg.label, x(sg.from) + 4, pad.t + 11); });
+    ctx.strokeStyle = css("--grid"); ctx.lineWidth = 1; ctx.fillStyle = css("--text-muted"); ctx.font = "11px system-ui"; ctx.textAlign = "right";
+    for (let k = 0; k <= 4; k++) { const t = lo + (hi - lo) * k / 4; const yy = Math.round(pad.t + (h - pad.t - pad.b) * (1 - k / 4)) + 0.5; ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(w - pad.r, yy); ctx.stroke(); const val = opts.log ? Math.exp(t) : t; ctx.fillText(opts.fmt ? opts.fmt(val) : val.toFixed(2), pad.l - 6, yy + 4); }
+    if (opts.zero && lo < 0 && hi > 0) { ctx.strokeStyle = css("--text-muted"); ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(pad.l, Math.round(y(0)) + 0.5); ctx.lineTo(w - pad.r, Math.round(y(0)) + 0.5); ctx.stroke(); ctx.setLineDash([]); }
+    if (opts.ts) { const idx = [0, Math.floor((n - 1) / 2), n - 1]; idx.forEach((i, k) => { ctx.textAlign = k === 0 ? "left" : (k === 2 ? "right" : "center"); ctx.fillStyle = css("--text-muted"); ctx.fillText(fmtTime(opts.ts[i]).slice(0, 10), x(i), h - 5); }); }
+    series.forEach(s => { ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 1.4; ctx.lineJoin = "round"; ctx.beginPath(); let started = false; s.data.forEach((v, i) => { if (v == null || !isFinite(v)) { started = false; return; } if (!started) { ctx.moveTo(x(i), y(v)); started = true; } else ctx.lineTo(x(i), y(v)); }); ctx.stroke(); });
+    return { x, y, pad, w, h, n };
+  }
+
+  function drawValidationCharts(s) {
+    const es = equitySeries(s); const canvas = $("vEquity");
+    if (!es) { drawMulti(canvas, [], { empty: "no equity data" }); vEquityGeom = null; return; }
+    const series = [{ name: "fractional strategy", data: es.full, color: css("--series-1"), width: 2 }];
+    if ($("ovBaseline").checked) series.push({ name: "no-fractional baseline", data: es.base, color: css("--series-2") });
+    if ($("ovBH").checked && es.bh) series.push({ name: "buy & hold", data: es.bh, color: "#c3c2b7" });
+    if ($("ovProd").checked) series.push({ name: "production policy (accepted models only)", data: es.prod, color: "#7fd47f" });
+    const geom = drawMulti(canvas, series, { log: $("ovLog").checked, segments: es.segs, ts: es.ts, fmt: (v) => v.toFixed(2) + "×" });
+    vEquityGeom = geom ? { ...geom, es, series } : null;
+    const lg = $("vLegend"); lg.innerHTML = ""; series.forEach(sr => { const sp = document.createElement("span"); sp.style.setProperty("--c", sr.color); sp.textContent = sr.name; lg.appendChild(sp); });
+    es.segs.forEach(sg => { const sp = document.createElement("span"); sp.innerHTML = '<i class="seg"></i>'; sp.querySelector("i").style.background = sg.color; sp.appendChild(document.createTextNode(sg.label)); sp.style.setProperty("--c", "transparent"); lg.appendChild(sp); });
+    let peak = -Infinity; const dd = es.full.map(v => { peak = Math.max(peak, v); return v / peak - 1; });
+    drawMulti($("vUnderwater"), [{ name: "drawdown", data: dd, color: css("--neg"), width: 1.4 }], { segments: es.segs, fmt: (v) => (100 * v).toFixed(1) + "%", zero: true });
+    const win = 260, rs = new Array(es.pnl.length).fill(null); let sum = 0, sq = 0;
+    for (let i = 0; i < es.pnl.length; i++) { sum += es.pnl[i]; sq += es.pnl[i] * es.pnl[i]; if (i >= win) { sum -= es.pnl[i - win]; sq -= es.pnl[i - win] * es.pnl[i - win]; } if (i >= win - 1) { const m = sum / win, v = Math.max(sq / win - m * m, 0); rs[i] = v > 0 ? m / Math.sqrt(v) * Math.sqrt(3276) : 0; } }
+    drawMulti($("vRolling"), [{ name: "rolling Sharpe", data: rs, color: css("--series-1"), width: 1.4 }], { segments: es.segs, zero: true, fmt: (v) => v.toFixed(1) });
+  }
+  ["ovBaseline", "ovBH", "ovProd", "ovLog"].forEach(id => $(id).addEventListener("change", () => { if (vSummary) drawValidationCharts(vSummary); }));
+  $("vEquity").addEventListener("pointermove", (ev) => {
+    const tip = $("vEquityTip"); if (!vEquityGeom) { tip.style.display = "none"; return; }
+    const rect = ev.currentTarget.getBoundingClientRect(); const px = ev.clientX - rect.left; const { x, pad, w, n, es } = vEquityGeom;
+    const i = Math.max(0, Math.min(n - 1, Math.round((px - pad.l) / (w - pad.l - pad.r) * (n - 1))));
+    tip.innerHTML = ""; const b = document.createElement("b"); b.textContent = es.full[i].toFixed(3) + "× equity"; const sp = document.createElement("span");
+    sp.textContent = fmtTime(es.ts[i]) + " · baseline " + es.base[i].toFixed(3) + "× · window " + ((vSummary.equity.development.window[i] != null) ? vSummary.equity.development.window[i] : "holdout");
+    tip.appendChild(b); tip.appendChild(sp); tip.style.display = "block"; tip.style.left = Math.min(px + 12, w - 240) + "px"; tip.style.top = "8px";
+  });
+  $("vEquity").addEventListener("pointerleave", () => { $("vEquityTip").style.display = "none"; });
+
+  function drawDeltaBars(rows) {
+    const canvas = $("vDelta"), g = setupCanvas(canvas); if (!g) return; const { ctx, w, h } = g; ctx.clearRect(0, 0, w, h); const pad = { l: 48, r: 12, t: 10, b: 18 };
+    const vals = rows.map(r => r.delta_sharpe).filter(v => v != null);
+    if (!vals.length) { ctx.fillStyle = css("--text-muted"); ctx.font = "12px system-ui"; ctx.fillText("no window statistics", pad.l, h / 2); vDeltaGeom = null; return; }
+    const m = Math.max(0.5, ...vals.map(Math.abs)) * 1.1; const y = (v) => pad.t + (h - pad.t - pad.b) * (1 - (v + m) / (2 * m)); const slot = (w - pad.l - pad.r) / rows.length; const bw = Math.min(24, Math.max(2, slot - 2));
+    ctx.strokeStyle = css("--grid"); ctx.lineWidth = 1; ctx.fillStyle = css("--text-muted"); ctx.font = "11px system-ui"; ctx.textAlign = "right";
+    for (const t of [-m / 1.1, 0, m / 1.1]) { const yy = Math.round(y(t)) + 0.5; ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(w - pad.r, yy); ctx.stroke(); ctx.fillText(t.toFixed(1), pad.l - 6, yy + 4); }
+    rows.forEach((r, i) => { const v = r.delta_sharpe || 0, x0 = pad.l + slot * i + (slot - bw) / 2, y0 = y(Math.max(v, 0)), y1 = y(Math.min(v, 0)); ctx.fillStyle = v >= 0 ? css("--pos") : css("--neg"); ctx.fillRect(x0, y0, bw, Math.max(1, y1 - y0)); });
+    vDeltaGeom = { rows, pad, slot, w };
+  }
+  $("vDelta").addEventListener("pointermove", (ev) => {
+    const tip = $("vDeltaTip"); if (!vDeltaGeom) { tip.style.display = "none"; return; }
+    const rect = ev.currentTarget.getBoundingClientRect(); const px = ev.clientX - rect.left; const { rows, pad, slot, w } = vDeltaGeom; const i = Math.floor((px - pad.l) / slot);
+    if (i < 0 || i >= rows.length) { tip.style.display = "none"; return; } const r = rows[i];
+    tip.innerHTML = ""; const b = document.createElement("b"); b.textContent = (r.delta_sharpe >= 0 ? "+" : "") + fmtSh(r.delta_sharpe) + " ΔSharpe"; const sp = document.createElement("span");
+    sp.textContent = "window " + r.window + " · full " + fmtSh(r.full_sharpe) + " vs baseline " + fmtSh(r.baseline_sharpe) + " · return " + fmtPct(r.full_net_return) + " · " + (r.accepted ? "accepted" : "rejected") + " · d*=" + fmtNum(r.d_star, 2);
+    tip.appendChild(b); tip.appendChild(sp); tip.style.display = "block"; tip.style.left = Math.min(px + 12, w - 280) + "px"; tip.style.top = "4px";
+  });
+  $("vDelta").addEventListener("pointerleave", () => { $("vDeltaTip").style.display = "none"; });
+
+  function renderValidation(s) {
+    const dev = s.development || {}; const m = (dev.metrics || {}).full || {}; const g = s.gates || {}; const synthetic = s.kind === "synthetic";
+    const banner = $("vBanner"); banner.style.display = ""; banner.className = "banner " + (synthetic ? "synthetic" : "real"); banner.textContent = (synthetic ? "⚠ " : "") + (s.evidence_label || "");
+    const cls = g.classification || "EXPERIMENTAL"; const lvl = Math.max(0, LEVELS.indexOf((g.classification_if_real || cls))); $("vClass").textContent = cls; $("vClass").className = "class-badge lvl" + (synthetic ? 0 : lvl);
+    const man = s.manifest || {};
+    $("vRunMeta").textContent = `${s.run_id} · ${man.instrument || ""} · ${(man.data || {}).n_bars || "?"} bars · data ${(man.data || {}).data_hash || ""} · config ${man.config_hash || ""} · model config ${man.model_config_hash || ""} · code ${(man.code_commit || "").slice(0, 12)} · results ${s.results_hash || ""} · stages: ${(s.stages_completed || []).join(", ")}`;
+    setText("vCagr", fmtPct(m.cagr, 1), signClass(m.cagr)); setText("vCagrSub", "total " + fmtPct(m.total_return, 1) + " · vol " + fmtPct(m.volatility, 1));
+    setText("vDD", fmtPct(m.max_drawdown, 1)); setText("vDDSub", "ulcer " + fmtNum(m.ulcer_index, 3) + " · longest " + (m.max_drawdown_duration || 0) + " bars");
+    setText("vSharpe", fmtSh(m.sharpe), signClass(m.sharpe)); const bl = ((s.bootstrap || {}).block || {}).sharpe; setText("vSharpeSub", bl ? "95% CI [" + fmtSh(bl.ci_low) + ", " + fmtSh(bl.ci_high) + "]" : "");
+    setText("vSortino", fmtSh(m.sortino)); setText("vSortinoSub", "Calmar " + fmtSh(m.calmar) + " · PF " + (m.profit_factor === "inf" ? "∞" : fmtSh(m.profit_factor)));
+    setText("vTrades", m.trade_count == null ? "–" : m.trade_count); setText("vTradesSub", "win " + fmtPct(m.win_rate, 0).replace("+", "") + " · " + fmtNum(m.mean_bars_held, 1) + " bars avg · invested " + fmtPct(m.time_invested, 0).replace("+", ""));
+    setText("vCosts", fmtPct(m.total_cost, 2).replace("+", "")); setText("vCostsSub", "turnover " + fmtNum(m.turnover_per_year, 0) + "×/yr");
+    setText("vWindows", dev.n_windows == null ? "–" : dev.n_windows); setText("vWindowsSub", (dev.accepted_windows || 0) + " accepted · " + (dev.n_rows || 0) + " OOS bars");
+    const hm = s.holdout && s.holdout.metrics && s.holdout.metrics.full; setText("vHold", hm ? fmtPct(hm.total_return, 1) : "locked", hm ? signClass(hm.total_return) : ""); setText("vHoldSub", hm ? "Sharpe " + fmtSh(hm.sharpe) + " · DD " + fmtPct(hm.max_drawdown, 1) + " · opening #" + ((s.holdout.access || {}).opening_number || "?") : "never opened by this run");
+    drawValidationCharts(s);
+    const pw = dev.per_window || []; drawDeltaBars(pw);
+    const a = s.ablation || {};
+    kv("vAblation", a.cycles == null ? [["ablation", "not run"]] : [["cycles", a.cycles], ["positive cycles (fractional / baseline)", a.positive_cycles_full + " / " + a.positive_cycles_baseline], ["ΔSharpe mean / median", fmtSh(a.mean_delta_sharpe) + " / " + fmtSh(a.median_delta_sharpe)], ["fractional beats baseline", fmtPct(a.positive_delta_fraction, 0).replace("+", "") + " of windows"], ["bootstrap CI of mean ΔSharpe", a.delta_sharpe_ci ? "[" + fmtSh(a.delta_sharpe_ci[0]) + ", " + fmtSh(a.delta_sharpe_ci[1]) + "]" : "–"], ["OOS Sharpe fractional / baseline", fmtSh((a.oos_full || {}).sharpe) + " / " + fmtSh((a.oos_baseline || {}).sharpe)], ["trainer holdout ΔS (mean, positive)", fmtSh((a.trainer_holdout_delta || {}).mean) + ", " + fmtPct((a.trainer_holdout_delta || {}).positive_fraction, 0).replace("+", "")]]);
+    tableRows("vGates", (g.gates || []).map(r => ({ cells: [r.gate, r.group, typeof r.value === "number" ? (Number.isInteger(r.value) ? r.value : r.value.toFixed(3)) : String(r.value), r.op + " " + r.threshold, { text: r.passed === true ? "PASS" : (r.passed === false ? "FAIL" : "n/a"), cls: r.passed === true ? "gate-pass" : (r.passed === false ? "gate-fail" : "gate-na") }, r.evidence || ""] })));
+    const cc = s.cost_curve || {}; tableRows("vCost", (cc.rows || []).map(r => ({ cells: [r.label, fmtSh(r.sharpe), { text: fmtPct(r.total_return, 1), cls: signClass(r.total_return) }, r.profit_factor === "inf" ? "∞" : fmtSh(r.profit_factor), r.trade_count] })));
+    $("vCostNote").textContent = cc.rows ? `mean model round trip ${fmtNum(cc.mean_model_roundtrip_bps, 2)} bps · breakeven flat cost ${cc.breakeven_flat_bps == null ? "–" : (cc.breakeven_flat_bps === "inf" || cc.breakeven_flat_bps === Infinity ? "> tested range" : fmtNum(cc.breakeven_flat_bps, 1) + " bps")} · profitable at 2× cost: ${cc.profitable_at_2x_cost ? "yes" : "no"}` : "";
+    const st = []; ((s.timing || {}).rows || []).forEach(r => st.push({ cells: ["execution " + r.label.replace("_", " +") + " bar", fmtSh(r.sharpe), { text: fmtPct(r.total_return, 1), cls: signClass(r.total_return) }, r.trade_count, r.delay === 1 ? (s.timing.viable_at_plus_1 ? "viable" : "not viable") : ""] }));
+    ((s.parameter_perturbations || {}).rows || []).forEach(r => st.push({ cells: [r.label, fmtSh(r.sharpe), { text: fmtPct(r.total_return, 1), cls: signClass(r.total_return) }, r.trade_count, r.collapsed ? "COLLAPSE" : ""] }));
+    ((s.d_perturbation || {}).rows || []).forEach(r => st.push({ cells: [r.label + " (light refit)", fmtSh(r.sharpe), { text: fmtPct(r.total_return, 1), cls: signClass(r.total_return) }, r.trade_count, r.step === 0 ? "reference" : ""] }));
+    tableRows("vStress", st);
+    const sa = (s.sanity || {}).tests || {}; tableRows("vSanity", Object.values(sa).map(t => ({ cells: [t.label, t.sharpe == null ? fmtSh(t.sharpe_median) + " (median)" : fmtSh(t.sharpe), t.total_return == null ? (t.strategy_percentile != null ? "strategy pct " + fmtPct(t.strategy_percentile, 0).replace("+", "") : "–") : fmtPct(t.total_return, 1), t.expectation, { text: t.passed === true ? "PASS" : (t.passed === false ? "FAIL" : "info"), cls: t.passed === true ? "gate-pass" : (t.passed === false ? "gate-fail" : "gate-na") }] })));
+    const lk = s.leakage; $("vLeak").textContent = lk ? `Leakage: ${lk.passed ? "PASS" : "FAIL"} · timestamp violations ${lk.timestamps.violations} of ${lk.timestamps.rows} rows · labels aligned to the execution price: ${lk.label_alignment.labels_aligned}` : "leakage stage not run";
+    const b = (s.bootstrap || {}).block, mc = s.monte_carlo || {}, mt = s.multiple_testing || {};
+    kv("vBoot", !b ? [["bootstrap", "not run"]] : [["block bootstrap", b.n_boot + " resamples · " + b.block_bars + "-bar blocks"], ["Sharpe 95% CI", "[" + fmtSh(b.sharpe.ci_low) + ", " + fmtSh(b.sharpe.ci_high) + "] · P(Sharpe ≤ 0) " + fmtPct(b.sharpe.p_negative, 1).replace("+", "")], ["CAGR 95% CI", "[" + fmtPct(b.cagr.ci_low, 1) + ", " + fmtPct(b.cagr.ci_high, 1) + "]"], ["max DD median / p95", fmtPct(b.max_drawdown.median, 1).replace("+", "") + " / " + fmtPct(b.max_drawdown.p95, 1).replace("+", "")], ["Monte Carlo (trades)", (mc.n_paths || 0) + " paths · P(loss) " + fmtPct(((mc.terminal_return || {}).p_loss), 1).replace("+", "") + " · P(DD > 20%) " + fmtPct(((mc.max_drawdown || {}).p_over_20pct), 1).replace("+", "")], ["terminal return p05 / median", fmtPct((mc.terminal_return || {}).p05, 1) + " / " + fmtPct((mc.terminal_return || {}).median, 1)], ["multiple testing", (mt.n_tests || 0) + " configurations · p " + (mt.p_value == null ? "–" : mt.p_value.toExponential(2)) + " · Bonferroni p " + (mt.bonferroni_p_value == null ? "–" : mt.bonferroni_p_value.toExponential(2))]]);
+    const bc = (s.baselines || {})._comparison || {}; tableRows("vBaselines", Object.entries(bc).map(([k, v]) => ({ cells: [{ text: k, cls: k === "strategy" ? "pos" : "" }, fmtSh(v.sharpe), { text: fmtPct(v.total_return, 1), cls: signClass(v.total_return) }, fmtPct(v.max_drawdown, 1).replace("+", "")] })));
+    const rg = ((s.regimes || {}).attribution) || {}; const rr = []; for (const [kind, tbl] of Object.entries(rg)) for (const [name, v] of Object.entries(tbl)) rr.push({ cells: [kind + ": " + name, v.bars, fmtSh(v.sharpe), { text: fmtPct(v.net_return, 1), cls: signClass(v.net_return) }, v.trades] }); tableRows("vRegimes", rr);
+    tableRows("vWindowsTable", pw.map(r => ({ cells: [r.window, fmtTime((r.oos_span || [])[0]), short(r.model_id), fmtNum(r.d_star, 2), r.accepted ? "yes" : "no", { text: fmtPct(r.full_net_return, 2), cls: signClass(r.full_net_return) }, fmtSh(r.full_sharpe), fmtSh(r.baseline_sharpe), { text: fmtSh(r.delta_sharpe), cls: signClass(r.delta_sharpe) }, r.full_trades] })));
+    tableRows("vTradesTable", vTrades.slice().reverse().map(t => ({ onclick: () => loadTrade(t.trade_id), cells: [t.trade_id + (t.segment === "holdout" ? " H" : ""), fmtTime(t.decision_timestamp), fmtTime(t.execution_timestamp), t.direction > 0 ? "long" : "short", short(t.model_id), fmtNum(t.forecast, 3), fmtNum(t.approved_exposure, 2), fmtNum(t.entry_price, 2), fmtNum(t.exit_price, 2), t.bars_held, { text: fmtMoney(t.net_pnl_currency), cls: signClass(t.net_pnl) }, t.exit_reason] })));
+  }
+
+  async function loadTrade(id) {
+    try {
+      const r = await api("/api/research/trade?id=" + encodeURIComponent(vRunId) + "&trade=" + id); const t = r.trade, el = $("vTradeDetail"); el.innerHTML = "";
+      const box = document.createElement("div"); box.className = "kv";
+      const add = (k, v) => { const a = document.createElement("div"); a.textContent = k; const b = document.createElement("div"); b.textContent = v; box.appendChild(a); box.appendChild(b); };
+      add("trade", "#" + t.trade_id + " · " + (t.direction > 0 ? "long" : "short") + " · " + t.segment);
+      add("decision at", fmtTime(t.decision_timestamp)); add("executed at", fmtTime(t.execution_timestamp) + " @ " + fmtNum(t.entry_price, 2)); add("exit at", fmtTime(t.exit_timestamp) + " @ " + fmtNum(t.exit_price, 2) + " (" + t.exit_reason + ", " + t.bars_held + " bars)");
+      add("model", t.model_id + (r.model ? " · d*=" + fmtNum(r.model.fractional_d, 2) + " · trained " + fmtTime(r.model.training_start).slice(0, 10) + "→" + fmtTime(r.model.training_end).slice(0, 10) + " · " + (r.model.acceptance ? "accepted" : "not accepted") : ""));
+      add("forecast E[Ỹ]", fmtNum(t.forecast, 4) + " · ER " + fmtPct(t.expected_return, 3) + " · P↑ " + fmtNum(t.probability_up, 3) + " · confidence " + fmtNum(t.confidence, 2));
+      add("sizing", "target " + fmtNum(t.target_exposure, 3) + " → approved " + fmtNum(t.approved_exposure, 3) + " (max " + fmtNum(t.max_exposure, 3) + ")");
+      add("P&L", fmtMoney(t.net_pnl_currency) + " net · gross " + fmtMoney(t.gross_pnl_currency) + " · cost " + fmtMoney(t.cost_currency));
+      el.appendChild(box);
+      const tbl = document.createElement("table"); tbl.innerHTML = "<thead><tr><th>row</th><th>decision</th><th>executed</th><th>E</th><th>P↑</th><th>target</th><th>exposure</th><th>open next</th><th>net pnl</th><th>halt</th></tr></thead>"; const tb = document.createElement("tbody");
+      for (const d of r.decisions) { const tr = document.createElement("tr"); [d.row, fmtTime(d.decision_at).slice(5, 16), fmtTime(d.execution_at).slice(5, 16), fmtNum(d.E, 3), fmtNum(d.P, 2), fmtNum(d.target_exposure, 2), fmtNum(d.exposure, 2), fmtNum(d.open_next, 2), fmtPct(d.net_pnl, 3), d.halted ? "HALT" : ""].forEach(v => { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); }); if (d.row >= t.entry_row && d.row <= t.exit_row) tr.style.background = "#1f2a3a"; tb.appendChild(tr); }
+      tbl.appendChild(tb); const wrap = document.createElement("div"); wrap.className = "scroll"; wrap.style.marginTop = "10px"; wrap.appendChild(tbl); el.appendChild(wrap);
+      if (r.fills.length) { const f = document.createElement("div"); f.className = "hint"; f.textContent = "fills: " + r.fills.map(x => x.side + " " + fmtNum(x.quantity_exposure, 2) + " @ " + fmtNum(x.price, 2) + " (" + x.status + ", +" + x.delay_bars + " bar)").join(" · "); el.appendChild(f); }
+    } catch (e) { note("vStatus", "cannot load trade: " + e.message, "bad"); }
+  }
+
+  async function pollStatus() { try { const st = await api("/api/status"); render(st); renderResearchStatus(st.research); } catch (e) { $("phaseText").textContent = "dashboard unreachable: " + e.message; } }
   async function pollLogs() {
     try {
       const r = await api("/api/logs?since=" + logSeq); if (!r.lines.length) return; const box = $("log"); const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
@@ -405,7 +723,7 @@
     } catch (e) { /* ignore */ }
   }
   (async () => { try { fillForm(await api("/api/settings")); } catch (e) {} await pollStatus(); await pollLogs(); setInterval(pollStatus, 1500); setInterval(pollLogs, 1500); })();
-  window.addEventListener("resize", () => { if (lastStatus && lastStatus.bot) { drawEquity(lastStatus.bot.equity_curve); drawDelta(lastStatus.bot.fractional_contribution); } });
+  window.addEventListener("resize", () => { if (lastStatus && lastStatus.bot) { drawEquity(lastStatus.bot.equity_curve); drawDelta(lastStatus.bot.fractional_contribution); } if (vSummary && $("tabValidation").style.display !== "none") renderValidation(vSummary); });
 })();
 </script>
 </body>

@@ -123,6 +123,7 @@ class TrainingReport:
     holdout_rows: int = 0
     holdout_span: Optional[tuple[datetime, datetime]] = None   # first/last bar timestamps of the holdout rows
     d_full: float = float("nan")                                # whole-window d* (diagnostics only)
+    baseline_model: Optional[CombinedModel] = None              # final refit of the ablation baseline (research runs)
 
     @property
     def fold_full_score(self) -> float:
@@ -202,6 +203,35 @@ def software_version() -> str:
     return f"{__version__}+{git_commit()[:8]}"
 
 
+def fitted_model_hash(model: CombinedModel) -> str:
+    """Digest of the *fitted* parameters (trees, logistic weights, calibration map) -- independent of
+    the configuration and metadata hashes, so an identical manifest that yields a different fitted
+    model is detected (research section 26)."""
+    h = hashlib.sha256()
+    reg = model.regression._model
+    if reg is not None:
+        booster = getattr(reg, "booster_", None)
+        if booster is not None:
+            h.update(booster.model_to_string().encode())
+        else:  # sklearn fallback: hash the predictions on a fixed probe grid
+            h.update(np.ascontiguousarray(reg.predict(np.zeros((1, len(model.feature_names))))).tobytes())
+            h.update(str(sorted((k, str(v)) for k, v in reg.get_params().items())).encode())
+    d = model.direction
+    if d._pipe is not None:
+        logit = d._pipe.named_steps["logit"]
+        h.update(np.ascontiguousarray(logit.coef_, dtype=float).tobytes())
+        h.update(np.ascontiguousarray(logit.intercept_, dtype=float).tobytes())
+        h.update(np.ascontiguousarray(d.scaler_mean, dtype=float).tobytes())
+        h.update(np.ascontiguousarray(d.scaler_scale, dtype=float).tobytes())
+    else:
+        h.update(f"constant:{d.constant_class}".encode())
+    cal = model.calibration
+    probe = np.linspace(-3.0, 3.0, 241)
+    h.update(np.ascontiguousarray(cal.predict(probe), dtype=float).tobytes())
+    h.update(f"d={model.d_star!r};H={model.horizon};names={list(model.feature_names)}".encode())
+    return h.hexdigest()[:16]
+
+
 def environment_info() -> dict[str, Any]:
     """Interpreter, platform and the numerical stack that produced a model (spec section 56)."""
     import importlib.metadata as md
@@ -219,8 +249,9 @@ def environment_info() -> dict[str, Any]:
 
 class ModelTrainer:
     def __init__(self, cfg, feature_engine: FeatureEngine, fractional_engine: FractionalEngine,
-                 cost_model: CostModel, validator: ModelValidator | None = None):
+                 cost_model: CostModel, validator: ModelValidator | None = None, fit_final_baseline: bool = False):
         self.cfg = cfg
+        self.fit_final_baseline = bool(fit_final_baseline)   # research: also refit the ablation baseline as a model
         self.fe = feature_engine
         self.fractional = fractional_engine
         self.cost_model = cost_model
@@ -435,6 +466,47 @@ class ModelTrainer:
                                    self.purge, self.embargo)
         return inner_rows, holdout_rows, folds
 
+    # ---------------------------------------------------------- light refit
+    def light_refit(self, history: BarStore, d: float, params: dict[str, Any], names, calibration_fraction: float = 0.25,
+                    shuffle_labels: bool = False, shuffle_features: bool = False, label_offset_bars: int = 0,
+                    seed: int | None = None) -> CombinedModel:
+        """Cheap refit used by the research stress / sanity / leakage tests (sections 20-24).
+
+        No d* search, no grid, no holdout: the models are fitted on the earliest
+        ``1 - calibration_fraction`` of the window's rows (purged) and calibrated chronologically on the
+        rest.  ``shuffle_labels`` permutes the training labels, ``shuffle_features`` permutes every
+        feature column independently (both destroy any real structure: a strategy that still
+        "works" afterwards is broken), ``label_offset_bars`` shifts the label into the future.
+        The reference for every perturbation is the same light refit with the perturbation off.
+        """
+        window = history.last(self.window_bars)
+        previous_d = self.fe.adaptive_d
+        try:
+            ds = self.builder.build(window, float(d), label_offset_bars=int(label_offset_bars))
+            names = tuple(names)
+            X = ds.columns(names)
+            y_norm, y_raw = ds.y_norm.copy(), ds.y_raw.copy()
+            rng = np.random.default_rng(self.seed if seed is None else int(seed))
+            if shuffle_labels:
+                perm = rng.permutation(len(ds))
+                y_norm, y_raw = y_norm[perm], y_raw[perm]
+            if shuffle_features:
+                X = X.copy()
+                for j in range(X.shape[1]):
+                    X[:, j] = X[rng.permutation(len(ds)), j]
+            n = len(ds)
+            split = int(n * (1.0 - calibration_fraction))
+            fit_rows = np.arange(0, max(0, split - self.purge))
+            cal_rows = np.arange(min(n, split + self.embargo), n)
+            if len(fit_rows) < self.inner_min_fit or len(cal_rows) < self.inner_min_cal:
+                raise ValueError("window too small for a light refit")
+            reg, direction = self._fit_pair(X[fit_rows], y_norm[fit_rows], y_raw[fit_rows], params, names)
+            A, _ = combine(reg.predict(X[cal_rows]), direction.predict_proba_up(X[cal_rows]))
+            cal = self._calibrator().fit(A, y_norm[cal_rows])
+            return CombinedModel(reg, direction, cal, names, float(d), self.horizon, None)
+        finally:
+            self.fe.set_adaptive_d(previous_d)
+
     # -------------------------------------------------------------- retrain
     def retrain(self, history: BarStore, log=None) -> TrainingReport:
         t0 = time.time()
@@ -532,6 +604,22 @@ class ModelTrainer:
             meta = self._metadata(ds_prod, params, full_names, validation_summary, direction, False, extra,
                                   reg.effective_params())
             model = CombinedModel(reg, direction, calibration, full_names, d_prod, self.horizon, meta)
+            baseline_model = None
+            if self.fit_final_baseline:
+                # Same protocol for the conventional-feature baseline (research ablation, section 9).
+                Xb = ds_prod.columns(base_names)
+                reg_b, dir_b = self._fit_pair(Xb, ds_prod.y_norm, ds_prod.y_raw, baseline.params, base_names)
+                pooled_Ab = [fp.A for fp in baseline.fold_predictions]
+                pooled_Yb = [ds.y_norm[fp.rows] for fp in baseline.fold_predictions]
+                if holdout_base is not None:
+                    pooled_Ab.append(holdout_base.A)
+                    pooled_Yb.append(ds.y_norm[holdout_base.rows])
+                cal_b = self._calibrator().fit(np.concatenate(pooled_Ab), np.concatenate(pooled_Yb))
+                meta_b = self._metadata(ds_prod, self._params(baseline.params), base_names,
+                                        {"aggregate": baseline.aggregate.to_dict(), "fold_scores": baseline.fold_scores,
+                                         "holdout": holdout_base.metrics.to_dict() if holdout_base else None},
+                                        dir_b, True, {"d_production": d_prod}, reg_b.effective_params())
+                baseline_model = CombinedModel(reg_b, dir_b, cal_b, base_names, d_prod, self.horizon, meta_b)
             holdout_span = None
             if holdout_full is not None:
                 holdout_span = (window[int(ds.bar_index[holdout_full.rows[0]])].timestamp,
@@ -544,7 +632,8 @@ class ModelTrainer:
                                   holdout_d_star=holdout_full.d_star if holdout_full else float("nan"),
                                   holdout_metrics=holdout_full.metrics if holdout_full else None,
                                   baseline_holdout_metrics=holdout_base.metrics if holdout_base else None,
-                                  holdout_rows=int(len(holdout_rows)), holdout_span=holdout_span, d_full=d_full)
+                                  holdout_rows=int(len(holdout_rows)), holdout_span=holdout_span, d_full=d_full,
+                                  baseline_model=baseline_model)
         except Exception as exc:
             return TrainingReport(None, False, None, stationarity, {}, [], [], [], None, None, float("nan"), 0,
                                   window[0].timestamp, window[-1].timestamp, time.time() - t0,
@@ -555,4 +644,4 @@ class ModelTrainer:
 
 
 __all__ = ["ModelTrainer", "TrainingReport", "CandidateEvaluation", "FoldPrediction", "FoldSet", "HoldoutEvaluation",
-           "software_version", "environment_info", "git_commit"]
+           "software_version", "environment_info", "git_commit", "fitted_model_hash"]

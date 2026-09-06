@@ -148,6 +148,70 @@ diagnostics:
   oos_by_d_every_retrain: false    # maintain the d -> OOSScore(d) curve on every retrain (expensive)
   oos_by_d_step: 3                 # evaluate every k-th candidate d for that curve
 
+research:
+  # Research-grade validation framework (docs/VALIDATION_FRAMEWORK.md).  Nothing here changes live behaviour.
+  walkforward:
+    train_bars: null           # null -> training.window_bars (trailing training block per window)
+    first_train_bars: null     # null -> training.minimum_bars (the first window trains as soon as the bot would)
+    oos_bars: null             # null -> training.retrain_every_bars (one OOS block per retrain)
+    step_bars: null            # null -> oos_bars (rolling, non-overlapping OOS blocks)
+    expanding: false           # true: every window trains on all history before it
+    deploy_policy: always      # always: trade every refit (research); production: trade only accepted models, keep the previous otherwise
+  holdout:
+    fraction: 0.15             # locked final holdout: never touched by development runs, opened only with --open-holdout
+  simulation:
+    portfolio_halts: true      # apply risk.daily_loss_limit / risk.drawdown_halt in the OOS simulation
+  cost:
+    flat_bps_levels: [0, 1, 2, 5, 10]
+    model_cost_scales: [1.0, 2.0, 3.0]
+  timing:
+    delays: [0, 1, 2]          # extra bars of execution latency
+  stress:
+    d_steps: [-2, -1, 0, 1, 2] # adaptive-order perturbation in units of fractional.adaptive_step (light refit)
+    collapse_fraction: 0.75    # a perturbation "collapses" when Sharpe loses this fraction and the return turns non-positive
+  sanity:
+    target_shift_bars: 20      # leakage test: label moved this many bars into the future
+    random_permutations: 20
+    max_destroyed_sharpe: 1.0  # a destroyed signal must stay below this Sharpe
+  bootstrap:
+    block_bars: 65             # 5 sessions
+    n_boot: 1000
+    monte_carlo_paths: 2000
+    seed: 0
+  baselines:
+    vol_target: 0.10
+    momentum_bars: 65
+    random_permutations: 20
+  regimes:
+    short_bars: 20
+    long_bars: 200
+  reproducibility:
+    windows: 1                 # windows retrained a second time and compared bit for bit (--repro-full re-runs everything)
+  multiple_testing:
+    prior_trials: 0            # strategy variants tried before this configuration (declared honestly by the researcher)
+  synthetic:
+    seeds: 5
+    n_bars: 4000
+    master_seed: 0
+  gates:                       # promotion thresholds (research spec section 30)
+    min_windows: 20
+    min_trades: 200
+    min_sharpe: 1.0
+    max_drawdown: 0.25
+    min_profit_factor: 1.2
+    min_positive_window_fraction: 0.55
+    min_median_delta_sharpe: 0.0
+    min_positive_delta_fraction: 0.5
+    require_profitable_at_2x_cost: true
+    require_viable_at_plus_1_bar: true
+    allow_perturbation_collapse: false
+    min_bootstrap_sharpe_lower: 0.0
+    require_sanity_pass: true
+    require_leakage_pass: true
+    holdout_min_return: 0.0
+    holdout_min_sharpe: 0.0
+    require_reproducible: true
+
 paths:
   artifacts_dir: artifacts
   models_dir: artifacts/models

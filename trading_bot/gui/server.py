@@ -72,8 +72,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif url.path == "/api/logs":
             since = int((parse_qs(url.query).get("since") or ["0"])[0])
             self._json(self.ctl.logs_since(since))
+        elif url.path.startswith("/api/research/"):
+            self._research_get(url)
         else:
             self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def _research_get(self, url) -> None:
+        q = parse_qs(url.query)
+        first = lambda k, d=None: (q.get(k) or [d])[0]  # noqa: E731
+        try:
+            if url.path == "/api/research/runs":
+                self._json({"runs": self.ctl.research_runs(), "status": {**self.ctl.research_status, "running": self.ctl.research_running}})
+            elif url.path == "/api/research/status":
+                self._json({**self.ctl.research_status, "running": self.ctl.research_running})
+            elif url.path == "/api/research/run":
+                self._json(self.ctl.research_summary(first("id", "")))
+            elif url.path == "/api/research/trades":
+                self._json({"trades": self.ctl.research_trades(first("id", ""), int(first("limit", "0")) or None)})
+            elif url.path == "/api/research/trade":
+                self._json(self.ctl.research_trade(first("id", ""), int(first("trade", "0"))))
+            else:
+                self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        except FileNotFoundError as exc:
+            self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+        except (ValueError, KeyError) as exc:
+            self._json({"error": f"{type(exc).__name__}: {exc}"}, HTTPStatus.BAD_REQUEST)
 
     # --------------------------------------------------------------- POST
     def do_POST(self) -> None:
@@ -98,6 +121,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if data.get("settings"):
                     self.ctl.update_settings(data["settings"])
                 self._json(self.ctl.download_history())
+            elif url.path == "/api/research/start":
+                data = self._body()
+                if data.get("settings"):
+                    self.ctl.update_settings(data["settings"])
+                self._json(self.ctl.start_research(data.get("options") or {}))
+            elif url.path == "/api/research/stop":
+                self._json(self.ctl.stop_research())
             else:
                 self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except Exception as exc:

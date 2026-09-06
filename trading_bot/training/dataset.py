@@ -96,7 +96,9 @@ class TrainingDatasetBuilder:
                    int(cfg.signal.vol_reference_days) * int(cfg.market.bars_per_day), cfg.features.epsilon,
                    cfg.execution.slippage_reference, str(cfg.prediction.get("label_price", "open")))
 
-    def build(self, window: BarStore, adaptive_d: float) -> TrainingDataset:
+    def build(self, window: BarStore, adaptive_d: float, label_offset_bars: int = 0) -> TrainingDataset:
+        """``label_offset_bars`` > 0 shifts the label ``off`` bars into the future (leakage test, research
+        section 23): Y_t = log P_{t+1+off+H} - log P_{t+1+off}.  Production always uses 0."""
         self.fe.set_adaptive_d(adaptive_d)
         fm: FeatureMatrix = self.fe.compute_matrix(window)
         n = len(window)
@@ -109,9 +111,12 @@ class TrainingDatasetBuilder:
 
         # Labels: need bars t+1 .. t+H+1 (entry at the first tradable price after the signal).
         price = log_close if self.label_price == "close" else np.log(arrays["open"])
+        off = int(label_offset_bars)
+        if off < 0:
+            raise ValueError("label_offset_bars must be >= 0")
         y_raw = np.full(n, np.nan)
-        if n > H + 1:
-            y_raw[: n - (H + 1)] = price[H + 1:] - price[1: n - H]
+        if n > H + 1 + off:
+            y_raw[: n - (H + 1 + off)] = price[H + 1 + off:] - price[1 + off: n - H]
         y_norm = y_raw / (sigma * np.sqrt(H) + self.eps)
 
         cost_rt = self.cost_model.estimate_array(range_rel, spread_rel)
