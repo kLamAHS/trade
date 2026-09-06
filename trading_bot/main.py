@@ -6,6 +6,9 @@
     python -m trading_bot.main paper --symbol SPY
     python -m trading_bot.main train --csv bars.csv
     python -m trading_bot.main diagnose --csv bars.csv
+    python -m trading_bot.main research --csv bars.csv [--stages quick] [--open-holdout]   # validation framework
+    python -m trading_bot.main research-synthetic --seeds 5 --bars 4000                    # engineering validation
+    python -m trading_bot.main research-runs [--compare RUN_A RUN_B]
     python -m trading_bot.main gui                   # browser dashboard (or start.bat / start.sh)
 
 Always run as a module (``python -m trading_bot.main``) or through the
@@ -260,6 +263,88 @@ def cmd_diagnose(args) -> int:
     return 0
 
 
+def _data_info(args, cfg) -> dict:
+    if getattr(args, "synthetic", None):
+        return {"source": "synthetic", "seed": int(args.seed), "n_bars": int(args.synthetic), "memory_d": float(args.memory_d),
+                "amplitude": float(args.amplitude)}
+    return {"source": "csv", "path": str(Path(args.csv).resolve())}
+
+
+def cmd_research(args) -> int:
+    """Run the research-grade validation pipeline and print the gate table (research spec section 34)."""
+    from .research.runner import ResearchRun
+    from .research.synthetic_ensemble import run_synthetic_ensemble
+
+    cfg = build_config(args)
+    bars = _load_bars(args, cfg)
+    store = _validated_store(cfg, bars)
+    kind = "synthetic" if getattr(args, "synthetic", None) else "real"
+    quiet = {"grid ", "d* (", "fold-local", "holdout (d", "baseline {"}
+    log = (lambda m: None) if args.quiet else (lambda m: print(m) if not m.startswith(tuple(quiet)) else None)
+    syn_summary = None
+    if args.with_synthetic:
+        r = cfg.get("research", {}).get("synthetic", {}) or {}
+        syn_summary = run_synthetic_ensemble(cfg, int(args.with_synthetic), int(r.get("n_bars", 4000)), int(r.get("master_seed", 0)),
+                                             args.artifacts, log=log)
+    run = ResearchRun(cfg, store, _data_info(args, cfg), args.artifacts, run_id=args.run_id, log=log, kind=kind,
+                      stages=args.stages, open_holdout=args.open_holdout, full_reproducibility=args.repro_full,
+                      synthetic_summary=syn_summary)
+    summary = run.execute()
+    _print_gates(summary)
+    print(f"run directory: {run.run_dir}")
+    return 0 if summary["gates"]["failed"] == 0 or not args.require_gates else 3
+
+
+def _print_gates(summary: dict) -> None:
+    g = summary["gates"]
+    dev = summary["development"]["metrics"]["full"]
+    print()
+    print(summary["evidence_label"])
+    print(f"run {summary['run_id']}: {summary['development']['n_windows']} OOS windows, {dev['trade_count']} trades, "
+          f"return {dev['total_return']:+.2%}, CAGR {dev['cagr']:+.2%}, Sharpe {dev['sharpe']:.2f}, Sortino {dev['sortino']:.2f}, "
+          f"max DD {dev['max_drawdown']:.2%}, costs {dev['total_cost']:.4f}")
+    print(f"classification: {g['classification']}   (results hash {summary.get('results_hash')}, "
+          f"manifest {summary['manifest']['manifest_hash']})")
+    print(f"{'gate':46s} {'group':15s} {'value':>14s}    {'threshold':>12s}  result")
+    for row in g["gates"]:
+        v = row["value"]
+        vs = f"{v:.4g}" if isinstance(v, float) else str(v)
+        res = "PASS" if row["passed"] else ("FAIL" if row["passed"] is False else "n/a")
+        print(f"{row['gate']:46s} {row['group']:15s} {vs[:14]:>14s} {row['op']:>3s} {str(row['threshold'])[:12]:>12s}  {res}  {row.get('evidence', '')}")
+
+
+def cmd_research_synthetic(args) -> int:
+    from .research.synthetic_ensemble import run_synthetic_ensemble
+
+    cfg = build_config(args)
+    r = cfg.get("research", {}).get("synthetic", {}) or {}
+    quiet = {"grid ", "d* (", "fold-local", "holdout (d", "baseline {", "[development]", "==="}
+    log = (lambda m: None) if args.quiet else (lambda m: print(m) if not m.startswith(tuple(quiet)) else None)
+    out = run_synthetic_ensemble(cfg, int(args.seeds or r.get("seeds", 5)), int(args.bars or r.get("n_bars", 4000)),
+                                 int(args.master_seed if args.master_seed is not None else r.get("master_seed", 0)),
+                                 args.artifacts, log=log, stages=args.stages.split(",") if args.stages else None)
+    print(json.dumps({"label": out["label"], "ensemble_id": out["ensemble_id"], "engineering_checks": out["engineering_checks"],
+                      "distribution": out["distribution"]}, indent=2, default=str))
+    return 0 if out["engineering_checks"]["passed"] else 3
+
+
+def cmd_research_runs(args) -> int:
+    from .research.manifest import compare_runs
+    from .research.runner import list_runs, load_summary
+
+    cfg = build_config(args)
+    root = args.artifacts or cfg.paths.artifacts_dir
+    if args.compare:
+        a, b = (load_summary(p if Path(p).exists() else Path(root) / "runs" / p) for p in args.compare)
+        out = compare_runs(a, b)
+        print(json.dumps(out, indent=2))
+        return 0 if out["status"] == "IDENTICAL" else (2 if out["status"] == "DIFFERENT INPUTS" else 4)
+    for r in list_runs(root):
+        print(f"{r['run_id']:44s} {str(r['kind']):9s} {str(r['classification']):26s} windows={r['windows']} trades={r['trades']} "
+              f"sharpe={r['sharpe'] if r['sharpe'] is None else round(r['sharpe'], 2)} holdout={r['holdout']}")
+    return 0
+
+
 def cmd_gui(args) -> int:
     from .gui.server import serve
 
@@ -312,6 +397,30 @@ def build_parser() -> argparse.ArgumentParser:
     common(dg); data(dg)
     dg.add_argument("--every", type=int, default=2, help="evaluate every k-th candidate d for the OOS curve")
     dg.set_defaults(func=cmd_diagnose)
+
+    rs = sub.add_parser("research", help="research-grade validation: walk-forward OOS, ablation, stress, bootstrap, gates")
+    common(rs); data(rs)
+    rs.add_argument("--stages", default="full", help="full | quick | comma-separated stage names")
+    rs.add_argument("--open-holdout", action="store_true", help="open the locked final holdout (recorded in holdout_access.jsonl)")
+    rs.add_argument("--with-synthetic", type=int, default=0, metavar="N", help="run the N-seed synthetic engineering validation first")
+    rs.add_argument("--repro-full", action="store_true", help="re-run the whole development walk-forward for the reproducibility check")
+    rs.add_argument("--require-gates", action="store_true", help="exit non-zero when any evaluated gate fails")
+    rs.add_argument("--quiet", action="store_true")
+    rs.set_defaults(func=cmd_research)
+
+    rsy = sub.add_parser("research-synthetic", help="multi-seed synthetic engineering validation (not performance evidence)")
+    common(rsy)
+    rsy.add_argument("--seeds", type=int, default=None)
+    rsy.add_argument("--bars", type=int, default=None)
+    rsy.add_argument("--master-seed", type=int, default=None)
+    rsy.add_argument("--stages", default=None, help="comma-separated stage names per path (default: the synthetic stage set)")
+    rsy.add_argument("--quiet", action="store_true")
+    rsy.set_defaults(func=cmd_research_synthetic)
+
+    rr = sub.add_parser("research-runs", help="list research runs, or compare two for reproducibility")
+    common(rr)
+    rr.add_argument("--compare", nargs=2, metavar="RUN", help="two run ids (or directories): identical manifests must give identical results")
+    rr.set_defaults(func=cmd_research_runs)
 
     gui = sub.add_parser("gui", help="local browser dashboard (settings, API keys, run control, live status)")
     gui.add_argument("--settings", default="settings.json", help="where the dashboard stores settings and API keys")

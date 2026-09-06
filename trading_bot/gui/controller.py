@@ -40,6 +40,11 @@ class BotController:
         self.run_mode: Optional[str] = None
         self.download_status: Optional[dict] = None
         self._download_thread: Optional[threading.Thread] = None
+        self._research_thread: Optional[threading.Thread] = None
+        self._research_stop = threading.Event()
+        self.research_status: dict[str, Any] = {"phase": "idle", "stage": None, "message": "", "progress": 0.0,
+                                                "run_id": None, "error": None, "started_at": None, "finished_at": None,
+                                                "classification": None}
 
     # ---------------------------------------------------------------- logs
     def log(self, message: str, level: str = "info") -> None:
@@ -163,7 +168,7 @@ class BotController:
                                            instrument=cfg.market.instrument, calendar=bot.calendar)
         feed = ReplayFeed(bars, bot.calendar)
         self.message = f"backtest over {len(feed)} bars"
-        self.log(self.message)
+        self.log(self.message + " (internal simulator only: no orders are sent to Alpaca in backtest mode)")
         t0 = time.time()
         for bar in feed:
             if self._stop.is_set():
@@ -254,6 +259,155 @@ class BotController:
             self.download_status = {"phase": "error", "message": f"{type(exc).__name__}: {exc}"}
             self.log(f"download failed: {exc}")
 
+    # ------------------------------------------------------------ research
+    @property
+    def research_running(self) -> bool:
+        return self._research_thread is not None and self._research_thread.is_alive()
+
+    def start_research(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        options = dict(options or {})
+        with self._lock:
+            if self.research_running:
+                raise RuntimeError("a validation run is already in progress")
+            if self.running:
+                raise RuntimeError("stop the trading run first: validation and trading share the CPU and the artifacts directory")
+            if self.settings.data_source == "csv" and not Path(self.settings.csv_path).exists():
+                raise RuntimeError(f"CSV file not found: {self.settings.csv_path!r}")
+            self._research_stop.clear()
+            self.research_status = {"phase": "starting", "stage": None, "message": "", "progress": 0.0, "run_id": None,
+                                    "error": None, "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None,
+                                    "classification": None, "options": options}
+            self._research_thread = threading.Thread(target=self._run_research, args=(options,), name="research", daemon=True)
+            self._research_thread.start()
+        return {"phase": self.research_status["phase"]}
+
+    def stop_research(self) -> dict[str, Any]:
+        if self.research_running:
+            self._research_stop.set()
+            self.research_status["phase"] = "stopping"
+            self.log("validation stop requested")
+        return {"phase": self.research_status["phase"]}
+
+    def _research_progress(self, stage: str, message: str, fraction: float) -> None:
+        st = self.research_status
+        st["stage"], st["message"], st["progress"] = stage, message, float(fraction)
+
+    def _run_research(self, options: dict[str, Any]) -> None:
+        from ..data.calendar import SessionCalendar
+        from ..data.store import BarStore, read_bars_csv
+        from ..data.synthetic import generate_synthetic_bars
+        from ..data.validator import DataValidator
+        from ..research.runner import ResearchRun
+        from ..research.synthetic_ensemble import run_synthetic_ensemble
+
+        st = self.research_status
+        quiet = ("grid ", "d* (", "fold-local", "holdout (d", "baseline {")
+
+        def log(m: str) -> None:
+            if not m.startswith(quiet):
+                self.log(m)
+
+        try:
+            cfg = self.build_config()
+            s = self.settings
+            cal = SessionCalendar.from_config(cfg)
+            if s.data_source == "csv":
+                bars = read_bars_csv(s.csv_path, cfg.market.instrument, int(cfg.market.bar_minutes))
+                info, kind = {"source": "csv", "path": str(Path(s.csv_path).resolve())}, "real"
+            else:
+                bars = generate_synthetic_bars(int(s.synthetic_bars), seed=int(s.synthetic_seed), instrument=cfg.market.instrument, calendar=cal)
+                info, kind = {"source": "synthetic", "seed": int(s.synthetic_seed), "n_bars": int(s.synthetic_bars)}, "synthetic"
+            validator = DataValidator.from_config(cfg)
+            store = BarStore(cfg.market.instrument, int(cfg.market.bar_minutes))
+            for b in bars:
+                if validator.validate(b).storable:
+                    store.append(b)
+            st["phase"] = "running"
+            syn_summary = None
+            n_syn = int(options.get("with_synthetic") or 0)
+            if n_syn > 0:
+                r = cfg.get("research", {}).get("synthetic", {}) or {}
+                syn_summary = run_synthetic_ensemble(cfg, n_syn, int(r.get("n_bars", 4000)), int(r.get("master_seed", 0)),
+                                                     s.artifacts_dir, log=log, on_progress=self._research_progress,
+                                                     should_stop=self._research_stop.is_set)
+            run = ResearchRun(cfg, store, info, s.artifacts_dir, log=log, kind=kind, stages=options.get("stages") or "full",
+                              open_holdout=bool(options.get("open_holdout")), on_progress=self._research_progress,
+                              should_stop=self._research_stop.is_set, synthetic_summary=syn_summary)
+            st["run_id"] = run.run_id
+            summary = run.execute()
+            st["classification"] = summary["gates"]["classification"]
+            st["phase"] = "finished"
+            st["message"] = f"{summary['gates']['classification']} · {summary['development']['n_windows']} windows"
+        except InterruptedError:
+            st["phase"] = "interrupted"
+            st["message"] = "validation run interrupted (no run directory written)"
+            self.log(st["message"])
+        except Exception as exc:
+            st["error"] = f"{type(exc).__name__}: {exc}"
+            st["phase"] = "error"
+            self.log(f"ERROR {st['error']}")
+            self.log(traceback.format_exc().strip().splitlines()[-1])
+        finally:
+            st["finished_at"] = datetime.now(timezone.utc).isoformat()
+            st["progress"] = 1.0
+
+    def research_runs(self) -> list[dict[str, Any]]:
+        from ..research.runner import list_runs
+
+        return list_runs(self.settings.artifacts_dir)
+
+    def _run_dir(self, run_id: str) -> Path:
+        if not run_id or "/" in run_id or "\\" in run_id or run_id.startswith("."):
+            raise ValueError("invalid run id")
+        d = Path(self.settings.artifacts_dir) / "runs" / run_id
+        if not (d / "summary.json").exists():
+            raise FileNotFoundError(f"run {run_id!r} not found")
+        return d
+
+    def research_summary(self, run_id: str) -> dict[str, Any]:
+        from ..research.runner import load_summary
+
+        return load_summary(self._run_dir(run_id))
+
+    @staticmethod
+    def _read_csv(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
+        import csv
+
+        rows = []
+        with open(path, "r", encoding="utf-8", newline="") as fh:
+            for r in csv.DictReader(fh):
+                rows.append({k: _num(v) for k, v in r.items()})
+        return rows[-limit:] if limit else rows
+
+    def research_trades(self, run_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+        return self._read_csv(self._run_dir(run_id) / "trades.csv", limit)
+
+    def research_trade(self, run_id: str, trade_id: int) -> dict[str, Any]:
+        """Full audit trail of one trade: the trade record, every decision row from two bars before
+        the entry to the exit, and the fitted model that produced the forecasts."""
+        import json as _json
+
+        d = self._run_dir(run_id)
+        trades = self._read_csv(d / "trades.csv")
+        trade = next((t for t in trades if int(t["trade_id"]) == int(trade_id)), None)
+        if trade is None:
+            raise FileNotFoundError(f"trade {trade_id} not found in run {run_id}")
+        lo, hi = int(trade["entry_row"]) - 2, int(trade["exit_row"]) + 1
+        decisions = [r for r in self._read_csv(d / "decisions.csv") if lo <= int(r["row"]) <= hi]
+        fills = [f for f in self._read_csv(d / "fills.csv") if f.get("trade_id") not in (None, "") and int(f["trade_id"]) == int(trade_id)]
+        model = None
+        mp = d / "models" / f"{trade.get('model_id')}.json"
+        if mp.exists():
+            with open(mp, "r", encoding="utf-8") as fh:
+                meta = _json.load(fh)
+            model = {k: meta.get(k) for k in ("model_id", "training_start", "training_end", "fractional_d", "n_training_rows",
+                                              "fitted_model_hash", "software_version", "config_digest", "random_seed", "window", "segment")}
+            model["regression_params"] = (meta.get("model_params") or {}).get("regression")
+            vm = meta.get("validation_metrics") or {}
+            model["holdout"] = vm.get("holdout")
+            model["acceptance"] = (vm.get("acceptance") or {}).get("accepted")
+        return {"trade": trade, "decisions": decisions, "fills": fills, "model": model}
+
     # ------------------------------------------------------------- status
     def snapshot(self) -> dict[str, Any]:
         bot = self.bot
@@ -262,6 +416,7 @@ class BotController:
             "started_at": self.started_at, "finished_at": self.finished_at, "running": self.running,
             "download": self.download_status, "settings": self.settings.public(),
             "now": datetime.now(timezone.utc).isoformat(),
+            "research": {**self.research_status, "running": self.research_running},
         }
         if bot is None:
             out["bot"] = None
@@ -301,6 +456,20 @@ class BotController:
             "summary": self.summary["metrics"] if self.summary else None,
         }
         return out
+
+
+def _num(v):
+    if v is None or v == "":
+        return None
+    if v in ("True", "False"):
+        return v == "True"
+    try:
+        f = float(v)
+    except ValueError:
+        return v
+    if f.is_integer() and "." not in v and "e" not in v.lower():
+        return int(f)
+    return f
 
 
 __all__ = ["BotController"]

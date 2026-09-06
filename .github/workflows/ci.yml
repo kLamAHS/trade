@@ -38,3 +38,18 @@ jobs:
           assert meta["validation_metrics"]["holdout_rows"] > 0
           print("artifact ok:", meta["model_id"], meta["environment"]["git_commit"][:12])
           PY
+      - name: Research pipeline smoke run (synthetic, quick stages, must be reproducible and leak-free)
+        run: |
+          python -m trading_bot.main research --synthetic 2600 --seed 21 --memory-d 0.45 --amplitude 6 --symbol SYN --fast \
+            --stages quick --quiet --set training.window_bars=1600 --set training.minimum_bars=1400 \
+            --set training.hyperparameter_grid.n_estimators=[40] --set models.regression.num_threads=2 \
+            --set research.bootstrap.n_boot=100 --set research.bootstrap.monte_carlo_paths=100 \
+            --set research.baselines.random_permutations=3 --artifacts /tmp/ci-research
+          python - <<'PY'
+          import glob, json
+          s = json.load(open(sorted(glob.glob("/tmp/ci-research/runs/syn_*/summary.json"))[-1]))
+          assert s["reproducibility"]["status"] == "IDENTICAL", s["reproducibility"]
+          assert s["leakage"]["passed"] and s["development"]["timestamp_audit"]["violations"] == 0
+          assert s["gates"]["classification"] == "EXPERIMENTAL (SYNTHETIC)"
+          print("research run ok:", s["run_id"], s["development"]["n_windows"], "windows")
+          PY

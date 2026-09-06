@@ -27,6 +27,12 @@ Double-click **`start.bat`** on Windows (or run `./start.sh` on macOS/Linux). On
   or Alpaca paper trading, fast preset, order mirroring, initial capital and free-form config overrides.
 * **Start / Stop**, live portfolio tiles, equity chart (hover for values, table view for the numbers),
   the fractional-contribution chart per retrain, the last decision chain, trades, events and the log.
+* **Validation tab** — runs the research-grade validation framework (below) on the selected data and
+  renders the run directory: evidence banner, classification badge, OOS tiles (CAGR, max drawdown,
+  Sharpe, Sortino, trades, costs), equity with baseline / buy-and-hold / production-policy overlays,
+  OOS and HOLDOUT segments and a log-scale toggle, underwater and rolling-Sharpe charts, per-window
+  ΔSharpe, the acceptance-gate table, cost / timing / parameter stress, sanity and leakage tests,
+  bootstrap and Monte Carlo, baselines, regimes and a clickable trade audit trail.
 
 The dashboard is the `gui` sub-command (`python -m trading_bot.main gui [--port 8765] [--no-browser]`).
 It binds to localhost only.
@@ -52,6 +58,13 @@ python -m trading_bot.main paper --symbol SPY            # add --no-mirror to ke
 # 4. One retraining cycle / research diagnostics
 python -m trading_bot.main train --csv artifacts/data/SPY_30m.csv
 python -m trading_bot.main diagnose --csv artifacts/data/SPY_30m.csv --every 2
+
+# 5. Research-grade validation (docs/VALIDATION_FRAMEWORK.md): walk-forward OOS, ablation, baselines,
+#    cost / timing / parameter stress, sanity + leakage tests, bootstrap + Monte Carlo, reproducibility, gates
+python -m trading_bot.main research-synthetic --seeds 5 --bars 4000          # engineering validation (not evidence)
+python -m trading_bot.main research --csv artifacts/data/SPY_30m.csv         # development run, holdout stays locked
+python -m trading_bot.main research --csv artifacts/data/SPY_30m.csv --open-holdout   # once, at the end
+python -m trading_bot.main research-runs --compare RUN_A RUN_B               # identical manifest -> identical results
 
 pytest            # unit, numerical, leakage, execution, risk and end-to-end tests
 ```
@@ -115,10 +128,42 @@ The orchestrator is `trading_bot/bot.py` (`TradingBot.on_bar`, the five-state ma
    daily loss halt at -2.5 %, drawdown halt at -10 % (until an accepted retrain).
 7. An exposure-change order is queued for the next bar and everything is written to the audit log.
 
+## Validation framework (research-grade backtesting)
+
+A single backtest path is a demonstration, not evidence. `trading_bot/research/` implements the
+validation framework described in `docs/VALIDATION_FRAMEWORK.md`, whose stages actively try to
+disprove the strategy:
+
+* **No-lookahead engine** — every OOS decision row carries `feature_available_at`, `decision_at` and
+  `execution_at` (next open); the runner refuses any violation and the leakage stage re-checks the
+  rows and the label alignment against the bar store.
+* **Rolling walk-forward** — the production trainer is refit on every window (nested d* / grid /
+  calibration selection inside the training block); the fitted full and no-fractional models forecast
+  the unseen block; the blocks are concatenated into one continuous equity curve traded with the live
+  position rules and circuit breakers. A **locked final holdout** (15%) is never touched until
+  `--open-holdout`, which appends an access record to `artifacts/holdout_access.jsonl`.
+* **Ablation with statistics** — positive cycles, mean / median ΔSharpe, bootstrap CI, sign test.
+* **Baselines** — cash, buy & hold, vol-scaled, momentum, random permutations of the strategy's own
+  forecasts, no-fractional model.
+* **Stress** — cost curve (model ×1/×2/×3, flat 0-10 bps), execution delayed +1/+2 bars, position-rule
+  parameters ×0.5/×2, fractional order d* ± 2 steps (light refit).
+* **Sanity and leakage** — shuffled labels, shuffled features, target shifted +20 bars, reversed and
+  random forecasts, zero / double cost, each with an expectation and a pass flag.
+* **Statistics** — block bootstrap CIs, Monte Carlo trade resampling, multiple-testing bookkeeping.
+* **Reproducibility** — manifests with separate data / config / model-config / code / fitted-model
+  hashes; a window is retrained again and compared bit for bit (`REPRODUCIBILITY FAILURE` otherwise).
+* **Gates and classification** — EXPERIMENTAL → CANDIDATE → VALIDATED CANDIDATE → HOLDOUT PASSED →
+  PAPER ELIGIBLE, thresholds in `research.gates`. Synthetic runs are labelled
+  *SYNTHETIC / ENGINEERING VALIDATION — NOT PERFORMANCE EVIDENCE* and never classify.
+
+Runs are written to `artifacts/runs/<run_id>/` (`manifest.yaml`, `summary.json`, `equity.csv`,
+`trades.csv`, `fills.csv`, `decisions.csv`, `retrains.csv`, `models/`, `diagnostics/`, `plots/`, `logs/`).
+
 ## Artifacts
 
 ```
 artifacts/
+  runs/<run_id>/                                     research runs (see above) + holdout_access.jsonl
   models/<model_id>/model.joblib + metadata.json     reproducibility record (spec 56), current.json pointer
   audit/<run>_bars.jsonl                             one record per bar: bar, features, d, kernel, prediction,
                                                      cost, signal, risk decision, order, ledger, state
@@ -200,7 +245,11 @@ configuration, fractional kernel, seed, effective model parameters and the softw
 
 ## Tests (spec sections 54-55)
 
-`trading_bot/tests/` covers: GL weight recursion vs. direct binomial evaluation, `d = 0` identity,
+`trading_bot/tests/` covers (`test_research.py` for the validation framework: schedule tiling and
+holdout locking, simulator parity with the trainer's validation simulator, delay / cost / halt
+semantics, metrics, bootstrap determinism, the gate ladder, manifest hashes, label offsets, synthetic
+generator knobs, a leakage-detector mutation test, the end-to-end pipeline with artifacts, bit-for-bit
+window reproduction and the dashboard research API): GL weight recursion vs. direct binomial evaluation, `d = 0` identity,
 `d = 1` first difference, deterministic truncation, NaN/inf-free warm-up, causal convolution;
 batch/streaming feature equality and formula spot checks; **future-bar mutation**, **execution-shift**,
 **scaling**, **fractional-order** and **label-isolation** leakage tests plus purge/embargo checks;
