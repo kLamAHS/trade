@@ -163,7 +163,7 @@ class BotController:
                                            instrument=cfg.market.instrument, calendar=bot.calendar)
         feed = ReplayFeed(bars, bot.calendar)
         self.message = f"backtest over {len(feed)} bars"
-        self.log(self.message)
+        self.log(self.message + " (internal simulator only: no orders are sent to Alpaca in backtest mode)")
         t0 = time.time()
         for bar in feed:
             if self._stop.is_set():

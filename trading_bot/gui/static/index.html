@@ -134,6 +134,7 @@
       </div>
       <div class="check"><input type="checkbox" id="fast" checked><label for="fast" style="margin:0">Fast preset (smaller training window and grid)</label></div>
       <div class="check"><input type="checkbox" id="mirror_orders" checked><label for="mirror_orders" style="margin:0">Mirror orders to the Alpaca paper account</label></div>
+      <div id="modeHint" class="hint"></div>
       <label for="overrides">Config overrides (<code>dotted.key=value</code>, one per line)</label>
       <textarea id="overrides" placeholder="risk.daily_loss_limit=0.02&#10;training.retrain_every_bars=500"></textarea>
       <div class="hint">Artifacts (audit trail, models, diagnostics) are written under <code id="artifactsDir">artifacts/</code>.</div>
@@ -229,6 +230,10 @@
     const bt = $("mode").value === "backtest";
     $("backtestOpts").style.display = bt ? "" : "none";
     $("synthetic_bars").disabled = $("data_source").value !== "synthetic";
+    $("mirror_orders").disabled = bt;
+    $("modeHint").textContent = bt
+      ? "Backtests run entirely in the internal simulator: nothing is sent to Alpaca and the paper account does not change. Choose \"Paper trading (Alpaca)\" to trade the paper account."
+      : "Paper trading downloads history from Alpaca, trains, then polls for new 30-minute bars during market hours (09:30-16:00 ET) and mirrors each exposure change as a whole-share market order to the paper account.";
   }
   $("mode").addEventListener("change", toggleModeOpts);
   $("data_source").addEventListener("change", toggleModeOpts);
@@ -348,7 +353,8 @@
     lastStatus = st;
     const running = st.running; $("btnStart").disabled = running; $("btnStop").disabled = !running;
     const state = st.bot ? st.bot.state : st.phase; const badge = $("stateBadge"); badge.className = "badge " + state; $("stateText").textContent = state;
-    $("phaseText").textContent = st.phase + (st.message ? " · " + st.message : "") + (st.error ? " · " + st.error : "");
+    const modeTag = st.mode === "backtest" ? " · simulator only (Alpaca not used)" : (st.mode === "paper" ? " · Alpaca paper account" : "");
+    $("phaseText").textContent = st.phase + modeTag + (st.message ? " · " + st.message : "") + (st.error ? " · " + st.error : "");
     if (st.download) note("downloadHint", st.download.message, st.download.phase === "error" ? "bad" : (st.download.phase === "finished" ? "ok" : ""));
     if (!st.bot) return;
     const b = st.bot;
