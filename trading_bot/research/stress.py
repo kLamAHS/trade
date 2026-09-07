@@ -21,18 +21,47 @@ def _row(runner, oos, sim: SimResult, label: str, **extra) -> dict[str, Any]:
     m = runner.metrics(oos, sim, "full")
     return {"label": label, "sharpe": m["sharpe"], "total_return": m["total_return"], "cagr": m["cagr"],
             "max_drawdown": m["max_drawdown"], "profit_factor": m["profit_factor"], "trade_count": m["trade_count"],
+            "n_signals": int(sim.n_signals), "halted_bars": int(np.sum(sim.halted)),
             "total_cost": m["total_cost"], "win_rate": m["win_rate"], "time_invested": m["time_invested"], **extra}
 
 
-def cost_curve(runner, oos, levels_bps=(0, 1, 2, 5, 10), scales=(1.0, 2.0, 3.0)) -> dict[str, Any]:
+def cost_curve(runner, oos, levels_bps=(0, 1, 2, 5, 10), scales=(1.0, 2.0, 3.0), signal_scales=(0.5, 2.0)) -> dict[str, Any]:
+    """Three cost experiments (section 11), reported separately because they answer different questions:
+
+    * ``realised``  -- the decisions are frozen (the strategy still believes the modelled cost) and the
+      fill is charged more: model cost x1/x2/x3 and flat 0-10 bps per round trip.  The signal path is
+      identical by construction (same ``n_signals``); only the portfolio circuit breakers, which react
+      to realised equity as they would live, can still alter a position.  This is the honest "what if
+      execution is worse than modelled" test and the one the 2x gate uses.
+    * ``assumed``   -- the strategy is told a different cost (it trades more or less) while the fill
+      is charged the modelled cost: does the trade gate sit on a knife edge?
+    * ``joint``     -- both move together (a different, more cautious strategy under a worse market).
+    """
     rows = []
+    ref = _row(runner, oos, runner.simulate(oos, "full"), "reference", family="reference", scale=1.0)
+    rows.append(ref)
     for s in scales:
-        rows.append(_row(runner, oos, runner.simulate(oos, "full", cost_scale=float(s)), f"model_cost_x{s:g}",
-                         kind="model", scale=float(s)))
+        if s == 1.0:
+            continue
+        rows.append(_row(runner, oos, runner.simulate(oos, "full", exec_cost_scale=float(s)), f"realised_cost_x{s:g}",
+                         family="realised", scale=float(s)))
     for bps in levels_bps:
-        rows.append(_row(runner, oos, runner.simulate(oos, "full", cost_bps=float(bps)), f"flat_{bps:g}bps",
-                         kind="flat_bps", bps=float(bps)))
-    flat = [(r["bps"], r["total_return"]) for r in rows if r["kind"] == "flat_bps"]
+        rows.append(_row(runner, oos, runner.simulate(oos, "full", exec_cost_bps=float(bps)), f"realised_flat_{bps:g}bps",
+                         family="realised", bps=float(bps)))
+    for s in signal_scales:
+        rows.append(_row(runner, oos, runner.simulate(oos, "full", signal_cost_scale=float(s)), f"assumed_cost_x{s:g}",
+                         family="assumed", scale=float(s)))
+    for s in scales:
+        if s == 1.0:
+            continue
+        rows.append(_row(runner, oos, runner.simulate(oos, "full", cost_scale=float(s)), f"joint_cost_x{s:g}",
+                         family="joint", scale=float(s)))
+    for bps in levels_bps:
+        rows.append(_row(runner, oos, runner.simulate(oos, "full", cost_bps=float(bps)), f"joint_flat_{bps:g}bps",
+                         family="joint", bps=float(bps)))
+    for r in rows:
+        r["decisions_frozen"] = r["family"] in ("reference", "realised")
+    flat = sorted((r["bps"], r["total_return"]) for r in rows if r["family"] == "realised" and "bps" in r)
     breakeven = None
     for (b0, r0), (b1, r1) in zip(flat[:-1], flat[1:]):
         if r0 > 0 >= r1 and r0 != r1:
@@ -40,12 +69,18 @@ def cost_curve(runner, oos, levels_bps=(0, 1, 2, 5, 10), scales=(1.0, 2.0, 3.0))
             break
     if breakeven is None and flat and flat[-1][1] > 0:
         breakeven = float("inf")
-    ref = next(r for r in rows if r["kind"] == "model" and r["scale"] == 1.0)
-    x2 = next((r for r in rows if r["kind"] == "model" and r["scale"] == 2.0), None)
+    x2 = next((r for r in rows if r["family"] == "realised" and r.get("scale") == 2.0), None)
+    joint2 = next((r for r in rows if r["family"] == "joint" and r.get("scale") == 2.0), None)
     mean_cost_bps = float(np.mean(oos.cost_roundtrip)) * 1e4
-    return {"rows": rows, "breakeven_flat_bps": breakeven, "mean_model_roundtrip_bps": mean_cost_bps,
-            "reference": ref, "profitable_at_2x_cost": bool(x2 is not None and x2["total_return"] > 0),
-            "sharpe_at_2x_cost": x2["sharpe"] if x2 else None}
+    realised_bps_at_breakeven = None
+    return {"rows": rows, "breakeven_flat_bps": breakeven, "mean_model_roundtrip_bps": mean_cost_bps, "reference": ref,
+            "profitable_at_2x_cost": bool(x2 is not None and x2["total_return"] > 0),
+            "sharpe_at_2x_cost": x2["sharpe"] if x2 else None,
+            "profitable_at_2x_joint_cost": bool(joint2 is not None and joint2["total_return"] > 0),
+            "trade_count_frozen": int(ref["trade_count"]), "signals_frozen": int(ref["n_signals"]),
+            "note": "realised rows keep the signal decisions frozen (same signals; only the equity-driven circuit breakers can "
+                    "differ) and charge more at the fill; assumed rows change what the strategy believes it must clear; "
+                    "joint rows move both"}
 
 
 def timing_delays(runner, oos, delays=(0, 1, 2)) -> dict[str, Any]:

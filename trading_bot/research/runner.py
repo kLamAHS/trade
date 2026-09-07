@@ -29,7 +29,7 @@ from .metrics import summarize_distribution
 from .regimes import regime_attribution, tag_regimes
 from .sanity import run_leakage, run_sanity
 from .stress import cost_curve, d_perturbation, parameter_perturbations, timing_delays
-from .walkforward import WalkForwardResult, WalkForwardRunner
+from .walkforward import WalkForwardResult, WalkForwardRunner, plan_schedule
 
 STAGES = ["walkforward", "ablation", "baselines", "regimes", "cost", "timing", "perturbation", "d_perturbation",
           "sanity", "leakage", "bootstrap", "reproducibility", "holdout", "gates"]
@@ -66,7 +66,8 @@ class ResearchRun:
                  artifacts_root: str | Path | None = None, run_id: str | None = None, log: Callable[[str], None] | None = None,
                  kind: str = "real", stages: str | list[str] | None = None, open_holdout: bool = False,
                  on_progress: Callable[[str, str, float], None] | None = None, should_stop: Callable[[], bool] | None = None,
-                 full_reproducibility: bool = False, synthetic_summary: dict[str, Any] | None = None):
+                 full_reproducibility: bool = False, synthetic_summary: dict[str, Any] | None = None,
+                 force_holdout: bool = False):
         self.cfg = cfg
         self.store = store
         self.data_info = dict(data_info or {})
@@ -77,6 +78,7 @@ class ResearchRun:
         self.on_progress = on_progress or (lambda *_: None)
         self.should_stop = should_stop or (lambda: False)
         self.full_reproducibility = bool(full_reproducibility)
+        self.force_holdout = bool(force_holdout)     # open the holdout even when development is not VALIDATED CANDIDATE
         self.synthetic_summary = synthetic_summary
         self.lines: list[str] = []
         self._log_cb = log or (lambda *_: None)
@@ -115,7 +117,11 @@ class ResearchRun:
         s = self.summary
         s.update({"run_id": self.run_id, "kind": self.kind, "evidence_label": self.manifest.evidence_label,
                   "manifest": {k: v for k, v in self.manifest.to_dict().items() if k != "config"},
-                  "stages": self.stages, "schedule": self.runner.schedule().to_dict(), "stages_completed": []})
+                  "stages": self.stages, "schedule": self.runner.schedule().to_dict(), "stages_completed": [],
+                  "plan": plan_schedule(self.cfg, len(self.store)), "headline_variant": self.runner.deploy_policy})
+        if not s["plan"]["meets_min_windows"]:
+            self.log(f"NOTE: {s['plan']['windows']} walk-forward windows; the window gate needs {s['plan']['min_windows']} "
+                     f"(about {s['plan']['bars_needed_for_min_windows']} bars / {s['plan']['sessions_needed_for_min_windows']} sessions)")
         self.log(f"research run {self.run_id}: {self.kind} data, {len(self.store)} bars of {self.cfg.market.instrument}, "
                  f"config {self.manifest.config_hash} / model config {self.manifest.model_config_hash}, code {self.manifest.code_commit[:12]}")
         self.log(self.manifest.evidence_label)
@@ -125,7 +131,7 @@ class ResearchRun:
             s["stages_completed"].append(stage)
         s["elapsed_seconds"] = time.time() - t0
         self.on_progress("artifacts", "writing run directory", 0.98)
-        paths = write_run(self.run_dir, self.manifest, s, self.dev, self.hold, self.cfg, self.lines)
+        paths = write_run(self.run_dir, self.manifest, s, self.dev, self.hold, self.cfg, self.lines, store=self.store)
         s["artifacts"] = paths
         with open(self.run_dir / "summary.json", "w", encoding="utf-8") as fh:   # rewrite with the artifact paths
             from .artifacts import _clean
@@ -150,9 +156,19 @@ class ResearchRun:
         s["results_hash"] = results_hash({v: self.dev.oos.forecasts[v]["E"] for v in ("full", "baseline")},
                                          self.dev.sims["full"].equity, [w.fitted_model_hash for w in self.dev.windows])
         m = dev["metrics"]["full"]
-        self.log(f"development OOS: {dev['n_windows']} windows, {dev['n_rows']} rows, return {m['total_return']:+.2%}, "
-                 f"Sharpe {m['sharpe']:.2f}, max DD {m['max_drawdown']:.2%}, trades {m['trade_count']}, "
-                 f"accepted windows {dev['accepted_windows']}/{dev['n_windows']}; results hash {s['results_hash']}")
+        p = dev["metrics"]["production"]
+        pp = dev["production_policy"]
+        s["production_policy"] = {
+            "note": "accepted models only, the previous one kept otherwise: what the bot would have done ex ante",
+            "research": {k: m[k] for k in ("total_return", "cagr", "sharpe", "sortino", "max_drawdown", "profit_factor", "trade_count", "time_invested")},
+            "production": {k: p[k] for k in ("total_return", "cagr", "sharpe", "sortino", "max_drawdown", "profit_factor", "trade_count", "time_invested")},
+            "accepted_windows": dev["accepted_windows"], "n_windows": dev["n_windows"], **pp,
+            "gap_sharpe": m["sharpe"] - p["sharpe"], "gap_return": m["total_return"] - p["total_return"]}
+        self.log(f"development OOS (research, every refit): {dev['n_windows']} windows, {dev['n_rows']} rows, return {m['total_return']:+.2%}, "
+                 f"Sharpe {m['sharpe']:.2f}, max DD {m['max_drawdown']:.2%}, trades {m['trade_count']}; results hash {s['results_hash']}")
+        self.log(f"development OOS (production policy, accepted models only): return {p['total_return']:+.2%}, Sharpe {p['sharpe']:.2f}, "
+                 f"max DD {p['max_drawdown']:.2%}, trades {p['trade_count']}; accepted windows {dev['accepted_windows']}/{dev['n_windows']}, "
+                 f"a model was deployed on {pp['deployed_fraction']:.0%} of the OOS bars")
 
     def _equity_payload(self, res: WalkForwardResult) -> dict[str, Any]:
         oos = res.oos
@@ -171,10 +187,20 @@ class ResearchRun:
         boot = ablation_bootstrap(deltas, seed=int(self._sub("bootstrap").get("seed", 0)))
         trainer_deltas = np.array([w.holdout_delta for w in dev.windows if np.isfinite(w.holdout_delta)], dtype=float)
         mf, mb = dev.metrics["full"], dev.metrics["baseline"]
+        # Robust views of the same distribution: one exceptional window must not carry the verdict.
+        trimmed = float(np.mean(np.sort(deltas)[1:-1])) if len(deltas) > 2 else (float(deltas.mean()) if len(deltas) else None)
+        loo = [float(np.mean(np.delete(deltas, i))) for i in range(len(deltas))] if len(deltas) > 1 else []
+        best = int(np.argmax(deltas)) if len(deltas) else None
         self.summary["ablation"] = {
             "cycles": len(pw), "positive_cycles_full": full_pos, "positive_cycles_baseline": base_pos,
             "mean_delta_sharpe": float(deltas.mean()) if len(deltas) else None,
             "median_delta_sharpe": float(np.median(deltas)) if len(deltas) else None,
+            "trimmed_mean_delta_sharpe": trimmed,
+            "mean_delta_sharpe_excluding_best_window": (loo[best] if loo else None),
+            "best_window": ({"window": int(pw[best]["window"]), "delta_sharpe": float(deltas[best])} if best is not None else None),
+            "leave_one_out_min_mean": (float(min(loo)) if loo else None),
+            "delta_max_drawdown": float(mf["max_drawdown"] - mb["max_drawdown"]),
+            "delta_total_return": float(mf["total_return"] - mb["total_return"]),
             "positive_delta_fraction": float(np.mean(deltas > 0)) if len(deltas) else None,
             "mean_delta_return": float(dret.mean()) if len(dret) else None,
             "delta_sharpe_ci": boot.get("mean_ci"), "bootstrap": boot,
@@ -184,6 +210,23 @@ class ResearchRun:
             "per_window_delta_sharpe": deltas.tolist(),
         }
         a = self.summary["ablation"]
+        thr = self._sub("gates")
+        med_ok = a["median_delta_sharpe"] is not None and a["median_delta_sharpe"] > float(thr.get("min_median_delta_sharpe", 0.0))
+        frac_ok = a["positive_delta_fraction"] is not None and a["positive_delta_fraction"] > float(thr.get("min_positive_delta_fraction", 0.5))
+        ci = boot.get("mean_ci") or [None, None]
+        ci_ok = ci[0] is not None and ci[0] > 0
+        if med_ok and frac_ok and ci_ok:
+            verdict, text = "DEMONSTRATED", "fractional features add out-of-sample value: median ΔSharpe > 0, most windows won, bootstrap CI above zero"
+        elif med_ok and frac_ok:
+            verdict, text = "SUGGESTIVE", "median ΔSharpe > 0 and most windows won, but the bootstrap CI of the mean still includes zero"
+        else:
+            verdict, text = "NOT DEMONSTRATED", ("no convincing evidence that fractional memory adds incremental alpha: the no-fractional "
+                                                 "baseline is as good (median ΔSharpe ≤ 0 or ≤ half of the windows won)")
+        if a["delta_max_drawdown"] < -0.005 and verdict != "DEMONSTRATED":
+            text += f"; it lowers the max drawdown by {-a['delta_max_drawdown']:.1%}, which is a different (risk) claim"
+        a["verdict"] = verdict
+        a["verdict_text"] = text
+        self.log(f"fractional value-add: {verdict} — {text}")
         self.log(f"ablation: ΔSharpe mean {a['mean_delta_sharpe']:+.2f} median {a['median_delta_sharpe']:+.2f} "
                  f"(positive in {a['positive_delta_fraction']:.0%} of {a['cycles']} windows, CI {boot.get('mean_ci')}); "
                  f"OOS Sharpe full {mf['sharpe']:.2f} vs baseline {mb['sharpe']:.2f}")
@@ -215,8 +258,9 @@ class ResearchRun:
         out = cost_curve(self.runner, self.dev.oos, tuple(c.get("flat_bps_levels", (0, 1, 2, 5, 10))),
                          tuple(c.get("model_cost_scales", (1.0, 2.0, 3.0))))
         self.summary["cost_curve"] = out
-        self.log(f"cost curve: mean model round trip {out['mean_model_roundtrip_bps']:.2f} bps, breakeven flat cost "
-                 f"{out['breakeven_flat_bps']} bps, profitable at 2x model cost: {out['profitable_at_2x_cost']}")
+        self.log(f"cost curve: mean model round trip {out['mean_model_roundtrip_bps']:.2f} bps; decisions frozen: break-even flat "
+                 f"cost {out['breakeven_flat_bps']} bps, profitable at 2x realised cost {out['profitable_at_2x_cost']}; "
+                 f"joint (strategy told 2x): profitable {out['profitable_at_2x_joint_cost']}")
 
     def stage_timing(self) -> None:
         t = self._sub("timing")
@@ -246,9 +290,12 @@ class ResearchRun:
 
     def stage_leakage(self) -> None:
         sa = self._sub("sanity")
-        out = run_leakage(self.runner, self.dev, int(sa.get("target_shift_bars", 20)), log=self.log)
+        out = run_leakage(self.runner, self.dev, int(sa.get("target_shift_bars", 20)), log=self.log,
+                          mutation_samples=int(sa.get("forward_mutation_samples", 4)))
         self.summary["leakage"] = out
-        self.log(f"leakage: timestamps violations {out['timestamps']['violations']}, labels aligned {out['label_alignment']['labels_aligned']}")
+        self.log(f"leakage: timestamps violations {out['timestamps']['violations']}, labels aligned {out['label_alignment']['labels_aligned']}, "
+                 f"forward mutation {'passed' if out['forward_mutation']['passed'] else 'FAILED'}, "
+                 f"sampled fill chain consistent {out['chain_consistent']}")
 
     def stage_bootstrap(self) -> None:
         b = self._sub("bootstrap")
@@ -288,6 +335,20 @@ class ResearchRun:
         self.log(f"reproducibility: {out['status']} ({len(checks)} window(s) retrained and compared bit for bit)")
 
     def stage_holdout(self) -> None:
+        # Guard (section 8): the holdout is a single final look.  Development must already be a
+        # VALIDATED CANDIDATE on the stages that ran, otherwise the holdout stays locked.
+        pre = evaluate_gates(self.summary, dict(self._sub("gates")))
+        level = pre["classification_if_real"]
+        ok_levels = ("VALIDATED CANDIDATE", "HOLDOUT PASSED", "PAPER ELIGIBLE")
+        if level not in ok_levels and not self.force_holdout:
+            failed = [g["gate"] for g in pre["gates"] if g["passed"] is False]
+            self.summary["holdout_refused"] = {"development_classification": level, "failed_gates": failed,
+                                               "note": "holdout not opened: development must be VALIDATED CANDIDATE first (use --force-holdout to override)"}
+            self.log(f"HOLDOUT NOT OPENED: development is {level}, not VALIDATED CANDIDATE (failed: {', '.join(failed) or 'stages missing'}); "
+                     f"the holdout stays locked (--force-holdout overrides)")
+            return
+        if level not in ok_levels:
+            self.log(f"WARNING: opening the holdout with development at {level} (--force-holdout)")
         access_path = self.root / "holdout_access.jsonl"
         previous = 0
         if access_path.exists():

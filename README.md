@@ -135,8 +135,9 @@ validation framework described in `docs/VALIDATION_FRAMEWORK.md`, whose stages a
 disprove the strategy:
 
 * **No-lookahead engine** — every OOS decision row carries `feature_available_at`, `decision_at` and
-  `execution_at` (next open); the runner refuses any violation and the leakage stage re-checks the
-  rows and the label alignment against the bar store.
+  `execution_at` (next open); the runner refuses any violation, the leakage stage re-checks the rows,
+  the label alignment and a forward-mutation test (bars after the decision rewritten, forecasts must
+  not move), and every trade's audit trail spells out the bar chain (newest bar used → fill bar).
 * **Rolling walk-forward** — the production trainer is refit on every window (nested d* / grid /
   calibration selection inside the training block); the fitted full and no-fractional models forecast
   the unseen block; the blocks are concatenated into one continuous equity curve traded with the live
@@ -145,8 +146,12 @@ disprove the strategy:
 * **Ablation with statistics** — positive cycles, mean / median ΔSharpe, bootstrap CI, sign test.
 * **Baselines** — cash, buy & hold, vol-scaled, momentum, random permutations of the strategy's own
   forecasts, no-fractional model.
-* **Stress** — cost curve (model ×1/×2/×3, flat 0-10 bps), execution delayed +1/+2 bars, position-rule
-  parameters ×0.5/×2, fractional order d* ± 2 steps (light refit).
+* **Stress** — cost in two dimensions (realised fill cost with the decisions frozen; the cost the
+  strategy assumes when deciding), execution delayed +1/+2 bars, position-rule parameters ×0.5/×2,
+  fractional order d* ± 2 steps (light refit).
+* **Production policy** — the accepted-models-only series (what the bot would have done ex ante) is
+  reported and gated next to the research series; the ablation ends in an explicit verdict
+  (DEMONSTRATED / SUGGESTIVE / NOT DEMONSTRATED).
 * **Sanity and leakage** — shuffled labels, shuffled features, target shifted +20 bars, reversed and
   random forecasts, zero / double cost, each with an expectation and a pass flag.
 * **Statistics** — block bootstrap CIs, Monte Carlo trade resampling, multiple-testing bookkeeping.

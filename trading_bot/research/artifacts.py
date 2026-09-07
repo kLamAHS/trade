@@ -67,15 +67,26 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]], fields: list[str]) -> 
             w.writerow({k: _clean(r.get(k)) for k in fields})
 
 
-def decision_rows(result, variant: str = "full", segment: str = "development", equity_offset: float = 1.0) -> list[dict[str, Any]]:
+def decision_rows(result, variant: str = "full", segment: str = "development", equity_offset: float = 1.0,
+                  store=None) -> list[dict[str, Any]]:
+    """One row per OOS decision.  The chain columns spell out what a human needs to verify the
+    no-lookahead invariant: the newest bar used (its start and close), and the fill bar (index + 1,
+    starting at the decision bar's close) whose open is the fill price."""
     oos, sim = result.oos, result.sims[variant]
     f = oos.forecasts[variant]
     rows = []
     for i in range(len(oos)):
-        rows.append({"row": i, "segment": segment, "bar_index": int(oos.bar_index[i]), "window": int(oos.window_ids[i]),
+        b = int(oos.bar_index[i])
+        chain = {}
+        if store is not None:
+            dec, fill = store[b], store[b + 1]
+            chain = {"decision_bar_start": dec.timestamp, "decision_bar_close_time": dec.close_time, "decision_bar_close": dec.close,
+                     "fill_bar_index": b + 1, "fill_bar_start": fill.timestamp, "fill_bar_close_time": fill.close_time,
+                     "fill_bar_open": fill.open}
+        rows.append({"row": i, "segment": segment, "bar_index": b, "window": int(oos.window_ids[i]),
                      "session": int(oos.session_ids[i]), "model_id": oos.model_ids[i],
                      "feature_available_at": oos.feature_available_at[i], "decision_at": oos.decision_at[i],
-                     "execution_at": oos.execution_at[i], "M": f["M"][i], "P": f["P"][i], "E": f["E"][i],
+                     "execution_at": oos.execution_at[i], **chain, "M": f["M"][i], "P": f["P"][i], "E": f["E"][i],
                      "sigma": oos.sigma[i], "sigma_ref": oos.sigma_ref[i], "cost_roundtrip": oos.cost_roundtrip[i],
                      "cost_side_exec": oos.cost_side_exec[i], "close": math.exp(oos.log_close[i]), "open_next": oos.open_next[i],
                      "open_next2": oos.open_next2[i], "label_y_norm": oos.y_norm[i], "target_exposure": sim.targets[i],
@@ -85,7 +96,9 @@ def decision_rows(result, variant: str = "full", segment: str = "development", e
 
 
 DECISION_FIELDS = ["row", "segment", "bar_index", "window", "session", "model_id", "feature_available_at", "decision_at",
-                   "execution_at", "M", "P", "E", "sigma", "sigma_ref", "cost_roundtrip", "cost_side_exec", "close",
+                   "execution_at", "decision_bar_start", "decision_bar_close_time", "decision_bar_close", "fill_bar_index",
+                   "fill_bar_start", "fill_bar_close_time", "fill_bar_open",
+                   "M", "P", "E", "sigma", "sigma_ref", "cost_roundtrip", "cost_side_exec", "close",
                    "open_next", "open_next2", "label_y_norm", "target_exposure", "exposure", "halted", "gross_pnl", "cost",
                    "net_pnl", "equity"]
 
@@ -225,7 +238,7 @@ def write_plots(run_dir: Path, dev, hold, bars_per_day: int, bars_per_year: int)
     return written
 
 
-def write_run(run_dir: Path, manifest, summary: dict[str, Any], dev, hold, cfg, log_lines: list[str]) -> dict[str, str]:
+def write_run(run_dir: Path, manifest, summary: dict[str, Any], dev, hold, cfg, log_lines: list[str], store=None) -> dict[str, str]:
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest.save(run_dir / "manifest.yaml")
     write_json(run_dir / "summary.json", summary)
@@ -233,7 +246,7 @@ def write_run(run_dir: Path, manifest, summary: dict[str, Any], dev, hold, cfg, 
     eq = equity_rows(dev, "development", offsets)
     trades = [{**t, "segment": "development"} for t in dev.sims["full"].trades]
     fills = fill_rows(dev, "full", "development")
-    decisions = decision_rows(dev, "full", "development")
+    decisions = decision_rows(dev, "full", "development", store=store)
     if hold is not None:
         offs = {v: float(dev.sims[v].equity[-1]) for v in offsets}
         eq += equity_rows(hold, "holdout", offs)
@@ -246,7 +259,7 @@ def write_run(run_dir: Path, manifest, summary: dict[str, Any], dev, hold, cfg, 
         for f in fill_rows(hold, "full", "holdout"):
             fills.append({**f, "fill_id": f["fill_id"] + base_fill, "row": f["row"] + base_row,
                           "trade_id": (f["trade_id"] + base_id) if f["trade_id"] is not None else None})
-        for d in decision_rows(hold, "full", "holdout", offs["full"]):
+        for d in decision_rows(hold, "full", "holdout", offs["full"], store=store):
             decisions.append({**d, "row": d["row"] + base_row})
     write_csv(run_dir / "equity.csv", eq, EQUITY_FIELDS)
     write_csv(run_dir / "trades.csv", trades, TRADE_FIELDS)
