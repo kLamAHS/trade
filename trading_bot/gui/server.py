@@ -85,6 +85,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json({"runs": self.ctl.research_runs(), "status": {**self.ctl.research_status, "running": self.ctl.research_running}})
             elif url.path == "/api/research/status":
                 self._json({**self.ctl.research_status, "running": self.ctl.research_running})
+            elif url.path == "/api/research/plan":
+                self._json(self.ctl.research_plan())
             elif url.path == "/api/research/run":
                 self._json(self.ctl.research_summary(first("id", "")))
             elif url.path == "/api/research/trades":

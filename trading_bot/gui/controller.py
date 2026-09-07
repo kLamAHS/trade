@@ -331,7 +331,8 @@ class BotController:
                                                      s.artifacts_dir, log=log, on_progress=self._research_progress,
                                                      should_stop=self._research_stop.is_set)
             run = ResearchRun(cfg, store, info, s.artifacts_dir, log=log, kind=kind, stages=options.get("stages") or "full",
-                              open_holdout=bool(options.get("open_holdout")), on_progress=self._research_progress,
+                              open_holdout=bool(options.get("open_holdout")), force_holdout=bool(options.get("force_holdout")),
+                              on_progress=self._research_progress,
                               should_stop=self._research_stop.is_set, synthetic_summary=syn_summary)
             st["run_id"] = run.run_id
             summary = run.execute()
@@ -406,7 +407,36 @@ class BotController:
             vm = meta.get("validation_metrics") or {}
             model["holdout"] = vm.get("holdout")
             model["acceptance"] = (vm.get("acceptance") or {}).get("accepted")
-        return {"trade": trade, "decisions": decisions, "fills": fills, "model": model}
+        chain = None
+        entry = next((r for r in decisions if int(r["row"]) == int(trade["entry_row"])), None)
+        if entry and entry.get("fill_bar_start") is not None:
+            chain = {"newest_bar_used": {"index": entry["bar_index"], "start": entry["decision_bar_start"], "close_time": entry["decision_bar_close_time"],
+                                         "close": entry["decision_bar_close"], "available_at": entry["feature_available_at"]},
+                     "feature_timestamp": entry["decision_at"], "forecast_timestamp": entry["decision_at"], "order_timestamp": entry["decision_at"],
+                     "fill_bar": {"index": entry["fill_bar_index"], "start": entry["fill_bar_start"], "close_time": entry["fill_bar_close_time"],
+                                  "open": entry["fill_bar_open"]},
+                     "fill_price": trade.get("entry_price"),
+                     "fill_price_is_next_bar_open": abs(float(trade.get("entry_price") or 0) - float(entry["fill_bar_open"])) < 1e-9,
+                     "fill_bar_starts_at_decision_bar_close": entry["fill_bar_start"] == entry["decision_bar_close_time"]}
+        return {"trade": trade, "decisions": decisions, "fills": fills, "model": model, "chain": chain}
+
+    def research_plan(self) -> dict[str, Any]:
+        """Schedule preview for the currently selected data (how many windows, bars needed for the gate)."""
+        from ..research.walkforward import plan_schedule
+
+        cfg = self.build_config()
+        s = self.settings
+        n = None
+        if s.data_source == "csv":
+            p = Path(s.csv_path)
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as fh:
+                    n = max(0, sum(1 for _ in fh) - 1)
+        else:
+            n = int(s.synthetic_bars)
+        if n is None:
+            return {"error": f"CSV file not found: {s.csv_path!r}"}
+        return plan_schedule(cfg, n)
 
     # ------------------------------------------------------------- status
     def snapshot(self) -> dict[str, Any]:

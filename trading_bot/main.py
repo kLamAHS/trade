@@ -288,7 +288,7 @@ def cmd_research(args) -> int:
                                              args.artifacts, log=log)
     run = ResearchRun(cfg, store, _data_info(args, cfg), args.artifacts, run_id=args.run_id, log=log, kind=kind,
                       stages=args.stages, open_holdout=args.open_holdout, full_reproducibility=args.repro_full,
-                      synthetic_summary=syn_summary)
+                      synthetic_summary=syn_summary, force_holdout=args.force_holdout)
     summary = run.execute()
     _print_gates(summary)
     print(f"run directory: {run.run_dir}")
@@ -303,6 +303,21 @@ def _print_gates(summary: dict) -> None:
     print(f"run {summary['run_id']}: {summary['development']['n_windows']} OOS windows, {dev['trade_count']} trades, "
           f"return {dev['total_return']:+.2%}, CAGR {dev['cagr']:+.2%}, Sharpe {dev['sharpe']:.2f}, Sortino {dev['sortino']:.2f}, "
           f"max DD {dev['max_drawdown']:.2%}, costs {dev['total_cost']:.4f}")
+    pp = summary.get("production_policy")
+    if pp:
+        p = pp["production"]
+        print(f"production policy (accepted models only, {pp['accepted_windows']}/{pp['n_windows']} windows accepted, deployed on "
+              f"{pp['deployed_fraction']:.0%} of OOS bars): return {p['total_return']:+.2%}, Sharpe {p['sharpe']:.2f}, "
+              f"max DD {p['max_drawdown']:.2%}, trades {p['trade_count']}")
+    ab = summary.get("ablation")
+    if ab and ab.get("verdict"):
+        print(f"fractional value-add: {ab['verdict']} — {ab['verdict_text']}")
+    if summary.get("holdout_refused"):
+        print(f"holdout: NOT OPENED ({summary['holdout_refused']['note']})")
+    plan = summary.get("plan") or {}
+    if plan and not plan.get("meets_min_windows"):
+        print(f"windows: {plan['windows']} of the {plan['min_windows']} required; about {plan['bars_needed_for_min_windows']} bars "
+              f"({plan['sessions_needed_for_min_windows']} sessions) of history are needed")
     print(f"classification: {g['classification']}   (results hash {summary.get('results_hash')}, "
           f"manifest {summary['manifest']['manifest_hash']})")
     print(f"{'gate':46s} {'group':15s} {'value':>14s}    {'threshold':>12s}  result")
@@ -401,7 +416,9 @@ def build_parser() -> argparse.ArgumentParser:
     rs = sub.add_parser("research", help="research-grade validation: walk-forward OOS, ablation, stress, bootstrap, gates")
     common(rs); data(rs)
     rs.add_argument("--stages", default="full", help="full | quick | comma-separated stage names")
-    rs.add_argument("--open-holdout", action="store_true", help="open the locked final holdout (recorded in holdout_access.jsonl)")
+    rs.add_argument("--open-holdout", action="store_true",
+                    help="open the locked final holdout (recorded in holdout_access.jsonl); refused unless development is VALIDATED CANDIDATE")
+    rs.add_argument("--force-holdout", action="store_true", help="open the holdout even when development is not VALIDATED CANDIDATE")
     rs.add_argument("--with-synthetic", type=int, default=0, metavar="N", help="run the N-seed synthetic engineering validation first")
     rs.add_argument("--repro-full", action="store_true", help="re-run the whole development walk-forward for the reproducibility check")
     rs.add_argument("--require-gates", action="store_true", help="exit non-zero when any evaluated gate fails")

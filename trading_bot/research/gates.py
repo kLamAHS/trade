@@ -22,6 +22,7 @@ DEFAULT_GATES: dict[str, Any] = {
     "require_profitable_at_2x_cost": True, "require_viable_at_plus_1_bar": True, "allow_perturbation_collapse": False,
     "min_bootstrap_sharpe_lower": 0.0, "require_sanity_pass": True, "require_leakage_pass": True,
     "holdout_min_return": 0.0, "holdout_min_sharpe": 0.0, "require_reproducible": True,
+    "production_min_return": 0.0, "production_min_sharpe": 0.0, "production_min_deployed_fraction": 0.5,
 }
 
 LEVELS = ["EXPERIMENTAL", "CANDIDATE", "VALIDATED CANDIDATE", "HOLDOUT PASSED", "PAPER ELIGIBLE"]
@@ -69,6 +70,18 @@ def evaluate_gates(summary: dict[str, Any], thresholds: dict[str, Any] | None = 
     frac = (sum(1 for x in pos if x > 0) / len(pos)) if pos else None
     gates.append(_gate("positive OOS windows", "walkforward", frac, g["min_positive_window_fraction"],
                        (frac is not None) and frac > g["min_positive_window_fraction"], f"{sum(1 for x in pos if x > 0)}/{len(pos)}", op=">"))
+    # --- production policy (what the bot would have done ex ante) ------------------------------------
+    pm = (dev.get("metrics") or {}).get("production") or {}
+    pp = dev.get("production_policy") or {}
+    pr, ps, pdf = pm.get("total_return"), pm.get("sharpe"), pp.get("deployed_fraction")
+    gates.append(_gate("production-policy OOS return", "walkforward", pr, g["production_min_return"],
+                       None if pr is None else pr > g["production_min_return"],
+                       f"accepted models only; {pp.get('windows_with_deployed_model', '?')}/{dev.get('n_windows', '?')} windows had a deployed model", op=">"))
+    gates.append(_gate("production-policy OOS Sharpe", "walkforward", ps, g["production_min_sharpe"],
+                       None if ps is None else ps > g["production_min_sharpe"], op=">"))
+    gates.append(_gate("production-policy deployed fraction", "walkforward", pdf, g["production_min_deployed_fraction"],
+                       None if pdf is None else pdf >= g["production_min_deployed_fraction"],
+                       "share of OOS bars on which an accepted model was deployed"))
     # --- ablation ---------------------------------------------------------------------------
     med = abl.get("median_delta_sharpe")
     gates.append(_gate("median ΔSharpe (fractional − baseline)", "ablation", med, g["min_median_delta_sharpe"],
@@ -77,8 +90,10 @@ def evaluate_gates(summary: dict[str, Any], thresholds: dict[str, Any] | None = 
     gates.append(_gate("windows where fractional beats baseline", "ablation", pfrac, g["min_positive_delta_fraction"],
                        None if not have(abl) else pfrac > g["min_positive_delta_fraction"], op=">"))
     # --- stress ---------------------------------------------------------------------------
-    gates.append(_gate("profitable at 2× model cost", "stress", cost.get("profitable_at_2x_cost"), True,
-                       None if not have(cost) else (bool(cost.get("profitable_at_2x_cost")) or not g["require_profitable_at_2x_cost"]), op="=="))
+    gates.append(_gate("profitable at 2× realised cost (decisions frozen)", "stress", cost.get("profitable_at_2x_cost"), True,
+                       None if not have(cost) else (bool(cost.get("profitable_at_2x_cost")) or not g["require_profitable_at_2x_cost"]),
+                       f"same {cost.get('trade_count_frozen', '?')} trades charged double at the fill; joint 2x (strategy told 2x): "
+                       f"{'profitable' if cost.get('profitable_at_2x_joint_cost') else 'not profitable'}" if have(cost) else "", op="=="))
     gates.append(_gate("viable at +1 bar execution delay", "stress", timing.get("viable_at_plus_1"), True,
                        None if not have(timing) else (bool(timing.get("viable_at_plus_1")) or not g["require_viable_at_plus_1_bar"]), op="=="))
     collapse = None

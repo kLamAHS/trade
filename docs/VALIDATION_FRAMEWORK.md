@@ -22,15 +22,15 @@ data selected under *Run configuration* and renders the run directory.
 | 2 | `ablation` | Fractional vs no-fractional per window: positive cycles, mean/median ΔSharpe, fraction of windows won, bootstrap CI of the mean ΔSharpe, sign test. | `runner.py`, `bootstrap.py` |
 | 3 | `baselines` | Cash, buy & hold, vol-scaled long, momentum, random permutations of the strategy's own forecasts (distribution + percentile), no-fractional model. Same rows, timing and costs. | `baselines.py` |
 | 4 | `regimes` | Ex-ante regime tags (trailing 20 vs 200-bar vol, close vs 200-bar mean) and P&L attribution. | `regimes.py` |
-| 5 | `cost` | Model cost ×1/×2/×3 and flat 0/1/2/5/10 bps; break-even flat cost. | `stress.py` |
+| 5 | `cost` | Three experiments: **realised** (decisions frozen, the same trades charged model cost ×2/×3 or flat 0-10 bps at the fill; break-even flat cost; the 2× gate), **assumed** (the strategy is told ×0.5/×2 the cost, fills charged as modelled: is the trade gate on a knife edge?), **joint** (both move). | `stress.py` |
 | 6 | `timing` | Execution delayed by +1 / +2 bars. | `stress.py` |
 | 7 | `perturbation` | Position-rule parameters ×0.5 / ×2 (cost multipliers, rebalance threshold, max holding, stop, vol cap); collapse detection. | `stress.py` |
 | 8 | `d_perturbation` | Fractional order d* ± 1, 2 steps with a light refit per window, compared with the light refit at d* itself. | `stress.py` |
 | 9 | `sanity` | Shuffled labels, shuffled features, target shifted +20 bars (light refits), reversed forecasts, random forecasts, zero / double cost. Each has an expectation and a pass flag. | `sanity.py` |
-| 10 | `leakage` | Timestamp audit of every OOS row (`feature_available_at <= decision_at <= execution_at`), label alignment against the bar store (label starts at the execution price), entry price = next open. | `sanity.py`, `walkforward.py` |
+| 10 | `leakage` | Timestamp audit of every OOS row (`feature_available_at <= decision_at <= execution_at`), label alignment against the bar store (label starts at the execution price), entry price = next open, **forward mutation** (every bar after a decision bar is rewritten; the fitted model's forecasts at and before it must be bit-identical, on several windows) and a human-verifiable **timestamp chain** for sampled trades. | `sanity.py`, `walkforward.py` |
 | 11 | `bootstrap` | Circular block bootstrap of bar returns (Sharpe / CAGR CIs, drawdown distribution), Monte Carlo trade resampling (terminal wealth, P(loss), P(DD > 20%)), multiple-testing bookkeeping (configurations tested, Bonferroni-adjusted p). | `bootstrap.py` |
 | 12 | `reproducibility` | Retrain the first window(s) again and compare the fitted model hash and the OOS forecasts bit for bit; `--repro-full` re-runs the whole walk-forward and compares results hashes. Mismatch = `REPRODUCIBILITY FAILURE`. | `walkforward.py`, `manifest.py` |
-| 13 | `holdout` | Only with `--open-holdout`: walk the locked final span with the same refit schedule, append an access record (`holdout_access.jsonl`: time, run id, code commit, config / model-config / data hashes, model version, opening number). Re-openings are flagged. | `runner.py` |
+| 13 | `holdout` | Only with `--open-holdout`, and **refused unless the development stages already reach VALIDATED CANDIDATE** (`--force-holdout` overrides, loudly): walk the locked final span with the same refit schedule, append an access record (`holdout_access.jsonl`: time, run id, code commit, config / model-config / data hashes, model version, opening number). Re-openings are flagged. | `runner.py` |
 | 14 | `gates` | Acceptance gates and classification (below). | `gates.py` |
 
 `--stages quick` runs 1-7, 11, 12, 14 (no light refits). The synthetic ensemble runs
@@ -47,9 +47,20 @@ Each decision row carries three timestamps:
 
 A 30-minute bar closing at 18:30 is followed by the open print at 18:30:00 or later, so the
 invariant is `feature_available_at <= decision_at <= execution_at`; the runner raises on any row that
-violates it and the leakage stage re-checks it. Latency beyond the boundary is measured by the
-+1/+2 bar timing test rather than assumed away. The label of a decision at bar *t* is
-`log O[t+1+H] − log O[t+1]`: it starts at the execution price and never touches an earlier bar.
+violates it and the leakage stage re-checks it. Because the decision bar's close and the fill bar's
+start share the boundary timestamp, `decisions.csv` and the trade audit trail spell the chain out in
+bar terms so a human can verify it without trusting the timestamps:
+
+```
+newest bar used        bar t   (start, close time, close price)      -> feature / forecast / order timestamp = close of bar t
+fill bar               bar t+1 (starts at the close of bar t)        -> fill price = open of bar t+1
+```
+
+The forward-mutation check goes further than timestamps: every bar after a decision bar is replaced by
+a different price path and the fitted model is re-run; the forecasts at and before the decision must
+not move by a single bit (a model that sees the fill bar or any later bar fails here). Latency beyond
+the boundary is measured by the +1/+2 bar timing test rather than assumed away. The label of a decision
+at bar *t* is `log O[t+1+H] − log O[t+1]`: it starts at the execution price and never touches an earlier bar.
 Nothing selected inside a training block (d*, hyper-parameters, calibration) sees its OOS block;
 the trainer's own protocol (fold-local d*, chronological calibration, untouched outer holdout) is
 described in the README.
@@ -67,10 +78,25 @@ drawdown halt (until the next window's model, with the drawdown reference re-bas
 live `RiskEngine` does after an accepted retrain) are applied when `research.simulation.portfolio_halts`
 is true.
 
-`research.walkforward.deploy_policy` selects which forecasts are traded: `always` (every refit,
-the research default) or `production` (only accepted models, keeping the previous one
-otherwise). Both series are always simulated; the *production policy* overlay in the dashboard
-shows the second.
+Two series are always simulated and reported side by side:
+
+* **research** — every refit is traded; the model's out-of-sample quality;
+* **production policy** — only models the trainer accepted are deployed, the previous accepted one
+  stays deployed otherwise and the strategy is flat before the first; this is what the bot would
+  have done ex ante, and it carries its own gates (return, Sharpe, share of bars with a deployed model).
+
+`research.walkforward.deploy_policy` (`always` | `production`) only selects which one is the
+headline for the walk-forward gates. A large gap between the two means the promotion rule, not
+the model, decides the live outcome.
+
+## Ablation verdict
+
+The fractional-vs-baseline comparison is summarised as a verdict that a headline number cannot
+hide: **DEMONSTRATED** (median ΔSharpe > 0, most windows won, bootstrap CI of the mean above zero),
+**SUGGESTIVE** (median and window count in favour, CI still spans zero) or **NOT DEMONSTRATED**.
+Trimmed and leave-one-out means are reported so that one exceptional window cannot carry the mean,
+and the change in maximum drawdown is stated separately because "lower drawdown" is a different
+claim from "more alpha".
 
 ## Metrics (spec sections 14-15, 18)
 
@@ -151,6 +177,10 @@ Thresholds live in `research.gates` of `strategy.yaml`:
 | sanity tests, leakage tests | pass |
 | holdout return / Sharpe > | 0 / 0 |
 | reproducibility | IDENTICAL |
+
+The window gate is about breadth, not trade count: trades inside one regime are not independent
+experiments. `summary.plan` (and the dashboard's schedule preview) states how many windows the
+selected data yields and roughly how many bars the gate needs.
 
 Classification ladder: **EXPERIMENTAL** → **CANDIDATE** (walk-forward gates) →
 **VALIDATED CANDIDATE** (+ ablation, stress, bootstrap, sanity, leakage) → **HOLDOUT PASSED**

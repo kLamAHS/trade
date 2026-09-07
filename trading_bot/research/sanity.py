@@ -89,7 +89,91 @@ def run_sanity(runner, result, target_shift_bars: int = 20, n_random: int = 20, 
             "passed": bool(all(checks))}
 
 
-def run_leakage(runner, result, target_shift_bars: int = 20, log=None) -> dict[str, Any]:
+def _mutated_store(store, from_bar: int, factor: float = 1.37, seed: int = 0):
+    """Copy of the history whose bars from ``from_bar`` onwards are replaced by a different price path
+    (scaled, re-noised, volume doubled).  Bars before ``from_bar`` are untouched."""
+    from ..data.store import BarStore
+    from ..types import Bar
+
+    rng = np.random.default_rng(seed)
+    bars = list(store.bars[:from_bar])
+    for b in store.bars[from_bar:]:
+        k = factor * (1.0 + 0.01 * rng.standard_normal())
+        o, c = b.open * k, b.close * k * (1.0 + 0.002 * rng.standard_normal())
+        hi, lo = max(o, c) * 1.001, min(o, c) * 0.999
+        bars.append(Bar(b.instrument, b.timestamp, o, hi, lo, c, b.volume * 2.0, b.bar_minutes,
+                        None if b.bid is None else b.bid * k, None if b.ask is None else b.ask * k,
+                        b.quote_timestamp, b.observed_at))
+    return BarStore(store.instrument, store.bar_minutes, bars)
+
+
+def forward_mutation_check(runner, result, n_samples: int = 4, log=None) -> dict[str, Any]:
+    """Change every bar *after* a decision bar and re-run the fitted model: the forecast at that bar (and
+    at every earlier bar of the block) must be bit-identical.  A model or feature that sees the fill bar
+    or any later bar fails here even if the timestamps look right (section 23)."""
+    windows = [w for w in result.windows if w.model is not None]
+    if not windows:
+        return {"passed": None, "samples": [], "note": "no fitted model"}
+    picks = sorted({int(round(k * (len(windows) - 1) / max(1, n_samples - 1))) for k in range(n_samples)})
+    samples = []
+    for k in picks:
+        wr = windows[k]
+        w = wr.window
+        ds, mask, offset = runner._oos_dataset(w, wr.model.d_star, {})
+        rows = np.flatnonzero(mask)
+        cut = rows[len(rows) // 2]                                   # decision bar in the middle of the block
+        cut_bar = int(ds.bar_index[cut] + offset)
+        E_ref = runner._forecast(wr.model, ds, mask)["E"]
+        mutated = _mutated_store(runner.store, cut_bar + 1, seed=k)  # everything after the decision bar changes
+        ds_m, mask_m, offset_m = runner._oos_dataset(w, wr.model.d_star, {}, store=mutated)
+        E_mut = runner._forecast(wr.model, ds_m, mask_m)["E"]
+        rows_m = np.flatnonzero(mask_m)
+        upto = int(np.sum((ds.bar_index[rows] + offset) <= cut_bar))
+        upto_m = int(np.sum((ds_m.bar_index[rows_m] + offset_m) <= cut_bar))
+        same_rows = upto == upto_m
+        identical = bool(same_rows and np.array_equal(E_ref[:upto], E_mut[:upto_m]))
+        changed_after = bool(len(E_mut) > upto_m and len(E_ref) > upto and not np.array_equal(E_ref[upto:upto + 1], E_mut[upto_m:upto_m + 1]))
+        samples.append({"window": w.index, "model_id": wr.model_id, "decision_bar": cut_bar,
+                        "decision_at": runner.store[cut_bar].close_time.isoformat(),
+                        "mutated_from_bar": cut_bar + 1, "rows_compared": upto, "identical_up_to_decision": identical,
+                        "max_abs_difference": float(np.max(np.abs(E_ref[:upto] - E_mut[:upto_m]))) if same_rows and upto else 0.0,
+                        "forecast_after_cut_changed": changed_after})
+        if log:
+            log(f"forward mutation window {w.index}: bars > {cut_bar} rewritten -> forecasts up to the decision "
+                f"{'identical' if identical else 'CHANGED'}")
+    return {"passed": bool(all(s["identical_up_to_decision"] for s in samples)), "samples": samples,
+            "note": "bars after the decision bar were replaced by a different price path; forecasts at and before it must not move"}
+
+
+def timestamp_chain(runner, result, n_trades: int = 10) -> list[dict[str, Any]]:
+    """Human-verifiable chain for a sample of trades (section 23):
+    newest bar used -> feature / forecast / order timestamp -> fill bar -> fill price."""
+    trades = result.sims["full"].trades
+    if not trades:
+        return []
+    idx = sorted({int(round(k * (len(trades) - 1) / max(1, n_trades - 1))) for k in range(min(n_trades, len(trades)))})
+    out = []
+    store = runner.store
+    for i in idx:
+        t = trades[i]
+        row = t["entry_row"]
+        b = int(result.oos.bar_index[row])
+        dec, fill = store[b], store[b + 1]
+        out.append({"trade_id": t["trade_id"], "row": row, "decision_bar_index": b,
+                    "newest_bar_used": {"index": b, "start": dec.timestamp.isoformat(), "close_time": dec.close_time.isoformat(),
+                                        "close": dec.close, "latest_source_time": dec.latest_source_time.isoformat()},
+                    "feature_timestamp": result.oos.decision_at[row].isoformat(),
+                    "forecast_timestamp": result.oos.decision_at[row].isoformat(),
+                    "order_timestamp": result.oos.decision_at[row].isoformat(),
+                    "fill_bar": {"index": b + 1, "start": fill.timestamp.isoformat(), "close_time": fill.close_time.isoformat(),
+                                 "open": fill.open},
+                    "fill_price": t["entry_price"], "fill_price_is_next_bar_open": bool(abs(t["entry_price"] - fill.open) < 1e-9),
+                    "fill_bar_starts_at_decision_bar_close": bool(fill.timestamp == dec.close_time),
+                    "fill_bar_is_after_newest_bar_used": bool(fill.timestamp >= dec.close_time and b + 1 > b)})
+    return out
+
+
+def run_leakage(runner, result, target_shift_bars: int = 20, log=None, mutation_samples: int = 4) -> dict[str, Any]:
     cfg = runner.cfg
     align = label_alignment_check(runner, result.oos, str(cfg.prediction.get("label_price", "open")), int(cfg.prediction.horizon_bars))
     audit = dict(result.timestamp_audit)
@@ -98,12 +182,19 @@ def run_leakage(runner, result, target_shift_bars: int = 20, log=None) -> dict[s
     fa, da, ea = result.oos.feature_available_at, result.oos.decision_at, result.oos.execution_at
     violations = int(sum(1 for a, b, c in zip(fa, da, ea) if a > b or c < b))
     audit["violations"] = violations
-    passed = bool(align["labels_aligned"] and align["entry_price_is_execution_open"] and violations == 0)
-    return {"timestamps": audit, "label_alignment": align, "passed": passed,
+    mutation = forward_mutation_check(runner, result, mutation_samples, log=log) if mutation_samples > 0 else {"passed": None, "samples": []}
+    chain = timestamp_chain(runner, result)
+    chain_ok = all(c["fill_price_is_next_bar_open"] and c["fill_bar_is_after_newest_bar_used"] for c in chain)
+    passed = bool(align["labels_aligned"] and align["entry_price_is_execution_open"] and violations == 0
+                  and mutation["passed"] in (True, None) and chain_ok)
+    return {"timestamps": audit, "label_alignment": align, "forward_mutation": mutation, "timestamp_chain": chain,
+            "chain_consistent": bool(chain_ok), "passed": passed,
             "checks": ["feature_available_at <= decision_at", "decision_at <= execution_at",
                        "label starts at the execution price and ends 1+H bars after the decision bar",
+                       "forecasts are bit-identical when every bar after the decision bar is rewritten (forward mutation)",
+                       "sampled trades: fill price == open of the bar that starts at the decision bar's close",
                        "d*, hyper-parameters and calibration selected inside the training block only (trainer protocol)",
                        f"target shift +{target_shift_bars} bars degrades the edge (see sanity.target_shift)"]}
 
 
-__all__ = ["run_sanity", "run_leakage", "label_alignment_check"]
+__all__ = ["run_sanity", "run_leakage", "label_alignment_check", "forward_mutation_check", "timestamp_chain"]

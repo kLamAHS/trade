@@ -156,8 +156,14 @@ class WalkForwardResult:
         return len(self.windows)
 
     def summary(self) -> dict[str, Any]:
+        deployed = [w.deployed_model_id for w in self.windows]
+        rows_deployed = int(sum(w.n_oos_rows for w in self.windows if w.deployed_model_id is not None))
         return {"label": self.label, "n_windows": self.n_windows, "n_rows": len(self.oos),
                 "accepted_windows": int(sum(w.accepted for w in self.windows)),
+                "production_policy": {"windows_with_deployed_model": int(sum(1 for d in deployed if d is not None)),
+                                      "rows_with_deployed_model": rows_deployed,
+                                      "deployed_fraction": rows_deployed / max(1, len(self.oos)),
+                                      "distinct_models": len({d for d in deployed if d is not None})},
                 "failed_windows": int(sum(w.error is not None for w in self.windows)),
                 "span": [self.oos.decision_at[0].isoformat(), self.oos.decision_at[-1].isoformat()] if len(self.oos) else None,
                 "metrics": {k: m.to_dict() for k, m in self.metrics.items()},
@@ -194,6 +200,10 @@ class WalkForwardRunner:
         self.calendar = SessionCalendar.from_config(cfg)
         r = cfg.get("research", {}) or {}
         wf = r.get("walkforward", {}) or {}
+        # Which series the headline / walk-forward gates score.  Both are always simulated:
+        #   full        every refit is traded (the research view of the model)
+        #   production  only models the trainer accepted are deployed, the previous one stays otherwise
+        #               (what the bot would have done ex ante)
         self.deploy_policy = deploy_policy or str(wf.get("deploy_policy", "always"))
         if self.deploy_policy not in ("always", "production"):
             raise ValueError("research.walkforward.deploy_policy must be 'always' or 'production'")
@@ -249,15 +259,17 @@ class WalkForwardRunner:
             fe.set_adaptive_d(prev)
         return int(lead + self.trainer.builder.vol_reference_bars + 5)
 
-    def _oos_dataset(self, w: Window, d: float, cache: dict):
+    def _oos_dataset(self, w: Window, d: float, cache: dict, store: BarStore | None = None):
         """Dataset over the OOS block (plus warm-up history before it and the label bars after it)
-        built with the feature definition ``d``; returns (dataset, row mask of the OOS block, offset)."""
+        built with the feature definition ``d``; returns (dataset, row mask of the OOS block, offset).
+        ``store`` overrides the runner's history (used by the forward-mutation leakage check)."""
         key = round(float(d), 10)
         if key in cache:
             return cache[key]
+        store = self.store if store is None else store
         start = max(0, w.train_end - self._lead_bars(d))
-        end = min(len(self.store), w.oos_end + self.horizon + 1)
-        ext = self.store.slice(start, end)
+        end = min(len(store), w.oos_end + self.horizon + 1)
+        ext = store.slice(start, end)
         ds = self.trainer.builder.build(ext, float(d))
         global_idx = ds.bar_index + start
         mask = (global_idx >= w.train_end) & (global_idx < w.oos_end)
@@ -304,10 +316,8 @@ class WalkForwardRunner:
             carried = report.model is None
             model = report.model if report.model is not None else model_prev
             base = report.baseline_model if report.baseline_model is not None else base_prev
-            if self.deploy_policy == "always":
-                deployed = model
-            elif report.model is not None and report.accepted:
-                deployed = report.model
+            if report.model is not None and report.accepted:
+                deployed = report.model                   # the production policy promotes accepted models only
             # OOS forecasts with the fitted models (features rebuilt with each model's own d)
             cache: dict = {}
             ref_d = model.d_star if model is not None else self.trainer.fe.adaptive_d
@@ -453,4 +463,27 @@ class WalkForwardRunner:
                 "max_abs_forecast_difference": float(np.max(np.abs(E_new - E_old))) if len(E_new) == len(E_old) else None}
 
 
-__all__ = ["WalkForwardRunner", "WalkForwardResult", "WindowResult", "OOSSeries", "window_statistics", "VARIANTS"]
+def plan_schedule(cfg: FrozenConfig, n_bars: int) -> dict[str, Any]:
+    """What a run on ``n_bars`` bars would look like, and how many bars the window gate needs (section 6)."""
+    r = cfg.get("research", {}) or {}
+    wf = r.get("walkforward", {}) or {}
+    train = int(wf.get("train_bars") or cfg.training.window_bars)
+    first = int(wf.get("first_train_bars") or cfg.training.minimum_bars)
+    oos = int(wf.get("oos_bars") or cfg.training.retrain_every_bars)
+    step = int(wf.get("step_bars") or oos)
+    hold = float((r.get("holdout", {}) or {}).get("fraction", 0.15))
+    min_windows = int((r.get("gates", {}) or {}).get("min_windows", 20))
+    sched = build_schedule(n_bars, train, oos, step, holdout_fraction=hold, first_train_bars=first,
+                           expanding=bool(wf.get("expanding", False)))
+    # bars needed so that the development span holds min_windows full OOS blocks
+    needed = int(math.ceil((first + min_windows * step) / max(1e-9, 1.0 - hold)))
+    bpd = int(cfg.market.bars_per_day)
+    return {"n_bars": int(n_bars), "windows": len(sched.windows), "oos_bars_total": int(sum(w.oos_bars for w in sched.windows)),
+            "holdout_start": sched.holdout_start, "holdout_bars": (n_bars - sched.holdout_start) if sched.holdout_start is not None else 0,
+            "first_train_bars": first, "train_bars": train, "oos_bars": oos, "step_bars": step, "holdout_fraction": hold,
+            "min_windows": min_windows, "bars_needed_for_min_windows": needed,
+            "sessions_needed_for_min_windows": int(math.ceil(needed / bpd)),
+            "meets_min_windows": len(sched.windows) >= min_windows}
+
+
+__all__ = ["WalkForwardRunner", "WalkForwardResult", "WindowResult", "OOSSeries", "window_statistics", "plan_schedule", "VARIANTS"]

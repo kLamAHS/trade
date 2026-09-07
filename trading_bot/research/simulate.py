@@ -5,7 +5,9 @@ the walk-forward OOS evaluation, the cost / timing stress tests and the sanity t
 
 * decisions at the close of row ``i`` execute at ``open_next[i + delay]`` and are held to
   ``open_next2[i + delay]`` (``delay`` = extra bars of execution latency, section 22),
-* per-side cost = ``cost_side_exec`` (scaled by ``cost_scale``) or a flat ``cost_bps`` override,
+* two independent cost dimensions: the *assumed* round-trip cost the signal must clear
+  (``signal_cost_scale`` / ``signal_cost_bps``) and the *realised* per-side cost charged at the fill
+  (``exec_cost_scale`` / ``exec_cost_bps``); ``cost_scale`` / ``cost_bps`` move both together,
 * position rules (sizing, turnover suppression, stop, max holding, re-evaluation cadence)
   are the shared ``apply_position_rules`` used by the live RiskEngine,
 * optional portfolio-level circuit breakers: daily loss halt (rest of session) and drawdown
@@ -96,16 +98,25 @@ class SimResult:
 
 def simulate_strategy(inp: SimInputs, params, cost_scale: float = 1.0, cost_bps: float | None = None, delay: int = 0,
                       daily_loss_limit: float | None = None, drawdown_halt: float | None = None,
-                      capital: float = 1.0, model_ids: list | None = None) -> SimResult:
+                      capital: float = 1.0, model_ids: list | None = None, signal_cost_scale: float = 1.0,
+                      signal_cost_bps: float | None = None, exec_cost_scale: float = 1.0,
+                      exec_cost_bps: float | None = None) -> SimResult:
     n = len(inp)
     H = params.horizon
-    # cost arrays under the scenario
-    if cost_bps is not None:
+    # Assumed cost (enters the trade / no-trade decision and the confidence) ...
+    if signal_cost_bps is not None:
+        cost_rt = np.full(n, signal_cost_bps / 1e4)
+    elif cost_bps is not None:
         cost_rt = np.full(n, cost_bps / 1e4)
+    else:
+        cost_rt = np.asarray(inp.cost_roundtrip, dtype=float) * cost_scale * signal_cost_scale
+    # ... and realised cost (charged per side at the fill, after the decision is frozen).
+    if exec_cost_bps is not None:
+        cost_side = np.full(n, exec_cost_bps / 2e4)
+    elif cost_bps is not None:
         cost_side = np.full(n, cost_bps / 2e4)
     else:
-        cost_rt = np.asarray(inp.cost_roundtrip, dtype=float) * cost_scale
-        cost_side = np.asarray(inp.cost_side_exec, dtype=float) * cost_scale
+        cost_side = np.asarray(inp.cost_side_exec, dtype=float) * cost_scale * exec_cost_scale
     q_cur = 0.0
     holding = 0
     entry_price = math.nan

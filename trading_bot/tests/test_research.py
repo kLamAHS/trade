@@ -47,7 +47,7 @@ def research_store():
 def research_run(research_cfg, research_store, tmp_path_factory):
     root = tmp_path_factory.mktemp("research")
     run = ResearchRun(research_cfg, research_store, {"source": "synthetic", "seed": 21}, root, log=None, kind="synthetic",
-                      stages="full", open_holdout=True)
+                      stages="full", open_holdout=True, force_holdout=True)      # synthetic never reaches VALIDATED CANDIDATE
     summary = run.execute()
     return run, summary, root
 
@@ -100,6 +100,23 @@ def test_simulate_strategy_matches_validation_simulator():
     assert all(t["decision_timestamp"] is None for t in res.trades)          # no timestamps supplied
     assert {"trade_id", "forecast", "expected_return", "probability_up", "confidence", "target_exposure",
             "approved_exposure", "entry_price", "exit_price", "bars_held", "exit_reason", "net_pnl"} <= set(res.trades[0])
+
+
+def test_cost_dimensions_are_independent():
+    """Realised cost with frozen decisions charges the *same* trades more; the assumed cost changes the trades."""
+    inp = _inputs()
+    params = SimulationParams(horizon=4)
+    base = simulate_strategy(inp, params)
+    frozen = simulate_strategy(inp, params, exec_cost_scale=2.0)
+    assert len(frozen.trades) == len(base.trades) and np.array_equal(frozen.exposures, base.exposures)
+    assert frozen.total_cost == pytest.approx(2.0 * base.total_cost) and frozen.gross_pnl == pytest.approx(base.gross_pnl)
+    flat = simulate_strategy(inp, params, exec_cost_bps=0.0)
+    assert flat.total_cost == 0.0 and np.array_equal(flat.exposures, base.exposures)
+    assumed = simulate_strategy(inp, params, signal_cost_scale=3.0)
+    assert assumed.n_signals < base.n_signals                      # a higher hurdle -> fewer signals
+    joint = simulate_strategy(inp, params, cost_scale=2.0)
+    assert joint.n_signals == simulate_strategy(inp, params, signal_cost_scale=2.0).n_signals
+    assert joint.total_cost <= 2.0 * base.total_cost + 1e-12
 
 
 def test_simulate_strategy_delay_cost_and_halts():
@@ -160,9 +177,11 @@ def test_bootstrap_monte_carlo_and_multiple_testing_are_deterministic():
 # ------------------------------------------------------------------- gates
 def _summary(level: str, synthetic: bool = False) -> dict:
     dev_metrics = {"sharpe": 1.5, "max_drawdown": 0.10, "profit_factor": 1.5, "trade_count": 300}
+    prod_metrics = {"sharpe": 1.2, "max_drawdown": 0.12, "profit_factor": 1.3, "trade_count": 200, "total_return": 0.2}
     per_window = [{"full_net_return": 0.01 if i % 4 else -0.01, "delta_sharpe": 0.2} for i in range(24)]
     s = {"manifest": {"kind": "synthetic" if synthetic else "real"},
-         "development": {"n_windows": 24, "metrics": {"full": dev_metrics}, "per_window": per_window}}
+         "development": {"n_windows": 24, "metrics": {"full": dev_metrics, "production": prod_metrics}, "per_window": per_window,
+                         "production_policy": {"deployed_fraction": 0.8, "windows_with_deployed_model": 20}}}
     if level == "EXPERIMENTAL":
         s["development"]["n_windows"] = 5
         return s
@@ -186,6 +205,18 @@ def test_gate_classification_ladder(level):
     out = evaluate_gates(_summary(level))
     assert out["classification"] == level
     assert out["paper_eligible"] == (level == "PAPER ELIGIBLE")
+
+
+def test_gates_production_policy_is_first_class():
+    s = _summary("CANDIDATE")
+    assert evaluate_gates(s)["classification"] == "CANDIDATE"
+    s["development"]["metrics"]["production"]["total_return"] = -0.05      # research view fine, ex-ante policy loses money
+    out = evaluate_gates(s)
+    assert out["classification"] == "EXPERIMENTAL"
+    assert any(g["gate"] == "production-policy OOS return" and g["passed"] is False for g in out["gates"])
+    s["development"]["metrics"]["production"]["total_return"] = 0.2
+    s["development"]["production_policy"]["deployed_fraction"] = 0.2         # a model was deployed on 20% of the bars only
+    assert evaluate_gates(s)["classification"] == "EXPERIMENTAL"
 
 
 def test_gates_synthetic_runs_never_classify_and_failures_block():
@@ -266,13 +297,48 @@ def test_leakage_detector_flags_tampered_timestamps(research_run):
 
     class Fake:
         oos = tampered
+        sims = res.sims
+        windows = res.windows
         timestamp_audit = dict(res.timestamp_audit)
 
-    bad = run_leakage(run.runner, Fake())
+    bad = run_leakage(run.runner, Fake(), mutation_samples=0)
     assert not bad["passed"] and bad["timestamps"]["violations"] == 1
     tampered.execution_at[5] = tampered.decision_at[5]
     tampered.y_raw[7] += 1e-3                                                     # label not the executable return
-    assert not run_leakage(run.runner, Fake())["label_alignment"]["labels_aligned"]
+    assert not run_leakage(run.runner, Fake(), mutation_samples=0)["label_alignment"]["labels_aligned"]
+
+
+def test_forward_mutation_check_catches_a_model_that_peeks(research_run, monkeypatch):
+    """Rewrite every bar after the decision bar: honest forecasts do not move, a peeking model's do."""
+    from trading_bot.research.sanity import forward_mutation_check
+
+    run, summary, root = research_run
+    honest = forward_mutation_check(run.runner, run.dev, n_samples=2)
+    assert honest["passed"] and all(s["identical_up_to_decision"] for s in honest["samples"])
+    assert all(s["forecast_after_cut_changed"] for s in honest["samples"])      # the mutation itself was effective
+    original = run.runner._forecast
+
+    def peeking(model, ds, mask):
+        out = original(model, ds, mask)
+        out["E"] = out["E"] + 1e-6 * ds.open_next[mask]                         # uses the fill bar's open
+        return out
+
+    monkeypatch.setattr(run.runner, "_forecast", peeking)
+    leaky = forward_mutation_check(run.runner, run.dev, n_samples=2)
+    assert not leaky["passed"] and leaky["samples"][0]["max_abs_difference"] > 0
+
+
+def test_timestamp_chain_is_human_verifiable(research_run):
+    from trading_bot.research.sanity import timestamp_chain
+
+    run, summary, root = research_run
+    chain = timestamp_chain(run.runner, run.dev, n_trades=6)
+    assert chain and all(c["fill_price_is_next_bar_open"] and c["fill_bar_starts_at_decision_bar_close"] for c in chain)
+    for c in chain:
+        assert c["fill_bar"]["index"] == c["newest_bar_used"]["index"] + 1
+        assert c["feature_timestamp"] == c["newest_bar_used"]["close_time"] == c["fill_bar"]["start"]
+    lk = summary["leakage"]
+    assert lk["forward_mutation"]["passed"] and lk["chain_consistent"] and len(lk["timestamp_chain"]) >= 1
 
 
 # ------------------------------------------------------------- end to end
@@ -293,10 +359,25 @@ def test_pipeline_end_to_end(research_run):
     a = s["ablation"]
     assert a["cycles"] == dev["n_windows"] and len(a["per_window_delta_sharpe"]) == dev["n_windows"]
     cc = s["cost_curve"]
-    x1 = next(r for r in cc["rows"] if r["label"] == "model_cost_x1")
-    assert x1["total_return"] == pytest.approx(dev["metrics"]["full"]["total_return"])
-    zero = next(r for r in cc["rows"] if r["label"] == "flat_0bps")
-    assert zero["total_cost"] == 0.0
+    ref = next(r for r in cc["rows"] if r["label"] == "reference")
+    assert ref["total_return"] == pytest.approx(dev["metrics"]["full"]["total_return"])
+    frozen = [r for r in cc["rows"] if r["family"] == "realised"]
+    assert frozen and all(r["n_signals"] == ref["n_signals"] for r in frozen)              # signal decisions frozen
+    zero = next(r for r in cc["rows"] if r["label"] == "realised_flat_0bps")
+    assert zero["total_cost"] == 0.0 and zero["total_return"] >= ref["total_return"] - 1e-12
+    x2 = next(r for r in cc["rows"] if r["label"] == "realised_cost_x2")
+    assert x2["total_cost"] == pytest.approx(2.0 * ref["total_cost"])
+    assert any(r["family"] == "assumed" for r in cc["rows"]) and any(r["family"] == "joint" for r in cc["rows"])
+    # production policy: accepted models only, flat before the first accepted window
+    pp = s["production_policy"]
+    prod_E = run.dev.oos.forecasts["production"]["E"]
+    first_deployed = next((w for w in run.dev.windows if w.deployed_model_id is not None), None)
+    if first_deployed is not None and first_deployed.window.index > 0:
+        assert np.all(prod_E[run.dev.oos.window_ids < first_deployed.window.index] == 0.0)
+    assert pp["accepted_windows"] == dev["accepted_windows"] and 0.0 <= pp["deployed_fraction"] <= 1.0
+    assert s["headline_variant"] == "always" and s["plan"]["windows"] == dev["n_windows"]
+    assert s["ablation"]["verdict"] in ("DEMONSTRATED", "SUGGESTIVE", "NOT DEMONSTRATED")
+    assert "mean_delta_sharpe_excluding_best_window" in s["ablation"]
     t = s["sanity"]["tests"]
     assert t["shuffled_labels"]["sharpe"] < t["light_refit_reference"]["sharpe"]
     assert t["shuffled_features"]["sharpe"] < t["light_refit_reference"]["sharpe"]
@@ -307,7 +388,7 @@ def test_pipeline_end_to_end(research_run):
     assert s["multiple_testing"]["configurations_tested_in_run"] == 2 * dev["n_windows"]
     # holdout: opened once, recorded, walked with refits, appended after development
     h = s["holdout"]
-    assert h["access"]["opening_number"] == 1 and h["n_windows"] >= 1
+    assert h["access"]["opening_number"] == 1 and h["n_windows"] >= 1 and "holdout_refused" not in s
     access = (root / "holdout_access.jsonl").read_text().strip().splitlines()
     assert len(access) == 1 and json.loads(access[0])["run_id"] == s["run_id"]
     assert run.hold.oos.bar_index[0] == run.dev.oos.bar_index[-1] + 1 or run.hold.oos.bar_index[0] >= run.dev.oos.bar_index[-1]
@@ -338,6 +419,8 @@ def test_pipeline_artifacts(research_run):
         rows = list(csv.DictReader(fh))
     assert len(rows) == len(run.dev.oos) + len(run.hold.oos)
     assert rows[0]["feature_available_at"] <= rows[0]["decision_at"] <= rows[0]["execution_at"]
+    assert rows[0]["fill_bar_start"] == rows[0]["decision_bar_close_time"] == rows[0]["decision_at"]
+    assert int(rows[0]["fill_bar_index"]) == int(rows[0]["bar_index"]) + 1 and float(rows[0]["fill_bar_open"]) == float(rows[0]["open_next"])
     with open(d / "trades.csv") as fh:
         trades = list(csv.DictReader(fh))
     assert len(trades) == len(run.dev.sims["full"].trades) + len(run.hold.sims["full"].trades)
@@ -347,6 +430,26 @@ def test_pipeline_artifacts(research_run):
     assert [r["window"] for r in retrains if r["segment"] == "development"] == [str(i) for i in range(run.dev.n_windows)]
     listed = list_runs(root)
     assert listed and listed[0]["run_id"] == s["run_id"] and listed[0]["holdout"] is True
+
+
+def test_holdout_guard_refuses_unvalidated_development(research_cfg, research_store, tmp_path):
+    run = ResearchRun(research_cfg, research_store, {"source": "synthetic"}, tmp_path, log=None, kind="synthetic",
+                      stages="walkforward,gates", open_holdout=True)
+    s = run.execute()
+    assert "holdout" in s["stages"] and "holdout" in s["stages_completed"]
+    assert "holdout" not in s and s["holdout_refused"]["development_classification"] == "EXPERIMENTAL"
+    assert not (tmp_path / "holdout_access.jsonl").exists()
+    assert run.hold is None
+
+
+def test_plan_schedule(research_cfg):
+    from trading_bot.research.walkforward import plan_schedule
+
+    p = plan_schedule(research_cfg, 2800)
+    assert p["windows"] == 3 and p["min_windows"] == 20 and not p["meets_min_windows"]
+    assert p["bars_needed_for_min_windows"] == int(np.ceil((1400 + 20 * 250) / 0.8))
+    big = plan_schedule(research_cfg, p["bars_needed_for_min_windows"])
+    assert big["meets_min_windows"] and big["windows"] >= 20
 
 
 def test_reproduce_window_bit_for_bit(research_run):
@@ -370,6 +473,10 @@ def test_dashboard_research_api(research_run, tmp_path):
     detail = ctl.research_trade(s["run_id"], trades[0]["trade_id"])
     assert detail["trade"]["trade_id"] == trades[0]["trade_id"] and detail["decisions"] and detail["model"]["fitted_model_hash"]
     assert detail["decisions"][0]["row"] == int(detail["trade"]["entry_row"]) - 2
+    assert detail["chain"]["fill_price_is_next_bar_open"] and detail["chain"]["fill_bar"]["index"] == detail["chain"]["newest_bar_used"]["index"] + 1
+    ctl.update_settings({"data_source": "synthetic", "synthetic_bars": 3000})
+    plan = ctl.research_plan()
+    assert plan["n_bars"] == 3000 and "bars_needed_for_min_windows" in plan
     with pytest.raises(FileNotFoundError):
         ctl.research_summary("does_not_exist")
     with pytest.raises(ValueError):
@@ -395,6 +502,8 @@ def test_dashboard_research_api(research_run, tmp_path):
             assert exc.code == 404
         status, body = get("/api/status")
         assert json.loads(body)["research"]["phase"] == "idle"
+        status, body = get("/api/research/plan")
+        assert status == 200 and json.loads(body)["n_bars"] == 3000
     finally:
         server.shutdown()
         server.server_close()
