@@ -101,19 +101,21 @@ class OOSSeries:
     log_close: np.ndarray
     open_next: np.ndarray
     open_next2: np.ndarray
-    forecasts: dict[str, dict[str, np.ndarray]]      # variant -> {"E", "M", "P"}
+    forecasts: dict[str, dict[str, np.ndarray]]      # variant -> {"E", "M", "P", "adverse", "unc"}
+    stress_p: Optional[np.ndarray] = None            # filtered stress-regime probability per row (0 without REGIME)
 
     def __len__(self) -> int:
         return len(self.bar_index)
 
-    def sim_inputs(self, variant: str = "full", E: np.ndarray | None = None) -> SimInputs:
+    def sim_inputs(self, variant: str = "full", E: np.ndarray | None = None, adverse: np.ndarray | None = None) -> SimInputs:
         f = self.forecasts[variant]
+        adv = f.get("adverse") if adverse is None else adverse
         return SimInputs(E=np.asarray(f["E"] if E is None else E, dtype=float), y_norm=self.y_norm, sigma=self.sigma,
                          sigma_ref=self.sigma_ref, cost_roundtrip=self.cost_roundtrip, cost_side_exec=self.cost_side_exec,
                          log_close=self.log_close, open_next=self.open_next, open_next2=self.open_next2,
                          M=f["M"], P=f["P"], session_ids=self.session_ids, window_ids=self.window_ids,
                          timestamps=list(self.decision_at), exec_timestamps=list(self.execution_at),
-                         model_ids=list(self.model_ids))
+                         model_ids=list(self.model_ids), adverse=adv, uncertainty=f.get("unc"), stress_p=self.stress_p)
 
     def subset(self, mask: np.ndarray) -> "OOSSeries":
         idx = np.flatnonzero(mask)
@@ -122,7 +124,8 @@ class OOSSeries:
                          pick(self.decision_at), pick(self.feature_available_at), pick(self.execution_at),
                          self.y_norm[idx], self.y_raw[idx], self.sigma[idx], self.sigma_ref[idx], self.cost_roundtrip[idx],
                          self.cost_side_exec[idx], self.log_close[idx], self.open_next[idx], self.open_next2[idx],
-                         {v: {k: a[idx] for k, a in f.items()} for v, f in self.forecasts.items()})
+                         {v: {k: a[idx] for k, a in f.items()} for v, f in self.forecasts.items()},
+                         self.stress_p[idx] if self.stress_p is not None else None)
 
     @staticmethod
     def concat(parts: list["OOSSeries"]) -> "OOSSeries":
@@ -132,11 +135,13 @@ class OOSSeries:
         cat = lambda name: np.concatenate([getattr(p, name) for p in parts])  # noqa: E731
         lst = lambda name: [x for p in parts for x in getattr(p, name)]  # noqa: E731
         variants = parts[0].forecasts.keys()
+        keys = list(parts[0].forecasts[next(iter(variants))].keys())
         return OOSSeries(cat("bar_index"), cat("window_ids"), cat("session_ids"), lst("model_ids"), lst("decision_at"),
                          lst("feature_available_at"), lst("execution_at"), cat("y_norm"), cat("y_raw"), cat("sigma"),
                          cat("sigma_ref"), cat("cost_roundtrip"), cat("cost_side_exec"), cat("log_close"), cat("open_next"),
                          cat("open_next2"),
-                         {v: {k: np.concatenate([p.forecasts[v][k] for p in parts]) for k in ("E", "M", "P")} for v in variants})
+                         {v: {k: np.concatenate([p.forecasts[v][k] for p in parts]) for k in keys} for v in variants},
+                         np.concatenate([p.stress_p if p.stress_p is not None else np.zeros(len(p)) for p in parts]))
 
 
 @dataclass
@@ -193,9 +198,11 @@ def window_statistics(sim: SimResult, window_ids: np.ndarray, bars_per_year: int
 
 class WalkForwardRunner:
     def __init__(self, cfg: FrozenConfig, store: BarStore, trainer: ModelTrainer | None = None,
-                 log: Callable[[str], None] | None = None, deploy_policy: str | None = None):
+                 log: Callable[[str], None] | None = None, deploy_policy: str | None = None,
+                 context: dict[str, BarStore] | None = None):
         self.cfg = cfg
         self.store = store
+        self.context = dict(context or {})            # cross-asset stores (joined as-of; sliced per window by the trainer)
         self.log = log or (lambda *_: None)
         self.calendar = SessionCalendar.from_config(cfg)
         r = cfg.get("research", {}) or {}
@@ -259,18 +266,19 @@ class WalkForwardRunner:
             fe.set_adaptive_d(prev)
         return int(lead + self.trainer.builder.vol_reference_bars + 5)
 
-    def _oos_dataset(self, w: Window, d: float, cache: dict, store: BarStore | None = None):
+    def _oos_dataset(self, w: Window, d: float, cache: dict, store: BarStore | None = None, components=None):
         """Dataset over the OOS block (plus warm-up history before it and the label bars after it)
-        built with the feature definition ``d``; returns (dataset, row mask of the OOS block, offset).
-        ``store`` overrides the runner's history (used by the forward-mutation leakage check)."""
-        key = round(float(d), 10)
+        built with the feature definition ``d`` and the fitted ``components`` of the model that will
+        read it; returns (dataset, row mask of the OOS block, offset).  ``store`` overrides the
+        runner's history (used by the forward-mutation leakage check)."""
+        key = (round(float(d), 10), components.key if components is not None else "")
         if key in cache:
             return cache[key]
         store = self.store if store is None else store
         start = max(0, w.train_end - self._lead_bars(d))
         end = min(len(store), w.oos_end + self.horizon + 1)
         ext = store.slice(start, end)
-        ds = self.trainer.builder.build(ext, float(d))
+        ds = self.trainer.builder.build(ext, float(d), components=components, context=self.context or None)
         global_idx = ds.bar_index + start
         mask = (global_idx >= w.train_end) & (global_idx < w.oos_end)
         cache[key] = (ds, mask, start)
@@ -279,7 +287,19 @@ class WalkForwardRunner:
     def _forecast(self, model: CombinedModel, ds, mask: np.ndarray) -> dict[str, np.ndarray]:
         X = ds.columns(model.feature_names)[mask]
         out = model.predict_arrays(X)
-        return {"E": out["E"], "M": out["M"], "P": out["P"]}
+        res = {"E": out["E"], "M": out["M"], "P": out["P"]}
+        ex = getattr(model, "execution_model", None)
+        n = int(mask.sum())
+        if ex is not None and ex.fitted and ds.x_exec is not None:
+            abs_er = np.abs(out["E"]) * ds.sigma[mask] * math.sqrt(self.horizon)
+            adv = np.maximum(ex.predict(ds.x_exec[mask], abs_er, np.abs(2.0 * out["P"] - 1.0), np.sign(out["E"])),
+                             self.trainer.adverse_floor)
+            res["adverse"] = adv
+            res["unc"] = np.full(n, self.trainer.uncertainty_z * ex.residual_std)
+        else:
+            res["adverse"] = np.zeros(n)
+            res["unc"] = np.zeros(n)
+        return res
 
     def _series_for_window(self, w: Window, ds, mask: np.ndarray, offset: int, forecasts: dict[str, dict[str, np.ndarray]],
                            model_id: str) -> OOSSeries:
@@ -296,10 +316,11 @@ class WalkForwardRunner:
         return OOSSeries(bar_idx, np.full(len(rows), w.index, dtype=int), np.zeros(len(rows), dtype=int),
                          [model_id] * len(rows), decision_at, feature_available_at, execution_at,
                          ds.y_norm[rows], ds.y_raw[rows], ds.sigma[rows], ds.sigma_ref[rows], ds.cost_roundtrip[rows],
-                         ds.cost_side_exec[rows], ds.log_close[rows], ds.open_next[rows], ds.open_next2[rows], forecasts)
+                         ds.cost_side_exec[rows], ds.log_close[rows], ds.open_next[rows], ds.open_next2[rows], forecasts,
+                         ds.stress_p[rows] if ds.stress_p is not None else np.zeros(len(rows)))
 
     def _flat_forecast(self, n: int) -> dict[str, np.ndarray]:
-        return {"E": np.zeros(n), "M": np.zeros(n), "P": np.full(n, 0.5)}
+        return {"E": np.zeros(n), "M": np.zeros(n), "P": np.full(n, 0.5), "adverse": np.zeros(n), "unc": np.zeros(n)}
 
     def run_windows(self, windows: list[Window] | tuple[Window, ...], label: str = "development",
                     carry: tuple[Optional[CombinedModel], Optional[CombinedModel], Optional[CombinedModel]] | None = None,
@@ -312,7 +333,7 @@ class WalkForwardRunner:
             tw = time.time()
             history = self.store.slice(w.train_start, w.train_end)
             self.log(f"[{label}] window {w.index}: train bars {w.train_start}-{w.train_end}, OOS {w.train_end}-{w.oos_end}")
-            report: TrainingReport = self.trainer.retrain(history, self.log)
+            report: TrainingReport = self.trainer.retrain(history, self.log, context=self.context or None)
             carried = report.model is None
             model = report.model if report.model is not None else model_prev
             base = report.baseline_model if report.baseline_model is not None else base_prev
@@ -321,11 +342,11 @@ class WalkForwardRunner:
             # OOS forecasts with the fitted models (features rebuilt with each model's own d)
             cache: dict = {}
             ref_d = model.d_star if model is not None else self.trainer.fe.adaptive_d
-            ds, mask, offset = self._oos_dataset(w, ref_d, cache)
+            ds, mask, offset = self._oos_dataset(w, ref_d, cache, components=getattr(model, "components", None))
             n = int(mask.sum())
             forecasts = {"full": self._forecast(model, ds, mask) if model is not None else self._flat_forecast(n)}
             if base is not None:
-                ds_b, mask_b, _ = self._oos_dataset(w, base.d_star, cache)
+                ds_b, mask_b, _ = self._oos_dataset(w, base.d_star, cache, components=getattr(base, "components", None))
                 forecasts["baseline"] = self._forecast(base, ds_b, mask_b)
             else:
                 forecasts["baseline"] = self._flat_forecast(n)
@@ -334,7 +355,7 @@ class WalkForwardRunner:
             elif deployed is model:
                 forecasts["production"] = {k: v.copy() for k, v in forecasts["full"].items()}
             else:
-                ds_p, mask_p, _ = self._oos_dataset(w, deployed.d_star, cache)
+                ds_p, mask_p, _ = self._oos_dataset(w, deployed.d_star, cache, components=getattr(deployed, "components", None))
                 forecasts["production"] = self._forecast(deployed, ds_p, mask_p)
             model_id = model.version if model is not None else "none"
             series = self._series_for_window(w, ds, mask, offset, forecasts, model_id)
@@ -452,9 +473,9 @@ class WalkForwardRunner:
         if report.model is None or wr.model is None:
             return {"window": w.index, "identical": report.model is None and wr.model is None,
                     "reason": "no model" if report.model is None else "reference had no model"}
-        ds, mask, _ = self._oos_dataset(w, report.model.d_star, {})
+        ds, mask, _ = self._oos_dataset(w, report.model.d_star, {}, components=getattr(report.model, "components", None))
         E_new = self._forecast(report.model, ds, mask)["E"]
-        ds0, mask0, _ = self._oos_dataset(w, wr.model.d_star, {})
+        ds0, mask0, _ = self._oos_dataset(w, wr.model.d_star, {}, components=getattr(wr.model, "components", None))
         E_old = self._forecast(wr.model, ds0, mask0)["E"]
         same_hash = fitted_model_hash(report.model) == wr.fitted_model_hash
         same_E = len(E_new) == len(E_old) and bool(np.array_equal(E_new, E_old))

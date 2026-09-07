@@ -14,7 +14,8 @@ from typing import Any
 import numpy as np
 
 from ..risk.limits import apply_position_rules, stop_triggered
-from ..strategy.sizing import (confidence_from_edge, direction_from_edge, raw_exposure, volatility_multiplier)
+from ..strategy.policy import DecisionPolicy
+from ..strategy.sizing import raw_exposure, volatility_multiplier
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class SimulationParams:
     drawdown_reference: float = 0.10
     eps: float = 1e-12
     reevaluate_every: int = 1
+    policy: DecisionPolicy = field(default_factory=lambda: DecisionPolicy(mode="legacy"))
 
     @classmethod
     def from_config(cls, cfg) -> "SimulationParams":
@@ -84,7 +86,8 @@ class SimulationParams:
                    turnover_weight=float(cfg.training.score.turnover_weight),
                    drawdown_weight=float(cfg.training.score.drawdown_weight),
                    drawdown_reference=float(cfg.training.score.drawdown_reference), eps=float(cfg.features.epsilon),
-                   reevaluate_every=int(cfg.signal.get("reevaluate_every_bars", 1)))
+                   reevaluate_every=int(cfg.signal.get("reevaluate_every_bars", 1)),
+                   policy=DecisionPolicy.from_config(cfg))
 
 
 def max_drawdown(equity: np.ndarray) -> float:
@@ -98,9 +101,15 @@ def max_drawdown(equity: np.ndarray) -> float:
 def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, sigma_ref: np.ndarray,
                         cost_roundtrip: np.ndarray, cost_side_exec: np.ndarray, log_close: np.ndarray,
                         open_next: np.ndarray, open_next2: np.ndarray, params: SimulationParams,
-                        M: np.ndarray | None = None) -> ValidationMetrics:
+                        M: np.ndarray | None = None, adverse: np.ndarray | None = None,
+                        uncertainty: np.ndarray | None = None, stress_p: np.ndarray | None = None) -> ValidationMetrics:
     n = len(E)
     H = params.horizon
+    policy = params.policy
+    # legacy-mode policies built from SimulationParams keep the params' multipliers (tests construct them directly)
+    if policy.cost_multiplier != params.cost_multiplier or policy.confidence_cost_multiplier != params.confidence_cost_multiplier:
+        policy = DecisionPolicy(policy.mode, params.cost_multiplier, params.confidence_cost_multiplier, policy.minimum_net_edge,
+                                policy.uncertainty_buffer, policy.fee_roundtrip, policy.regime, params.eps)
     q_cur = 0.0
     holding = 0
     entry_price = math.nan
@@ -129,12 +138,15 @@ def simulate_validation(E: np.ndarray, y_norm: np.ndarray, sigma: np.ndarray, si
             pos_ret = entry_dir * (log_close[i] - math.log(entry_price))
             stop_hit = stop_triggered(pos_ret, entry_sigma, H, params.stop_sigma_multiple)
         er = E[i] * sigma[i] * math.sqrt(H)
-        direction = direction_from_edge(er, cost_roundtrip[i], params.cost_multiplier)
+        dec = policy.decide(er, cost_roundtrip[i], 0.0, adverse[i] if adverse is not None else 0.0,
+                            uncertainty[i] if uncertainty is not None else 0.0,
+                            stress_p[i] if stress_p is not None else math.nan, fees=policy.extra_fee)
+        direction = dec.direction
         if direction:
             n_signals += 1
-            conf = confidence_from_edge(er, cost_roundtrip[i], params.confidence_cost_multiplier, params.eps)
+            conf = dec.confidence
             vm = volatility_multiplier(sigma_ref[i], sigma[i], params.vol_multiplier_min, params.vol_multiplier_max)
-            q_raw = raw_exposure(direction, conf, vm, params.max_abs_exposure)
+            q_raw = raw_exposure(direction, conf, vm, params.max_abs_exposure * dec.exposure_cap_multiplier)
         else:
             q_raw = 0.0
         rule = apply_position_rules(q_raw, q_cur, holding, params.max_holding_bars, stop_hit, params.rebalance_threshold,

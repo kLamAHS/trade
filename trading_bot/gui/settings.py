@@ -34,10 +34,11 @@ class GuiSettings:
     initial_capital: float = 100000.0
     overrides: str = ""               # one "dotted.key=value" per line
     config_path: str = ""             # optional alternative strategy YAML
+    context_paths: str = ""           # cross-asset context histories, one "SYMBOL=path.csv" per line (CSV data source)
 
     PUBLIC_FIELDS = ("api_key", "symbol", "mode", "data_source", "csv_path", "synthetic_bars", "synthetic_seed",
                      "fast", "mirror_orders", "history_days", "artifacts_dir", "initial_capital",
-                     "overrides", "config_path")
+                     "overrides", "config_path", "context_paths")
 
     # ------------------------------------------------------------ persistence
     @classmethod
@@ -109,6 +110,18 @@ class GuiSettings:
             os.environ["APCA_API_KEY_ID"] = self.api_key
         if self.secret_key:
             os.environ["APCA_API_SECRET_KEY"] = self.secret_key
+
+    def context_files(self) -> dict[str, str]:
+        """``SYMBOL=path.csv`` lines of ``context_paths`` -> {SYMBOL: path}."""
+        out: dict[str, str] = {}
+        for line in (self.context_paths or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            sym, path = line.split("=", 1)
+            if sym.strip() and path.strip():
+                out[sym.strip().upper()] = path.strip()
+        return out
 
     def override_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}

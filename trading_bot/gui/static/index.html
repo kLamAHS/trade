@@ -152,6 +152,8 @@
           <button type="button" id="btnDownload" title="download 30-minute history from Alpaca into this CSV">Download</button>
         </div>
         <div id="downloadHint" class="hint"></div>
+        <label for="context_paths">Context CSVs (cross-asset instruments, <code>SYMBOL=path.csv</code> per line; synthetic runs generate them)</label>
+        <textarea id="context_paths" style="min-height:48px" placeholder="QQQ=artifacts/data/QQQ_30m.csv&#10;IWM=artifacts/data/IWM_30m.csv"></textarea>
       </div>
       <div class="row">
         <div><label for="history_days">History days (Alpaca)</label><input type="number" id="history_days" value="1200" min="200" step="50"></div>
@@ -168,6 +170,26 @@
     <section class="card">
       <h2>Last decision</h2>
       <div id="decision" class="kv"><div class="muted">no bar processed yet</div><div></div></div>
+    </section>
+
+    <section class="card">
+      <h2>Expected edge</h2>
+      <div class="chart-wrap"><canvas id="edgeChart" class="small" width="360" height="170"></canvas></div>
+      <div id="edgeText" class="kv" style="margin-top:8px"><div class="muted">no decision yet</div><div></div></div>
+      <div class="hint">Gross forecast minus spread, slippage, adverse selection, fees and the uncertainty buffer. The bot trades only when the remainder clears the minimum net edge (abstaining is a decision, not a failure).</div>
+    </section>
+
+    <section class="card">
+      <h2>Market intelligence</h2>
+      <div id="marketPanel" class="kv"><div class="muted">no features yet</div><div></div></div>
+      <div class="hint">Descriptive state only (regime probabilities are filtered, never smoothed). It explains the sizing, it is not a causal claim.</div>
+    </section>
+
+    <section class="card">
+      <h2>Execution: expected vs realised</h2>
+      <div id="execPanel" class="kv"><div class="muted">no fills yet</div><div></div></div>
+      <div class="scroll" style="max-height:170px;margin-top:8px"><table id="execCalib"><thead><tr><th>Bucket</th><th>n</th><th>Pred. bp</th><th>Real. bp</th></tr></thead><tbody></tbody></table></div>
+      <div class="hint">Per fill, in bps of notional: spread, slippage and the post-fill adverse move beyond the forecast (h = 1 bar). In paper mode this is the primary execution diagnostic.</div>
     </section>
   </div>
 
@@ -281,6 +303,19 @@
     </section>
 
     <section class="card">
+      <h2>Feature families: OOS ΔSharpe and verdicts</h2>
+      <div class="chart-wrap"><canvas id="vFamilies" class="small" width="900" height="150"></canvas></div>
+      <div class="scroll" style="max-height:300px;margin-top:8px"><table id="vFamilyTable"><thead><tr><th>Family</th><th>Verdict</th><th>ΔSharpe marginal</th><th>ΔSharpe additive</th><th>Median window Δ</th><th>Positive windows</th><th>+1 latency</th><th>2× cost</th><th>Sabotage removes</th><th>Params</th><th>Data</th></tr></thead><tbody></tbody></table></div>
+      <div id="vFamilyNote" class="hint">Every optional family must earn its complexity: marginal = Full − (Full − F), additive = (Base + F) − Base, light refits per window. Sabotaged inputs (shuffle / freeze / flip / delay / remove) must destroy the benefit.</div>
+    </section>
+
+    <section class="card">
+      <h2>Execution stress: adaptive, frozen decisions, delay</h2>
+      <div class="scroll" style="max-height:260px"><table id="vExecStress"><thead><tr><th>Mode</th><th>Level</th><th>Sharpe</th><th>Return</th><th>Trades</th><th>Signals = ref</th></tr></thead><tbody></tbody></table></div>
+      <div id="vExecNote" class="hint"></div>
+    </section>
+
+    <section class="card">
       <h2>Acceptance gates</h2>
       <div class="scroll" style="max-height:420px"><table id="vGates"><thead><tr><th>Gate</th><th>Group</th><th>Value</th><th>Threshold</th><th>Result</th><th>Evidence</th></tr></thead><tbody></tbody></table></div>
     </section>
@@ -315,7 +350,7 @@
 <script>
 (function () {
   const $ = (id) => document.getElementById(id);
-  const fields = ["api_key", "symbol", "mode", "data_source", "csv_path", "synthetic_bars", "history_days", "initial_capital", "overrides", "fast", "mirror_orders"];
+  const fields = ["api_key", "symbol", "mode", "data_source", "csv_path", "context_paths", "synthetic_bars", "history_days", "initial_capital", "overrides", "fast", "mirror_orders"];
   let logSeq = 0, lastStatus = null, equityTableOpen = false;
 
   const fmtMoney = (v) => (v == null || isNaN(v)) ? "–" : v.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
@@ -495,6 +530,7 @@
     const flags = []; if (b.risk.data_halted) flags.push("⛔ DATA_HALTED"); if (b.risk.drawdown_halted) flags.push("⛔ drawdown halt (until an accepted retrain)"); if (b.risk.daily_halt) flags.push("⛔ daily loss halt (rest of session)"); if (b.risk.ablation_halted) flags.push("⛔ FRACTIONAL_EDGE_NOT_DETECTED"); if (b.risk.ablation_failures) flags.push("⚠ " + b.risk.ablation_failures + " consecutive non-positive ΔS");
     $("riskFlags").textContent = flags.join("   ");
     drawEquity(b.equity_curve); drawDelta(b.fractional_contribution); renderEquityTable(st);
+    renderEdge(b.last_decision); renderMarket(b.last_decision); renderExecution(b);
     const d = b.last_decision, kv = $("decision"); kv.innerHTML = "";
     if (d) {
       const add = (k, v) => { const a = document.createElement("div"); a.textContent = k; const c = document.createElement("div"); c.textContent = v; kv.appendChild(a); kv.appendChild(c); };
@@ -554,7 +590,7 @@
         (p.meets_min_windows ? `That meets the ${p.min_windows}-window gate.` : `The ${p.min_windows}-window gate needs about ${p.bars_needed_for_min_windows.toLocaleString()} bars (${p.sessions_needed_for_min_windows.toLocaleString()} sessions).`);
     } catch (e) { $("vPlan").textContent = "schedule preview unavailable: " + e.message; }
   }
-  ["synthetic_bars", "csv_path", "data_source", "fast", "overrides"].forEach(id => $(id).addEventListener("change", () => { if ($("tabValidation").style.display !== "none") loadPlan(); }));
+  ["synthetic_bars", "csv_path", "context_paths", "data_source", "fast", "overrides"].forEach(id => $(id).addEventListener("change", () => { if ($("tabValidation").style.display !== "none") loadPlan(); }));
 
   function renderResearchStatus(r) {
     if (!r) return;
@@ -678,6 +714,26 @@
   });
   $("vDelta").addEventListener("pointerleave", () => { $("vDeltaTip").style.display = "none"; });
 
+  function renderFamilies(s) {
+    const fam = s.families || {}; const attr = fam.attribution_delta_sharpe || {}; const names = Object.keys(attr);
+    const canvas = $("vFamilies"), g = setupCanvas(canvas);
+    if (g) { const { ctx, w, h } = g; ctx.clearRect(0, 0, w, h); const pad = { l: 48, r: 12, t: 10, b: 20 };
+      if (!names.length) { ctx.fillStyle = css("--text-muted"); ctx.font = "12px system-ui"; ctx.fillText("no optional feature family enabled (families stage not run)", pad.l, h / 2); }
+      else { const vals = names.map(n => attr[n] || 0); const m = Math.max(0.5, ...vals.map(Math.abs)) * 1.15; const y = (v) => pad.t + (h - pad.t - pad.b) * (1 - (v + m) / (2 * m)); const slot = (w - pad.l - pad.r) / names.length; const bw = Math.min(60, slot - 10);
+        ctx.strokeStyle = css("--grid"); ctx.fillStyle = css("--text-muted"); ctx.font = "11px system-ui"; ctx.textAlign = "right"; for (const t of [-m / 1.15, 0, m / 1.15]) { const yy = Math.round(y(t)) + 0.5; ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(w - pad.r, yy); ctx.stroke(); ctx.fillText(t.toFixed(1), pad.l - 6, yy + 4); }
+        names.forEach((n, i) => { const v = attr[n] || 0, x0 = pad.l + slot * i + (slot - bw) / 2; ctx.fillStyle = v >= 0 ? css("--pos") : css("--neg"); ctx.fillRect(x0, y(Math.max(v, 0)), bw, Math.max(1, Math.abs(y(v) - y(0)))); ctx.fillStyle = css("--text-secondary"); ctx.textAlign = "center"; ctx.fillText(n.replace("_", " "), x0 + bw / 2, h - 6); ctx.fillText((v >= 0 ? "+" : "") + v.toFixed(2), x0 + bw / 2, y(Math.max(v, 0)) - 4); }); } }
+    const gates = fam.gates || {}, mat = (fam.matrix || {}).families || {}, budget = {}; (fam.complexity_budget || []).forEach(b => { budget[b.family] = b; });
+    tableRows("vFamilyTable", names.map(n => { const gt = gates[n] || {}, ch = gt.checks || {}, mg = (mat[n] || {}).marginal || {}, ad = (mat[n] || {}).additive || {}, bd = budget[n] || {};
+      return { cells: [n, { text: gt.status || "–", cls: gt.status === "ACCEPTED" ? "gate-pass" : (gt.status ? "gate-fail" : "gate-na") }, fmtSh(mg.delta_sharpe), fmtSh(ad.delta_sharpe), fmtSh(mg.median_window_delta_sharpe), mg.positive_window_fraction == null ? "–" : fmtPct(mg.positive_window_fraction, 0).replace("+", ""), ch.survives_plus_1_latency == null ? "–" : (ch.survives_plus_1_latency ? "yes" : "no"), ch.survives_2x_cost == null ? "–" : (ch.survives_2x_cost ? "yes" : "no"), ch.sabotage_removes_benefit == null ? "–" : (ch.sabotage_removes_benefit ? "yes" : "NO"), bd.n_parameters == null ? "–" : bd.n_parameters + " (" + bd.n_features + " feat.)", bd.data_dependency || "–"] }; }));
+    const es = s.execution_stress; const rows = [];
+    if (es) { es.adaptive.forEach(r => rows.push({ cells: ["adaptive (strategy told)", "×" + r.multiplier, fmtSh(r.sharpe), { text: fmtPct(r.total_return, 1), cls: signClass(r.total_return) }, r.trade_count, "–"] }));
+      es.frozen.forEach(r => rows.push({ cells: ["frozen decisions", "×" + r.multiplier, fmtSh(r.sharpe), { text: fmtPct(r.total_return, 1), cls: signClass(r.total_return) }, r.trade_count, r.signals_equal_reference ? "yes" : "no"] }));
+      es.delay.forEach(r => rows.push({ cells: ["execution delay", "+" + r.delay + " bar", fmtSh(r.sharpe), { text: fmtPct(r.total_return, 1), cls: signClass(r.total_return) }, r.trade_count, "–"] }));
+      $("vExecNote").textContent = `frozen-decision break-even cost multiplier ×${es.frozen_breakeven_multiplier == null ? "–" : (es.frozen_breakeven_multiplier === "inf" ? ">3" : Number(es.frozen_breakeven_multiplier).toFixed(2))} · survives 2× frozen: ${es.frozen_survives_2x ? "yes" : "no"} · survives +1 bar: ${es.delay_survives_plus_1 ? "yes" : "no"} · +2 bars: ${es.delay_survives_plus_2 ? "yes" : "no"}`; }
+    else $("vExecNote").textContent = "";
+    tableRows("vExecStress", rows);
+  }
+
   function renderValidation(s) {
     const dev = s.development || {}; const m = (dev.metrics || {}).full || {}; const g = s.gates || {}; const synthetic = s.kind === "synthetic";
     const banner = $("vBanner"); banner.style.display = ""; banner.className = "banner " + (synthetic ? "synthetic" : "real"); banner.textContent = (synthetic ? "⚠ " : "") + (s.evidence_label || "");
@@ -701,6 +757,7 @@
     const a = s.ablation || {};
     const vd = $("vVerdict"); if (a.verdict) { vd.innerHTML = ""; const b = document.createElement("b"); b.textContent = "Fractional value-add: " + a.verdict; b.className = a.verdict === "DEMONSTRATED" ? "gate-pass" : (a.verdict === "SUGGESTIVE" ? "warn" : "gate-fail"); vd.appendChild(b); vd.appendChild(document.createTextNode(" — " + a.verdict_text)); } else vd.textContent = "";
     kv("vAblation", a.cycles == null ? [["ablation", "not run"]] : [["cycles", a.cycles], ["positive cycles (fractional / baseline)", a.positive_cycles_full + " / " + a.positive_cycles_baseline], ["ΔSharpe mean / median / trimmed", fmtSh(a.mean_delta_sharpe) + " / " + fmtSh(a.median_delta_sharpe) + " / " + fmtSh(a.trimmed_mean_delta_sharpe)], ["mean ΔSharpe without the best window", fmtSh(a.mean_delta_sharpe_excluding_best_window) + (a.best_window ? " (window " + a.best_window.window + " contributes " + fmtSh(a.best_window.delta_sharpe) + ")" : "")], ["fractional beats baseline", fmtPct(a.positive_delta_fraction, 0).replace("+", "") + " of windows"], ["bootstrap CI of mean ΔSharpe", a.delta_sharpe_ci ? "[" + fmtSh(a.delta_sharpe_ci[0]) + ", " + fmtSh(a.delta_sharpe_ci[1]) + "]" : "–"], ["OOS Sharpe fractional / baseline", fmtSh((a.oos_full || {}).sharpe) + " / " + fmtSh((a.oos_baseline || {}).sharpe)], ["Δ max drawdown / Δ return", fmtPct(a.delta_max_drawdown, 1) + " / " + fmtPct(a.delta_total_return, 1)], ["trainer holdout ΔS (mean, positive)", fmtSh((a.trainer_holdout_delta || {}).mean) + ", " + fmtPct((a.trainer_holdout_delta || {}).positive_fraction, 0).replace("+", "")]]);
+    renderFamilies(s);
     tableRows("vGates", (g.gates || []).map(r => ({ cells: [r.gate, r.group, typeof r.value === "number" ? (Number.isInteger(r.value) ? r.value : r.value.toFixed(3)) : String(r.value), r.op + " " + r.threshold, { text: r.passed === true ? "PASS" : (r.passed === false ? "FAIL" : "n/a"), cls: r.passed === true ? "gate-pass" : (r.passed === false ? "gate-fail" : "gate-na") }, r.evidence || ""] })));
     const cc = s.cost_curve || {}; tableRows("vCost", (cc.rows || []).map(r => ({ cells: [r.label, r.decisions_frozen ? "frozen" : (r.family === "assumed" ? "re-decided (fill cost unchanged)" : "re-decided"), fmtSh(r.sharpe), { text: fmtPct(r.total_return, 1), cls: signClass(r.total_return) }, r.profit_factor === "inf" ? "∞" : fmtSh(r.profit_factor), r.trade_count] })));
     $("vCostNote").textContent = cc.rows ? `mean model round trip ${fmtNum(cc.mean_model_roundtrip_bps, 2)} bps · decisions frozen: break-even flat cost ${cc.breakeven_flat_bps == null ? "–" : (cc.breakeven_flat_bps === "inf" || cc.breakeven_flat_bps === Infinity ? "> tested range" : fmtNum(cc.breakeven_flat_bps, 1) + " bps")}, profitable at 2× realised cost: ${cc.profitable_at_2x_cost ? "yes" : "no"} · joint (strategy told 2×): ${cc.profitable_at_2x_joint_cost ? "profitable" : "not profitable"}` : "";
@@ -746,6 +803,47 @@
       tbl.appendChild(tb); const wrap = document.createElement("div"); wrap.className = "scroll"; wrap.style.marginTop = "10px"; wrap.appendChild(tbl); el.appendChild(wrap);
       if (r.fills.length) { const f = document.createElement("div"); f.className = "hint"; f.textContent = "fills: " + r.fills.map(x => x.side + " " + fmtNum(x.quantity_exposure, 2) + " @ " + fmtNum(x.price, 2) + " (" + x.status + ", +" + x.delay_bars + " bar)").join(" · "); el.appendChild(f); }
     } catch (e) { note("vStatus", "cannot load trade: " + e.message, "bad"); }
+  }
+
+  // ---------------------------------------------- market-state panels
+  function renderEdge(d) {
+    const canvas = $("edgeChart"), g = setupCanvas(canvas); const el = $("edgeText");
+    if (!g) return; const { ctx, w, h } = g; ctx.clearRect(0, 0, w, h);
+    const ex = d && d.execution; if (!ex || ex.gross_bps == null) { ctx.fillStyle = css("--text-muted"); ctx.font = "12px system-ui"; ctx.fillText("no forecast yet", 12, h / 2); el.innerHTML = '<div class="muted">no decision yet</div><div></div>'; return; }
+    const steps = [["gross", Math.abs(ex.gross_bps)], ["spread", -ex.spread_bps], ["slip.", -ex.slippage_bps], ["adverse", -ex.adverse_selection_bps], ["fees", -ex.fee_bps], ["uncert.", -ex.uncertainty_bps]];
+    const net = ex.net_edge_bps; const pad = { l: 8, r: 8, t: 8, b: 20 }; const n = steps.length + 1; const slot = (w - pad.l - pad.r) / n;
+    let run = 0, lo = Math.min(0, net), hi = Math.abs(ex.gross_bps); steps.forEach(s => { run += s[1]; lo = Math.min(lo, run); hi = Math.max(hi, run); }); if (hi - lo < 1e-9) hi = lo + 1;
+    const y = (v) => pad.t + (h - pad.t - pad.b) * (1 - (v - lo) / (hi - lo));
+    ctx.strokeStyle = css("--grid"); ctx.beginPath(); ctx.moveTo(pad.l, Math.round(y(0)) + 0.5); ctx.lineTo(w - pad.r, Math.round(y(0)) + 0.5); ctx.stroke();
+    run = 0; ctx.font = "10px system-ui"; ctx.textAlign = "center";
+    steps.forEach((s, i) => { const from = run, to = run + s[1]; const x0 = pad.l + slot * i + 4, bw = slot - 8; ctx.fillStyle = s[1] >= 0 ? css("--pos") : css("--neg"); ctx.fillRect(x0, y(Math.max(from, to)), bw, Math.max(1, Math.abs(y(from) - y(to)))); ctx.fillStyle = css("--text-muted"); ctx.fillText(s[0], x0 + bw / 2, h - 6); run = to; });
+    const x0 = pad.l + slot * steps.length + 4, bw = slot - 8; ctx.fillStyle = net > 0 ? css("--good") : css("--critical"); ctx.fillRect(x0, y(Math.max(net, 0)), bw, Math.max(1, Math.abs(y(net) - y(0)))); ctx.fillStyle = css("--text-muted"); ctx.fillText("net", x0 + bw / 2, h - 6);
+    el.innerHTML = ""; const add = (k, v) => { const a = document.createElement("div"); a.textContent = k; const c = document.createElement("div"); c.textContent = v; el.appendChild(a); el.appendChild(c); };
+    add("gross predicted edge", Number(Math.abs(ex.gross_bps)).toFixed(1) + " bp (" + (ex.gross_bps > 0 ? "long" : (ex.gross_bps < 0 ? "short" : "flat")) + ")"); add("spread / slippage", "−" + Number(ex.spread_bps).toFixed(1) + " / −" + Number(ex.slippage_bps).toFixed(1) + " bp");
+    add("adverse selection", "−" + Number(ex.adverse_selection_bps).toFixed(1) + " bp (" + ex.adverse_selection_source + ")"); add("fees / uncertainty", "−" + Number(ex.fee_bps).toFixed(1) + " / −" + Number(ex.uncertainty_bps).toFixed(1) + " bp");
+    add("expected net edge", (net >= 0 ? "+" : "") + Number(net).toFixed(1) + " bp"); if (d.policy) add("policy", (d.policy.trade ? "TRADE" : "ABSTAIN") + " · required " + fmtNum(d.policy.required_edge_bps, 1) + " bp" + (d.policy.abstain_reason ? " · " + d.policy.abstain_reason : "") + (d.policy.exposure_multiplier < 1 ? " · regime cap ×" + d.policy.exposure_multiplier : ""));
+  }
+  function renderMarket(d) {
+    const el = $("marketPanel"); const m = d && d.market; if (!m) { el.innerHTML = '<div class="muted">no features yet</div><div></div>'; return; }
+    el.innerHTML = ""; const add = (k, v) => { const a = document.createElement("div"); a.textContent = k; const c = document.createElement("div"); c.textContent = v; el.appendChild(a); el.appendChild(c); };
+    const fam = m.families || []; add("families", fam.length ? fam.join(", ") : "–");
+    const r = m.regime || {}; const probs = Object.values(r.probabilities || {});
+    if (probs.length) add("regime P(calm … stress)", probs.map(p => Math.round(100 * p) + "%").join(" / ") + " · entropy " + fmtNum(r.entropy, 2) + " · age " + (r.age == null ? "–" : r.age) + " bars" + (r.stress_p > 0.7 ? " · STRESS" : ""));
+    else add("regime", "HMM family off (conventional: trend " + fmtNum((m.conventional || {}).trend_state, 2) + ", vol ratio " + fmtNum((m.conventional || {}).volatility_state, 2) + ")");
+    const o = m.ofi || {}; add("OFI", o.zscore == null ? "unavailable (needs quote sizes, Tier B)" : (o.zscore >= 0 ? "+" : "") + fmtNum(o.zscore, 2) + "σ · quote imbalance " + Math.round(50 + 50 * (o.quote_imbalance || 0)) + "% bid");
+    const k = m.kalman || {}; add("Kalman innovation", k.innovation_z == null ? "off" : (k.innovation_z >= 0 ? "+" : "") + fmtNum(k.innovation_z, 2) + "σ · velocity " + fmtNum(k.velocity, 3));
+    const xa = Object.entries(m.cross_asset || {}); add("cross-asset", xa.length ? xa.map(([n, v]) => n.replace("xa_", "").replace("_rel_return_1", "").toUpperCase() + " " + (v >= 0 ? "leading +" : "lagging ") + fmtNum(v, 2) + "σ").join(" · ") : "off");
+    const l = m.liquidity || {}; add("liquidity", "spread " + (l.spread_rel == null ? "–" : (1e4 * l.spread_rel).toFixed(1) + " bp") + " · range z " + fmtNum(l.range_z, 2) + " · volume z " + fmtNum(l.volume_z, 2) + (l.vpin != null ? " · VPIN " + fmtNum(l.vpin, 2) : "") + ((l.range_z > 2 || (l.spread_rel || 0) > 5e-4) ? " · THIN" : " · normal"));
+  }
+  function renderExecution(b) {
+    const el = $("execPanel"); const ec = b.execution_calibration; const tb = $("execCalib").querySelector("tbody"); tb.innerHTML = "";
+    if (!ec || !ec.fills) { el.innerHTML = '<div class="muted">no fills yet</div><div></div>'; return; }
+    el.innerHTML = ""; const add = (k, v) => { const a = document.createElement("div"); a.textContent = k; const c = document.createElement("div"); c.textContent = v; el.appendChild(a); el.appendChild(c); };
+    const pair = (name, key) => add(name, "expected " + fmtNum(ec[key].expected.mean, 1) + " · realised " + fmtNum(ec[key].realised.mean, 1) + " bp (median " + fmtNum(ec[key].realised.median, 1) + ", P95 " + fmtNum(ec[key].realised.p95, 1) + ")");
+    add("fills", ec.fills + (b.policy ? " · policy " + b.policy.mode : "")); pair("spread", "spread_bps"); pair("slippage", "slippage_bps"); pair("adverse selection", "adverse_selection_bps"); pair("total cost", "total_bps");
+    add("prediction error", "mean " + fmtNum(ec.total_bps.error.mean, 1) + " · P90 " + fmtNum(ec.total_bps.error.p90, 1) + " · worst " + fmtNum(ec.total_bps.error.worst, 1) + " bp"); add("within modelled P95", fmtPct(ec.within_p95_fraction, 0).replace("+", "") + " of fills");
+    if (ec.decision_to_fill_bps) add("decision → fill drift", "mean " + fmtNum(ec.decision_to_fill_bps.mean, 1) + " bp");
+    for (const r of ec.calibration || []) { const tr = document.createElement("tr"); [r.predicted_bucket_bps + " bp", r.n, fmtNum(r.predicted_mean_bps, 1), fmtNum(r.realised_mean_bps, 1)].forEach(v => { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); }); tb.appendChild(tr); }
   }
 
   async function pollStatus() { try { const st = await api("/api/status"); render(st); renderResearchStatus(st.research); } catch (e) { $("phaseText").textContent = "dashboard unreachable: " + e.message; } }

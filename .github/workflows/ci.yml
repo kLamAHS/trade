@@ -53,3 +53,22 @@ jobs:
           assert s["gates"]["classification"] == "EXPERIMENTAL (SYNTHETIC)"
           print("research run ok:", s["run_id"], s["development"]["n_windows"], "windows")
           PY
+      - name: Market-state smoke run (hostile synthetic market, feature families, execution stress, family gates)
+        run: |
+          python -m trading_bot.main research --synthetic 2600 --seed 21 --hostile --memory-d 0.45 --amplitude 6 --symbol SYN --fast \
+            --stages walkforward,execution_stress,families,leakage,gates --quiet \
+            --set training.window_bars=1600 --set training.minimum_bars=1400 \
+            --set training.hyperparameter_grid.n_estimators=[40] --set models.regression.num_threads=2 \
+            --set features.regime.enabled=true --set features.ofi.enabled=true --set features.kalman.enabled=true \
+            --set features.cross_asset.enabled=true --set features.cross_asset.symbols=[QQQ] \
+            --set research.bootstrap.n_boot=100 --set research.families.n_boot=100 --artifacts /tmp/ci-market-state
+          python - <<'PY'
+          import glob, json
+          s = json.load(open(sorted(glob.glob("/tmp/ci-market-state/runs/syn_*/summary.json"))[-1]))
+          fam, es = s["families"], s["execution_stress"]
+          assert set(fam["present"]) >= {"FRACTIONAL", "REGIME", "OFI", "KALMAN", "CROSS_ASSET"}, fam["present"]
+          assert all(v in ("ACCEPTED", "REJECTED", "RESEARCH ONLY") for v in fam["verdict"].values()), fam["verdict"]
+          assert all(r["signals_equal_reference"] for r in es["frozen"]), es["frozen"]
+          assert s["leakage"]["passed"] and s["development"]["timestamp_audit"]["violations"] == 0
+          print("market-state run ok:", s["run_id"], fam["verdict"], "frozen break-even", es["frozen_breakeven_multiplier"])
+          PY

@@ -19,7 +19,8 @@ from ..types import Bar
 
 
 class BarStore:
-    COLUMNS = ("timestamp", "open", "high", "low", "close", "volume", "bid", "ask")
+    COLUMNS = ("timestamp", "open", "high", "low", "close", "volume", "bid", "ask", "bid_size", "ask_size", "end_time",
+               "dollar_volume", "trade_count", "vwap", "bar_kind")
 
     def __init__(self, instrument: str, bar_minutes: int = 30, bars: Iterable[Bar] | None = None):
         self.instrument = instrument
@@ -33,6 +34,8 @@ class BarStore:
         self._volume: list[float] = []
         self._bid: list[float] = []
         self._ask: list[float] = []
+        self._bid_size: list[float] = []
+        self._ask_size: list[float] = []
         if bars is not None:
             for b in bars:
                 self.append(b)
@@ -68,6 +71,8 @@ class BarStore:
         self._volume.append(bar.volume)
         self._bid.append(math.nan if bar.bid is None else bar.bid)
         self._ask.append(math.nan if bar.ask is None else bar.ask)
+        self._bid_size.append(math.nan if bar.bid_size is None else bar.bid_size)
+        self._ask_size.append(math.nan if bar.ask_size is None else bar.ask_size)
 
     def extend(self, bars: Iterable[Bar]) -> None:
         for b in bars:
@@ -87,8 +92,32 @@ class BarStore:
             "volume": np.asarray(self._volume[start:stop], dtype=float),
             "bid": np.asarray(self._bid[start:stop], dtype=float),
             "ask": np.asarray(self._ask[start:stop], dtype=float),
+            "bid_size": np.asarray(self._bid_size[start:stop], dtype=float),
+            "ask_size": np.asarray(self._ask_size[start:stop], dtype=float),
             "timestamp": np.asarray(self._ts[start:stop], dtype=object),
+            "duration": np.asarray([b.duration_seconds for b in self._bars[start:stop]], dtype=float),
         }
+
+    @property
+    def bar_kind(self) -> str:
+        return self._bars[0].bar_kind if self._bars else "time"
+
+    def has_quote_sizes(self, min_fraction: float = 0.9) -> bool:
+        """Tier B check: displayed bid/ask sizes present on at least ``min_fraction`` of the bars."""
+        if not self._bars:
+            return False
+        ok = sum(1 for b, a in zip(self._bid_size, self._ask_size) if math.isfinite(b) and math.isfinite(a))
+        return ok >= min_fraction * len(self._bars)
+
+    def has_quotes(self, min_fraction: float = 0.9) -> bool:
+        if not self._bars:
+            return False
+        ok = sum(1 for b, a in zip(self._bid, self._ask) if math.isfinite(b) and math.isfinite(a))
+        return ok >= min_fraction * len(self._bars)
+
+    def data_tier(self) -> str:
+        """A: OHLCV only; B: bar-close NBBO with displayed sizes.  Tier C (full depth) is never available here."""
+        return "B" if self.has_quote_sizes() else "A"
 
     def timestamps(self) -> list[datetime]:
         return list(self._ts)
@@ -110,6 +139,12 @@ class BarStore:
             "timestamp": [t.isoformat() for t in self._ts],
             "open": self._open, "high": self._high, "low": self._low, "close": self._close,
             "volume": self._volume, "bid": self._bid, "ask": self._ask,
+            "bid_size": self._bid_size, "ask_size": self._ask_size,
+            "end_time": [b.end_time.isoformat() if b.end_time else "" for b in self._bars],
+            "dollar_volume": [math.nan if b.dollar_volume is None else b.dollar_volume for b in self._bars],
+            "trade_count": [math.nan if b.trade_count is None else b.trade_count for b in self._bars],
+            "vwap": [math.nan if b.vwap is None else b.vwap for b in self._bars],
+            "bar_kind": [b.bar_kind for b in self._bars],
         })
 
     def save(self, path: str | Path) -> None:
@@ -147,10 +182,23 @@ def bars_from_frame(frame: pd.DataFrame, instrument: str, bar_minutes: int = 30)
         if ts.tzinfo is None:
             ts = ts.tz_localize("UTC")
         ts_py = ts.to_pydatetime().astimezone(timezone.utc)
+        end_raw = getattr(row, "end_time", None)
+        end = None
+        if isinstance(end_raw, str) and end_raw:
+            e = pd.Timestamp(end_raw)
+            if e.tzinfo is None:
+                e = e.tz_localize("UTC")
+            end = e.to_pydatetime().astimezone(timezone.utc)
+        tc = _opt(getattr(row, "trade_count", None))
+        kind = getattr(row, "bar_kind", None)
         bars.append(Bar(instrument=instrument, timestamp=ts_py, open=float(row.open), high=float(row.high),
                         low=float(row.low), close=float(row.close), volume=float(row.volume),
                         bar_minutes=bar_minutes, bid=_opt(getattr(row, "bid", None)),
-                        ask=_opt(getattr(row, "ask", None))))
+                        ask=_opt(getattr(row, "ask", None)), bid_size=_opt(getattr(row, "bid_size", None)),
+                        ask_size=_opt(getattr(row, "ask_size", None)), end_time=end,
+                        dollar_volume=_opt(getattr(row, "dollar_volume", None)),
+                        trade_count=None if tc is None else int(tc), vwap=_opt(getattr(row, "vwap", None)),
+                        bar_kind=str(kind) if isinstance(kind, str) and kind else "time"))
     return bars
 
 

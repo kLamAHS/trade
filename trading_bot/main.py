@@ -79,11 +79,72 @@ def _load_bars(args, cfg):
 
     cal = SessionCalendar.from_config(cfg)
     if getattr(args, "synthetic", None):
+        market = _synthetic_market(args, cfg, cal)
+        if market is not None:
+            return market.bars[cfg.market.instrument]
         return generate_synthetic_bars(int(args.synthetic), seed=int(args.seed), instrument=cfg.market.instrument,
                                        calendar=cal, memory_d=float(args.memory_d), amplitude=float(args.amplitude))
     if getattr(args, "csv", None):
         return read_bars_csv(args.csv, cfg.market.instrument, int(cfg.market.bar_minutes))
     raise SystemExit("provide --csv PATH or --synthetic N")
+
+
+def _context_symbols(cfg) -> tuple[str, ...]:
+    ca = (cfg.get("features", {}) or {}).get("cross_asset", {}) or {}
+    if not ca.get("enabled", False):
+        return ()
+    return tuple(str(s).upper() for s in (ca.get("symbols") or []) if str(s).upper() != str(cfg.market.instrument).upper())
+
+
+def _synthetic_market(args, cfg, calendar):
+    """The hostile multi-asset synthetic market (``--hostile``, or automatically when the primary is synthetic
+    and cross-asset context symbols are configured).  Generated once per invocation and cached on ``args`` so
+    the primary bars and the context instruments come from the same draw."""
+    from .data.synthetic import generate_synthetic_market
+
+    if not getattr(args, "synthetic", None):
+        return None
+    symbols = _context_symbols(cfg)
+    if not (getattr(args, "hostile", False) or symbols):
+        return None
+    cached = getattr(args, "_synthetic_market", None)
+    if cached is None:
+        cached = generate_synthetic_market(int(args.synthetic), seed=int(args.seed), calendar=calendar,
+                                           symbols=(cfg.market.instrument,) + symbols, primary=cfg.market.instrument,
+                                           memory_d=float(args.memory_d), amplitude=float(args.amplitude))
+        setattr(args, "_synthetic_market", cached)
+    return cached
+
+
+def _load_context(args, cfg, calendar=None):
+    """Cross-asset context bars: ``--context SYMBOL=path.csv`` entries, or the correlated instruments of the
+    synthetic market when the primary is synthetic and ``features.cross_asset.symbols`` is set."""
+    from .data.calendar import SessionCalendar
+    from .data.store import BarStore, read_bars_csv
+
+    cal = calendar or SessionCalendar.from_config(cfg)
+    out = {}
+    market = _synthetic_market(args, cfg, cal)
+    if market is not None:
+        for sym in _context_symbols(cfg):
+            out[sym] = BarStore(sym, int(cfg.market.bar_minutes), market.bars[sym])
+    for item in getattr(args, "context", None) or []:
+        if "=" not in item:
+            raise SystemExit(f"--context expects SYMBOL=path.csv, got {item!r}")
+        sym, path = item.split("=", 1)
+        out[sym.upper()] = BarStore(sym.upper(), int(cfg.market.bar_minutes), read_bars_csv(path, sym.upper(), int(cfg.market.bar_minutes)))
+    return out
+
+
+def _represent(bars, cfg):
+    """Apply the configured market representation (event bars) and return (bars, effective config)."""
+    from .data.representation import apply_representation
+
+    bars, cfg2 = apply_representation(bars, cfg)
+    if cfg2 is not cfg:
+        print(f"market representation: {cfg2.market_representation.bar_type} bars, {len(bars)} bars, "
+              f"~{cfg2.market.bars_per_day} per session")
+    return bars, cfg2
 
 
 def _validated_store(cfg, bars):
@@ -109,8 +170,11 @@ def cmd_backtest(args) -> int:
     from .data.feed import ReplayFeed
 
     cfg = build_config(args)
-    bars = _load_bars(args, cfg)
+    bars, cfg = _represent(_load_bars(args, cfg), cfg)
     bot = TradingBot(cfg, run_id=args.run_id, artifacts_dir=args.artifacts, log=print if not args.quiet else None)
+    for sym, cs in _load_context(args, cfg, bot.calendar).items():
+        for b in cs.bars:
+            bot.on_context_bar(b)
     feed = ReplayFeed(bars, bot.calendar)
     print(f"backtest: {len(feed)} bars of {cfg.market.instrument}, config digest {cfg.digest()}")
     summary = bot.run(feed, max_bars=args.max_bars)
@@ -167,6 +231,7 @@ def cmd_paper(args) -> int:
                          bar_minutes=int(cfg.market.bar_minutes), poll_seconds=int(cfg.alpaca.poll_seconds),
                          adjustment=str(cfg.alpaca.get("adjustment", "split")))
     now = datetime.now(timezone.utc)
+    context_feed = _context_feeds(cfg, bot, now)
     history = feed.fetch_history(now - timedelta(days=int(cfg.alpaca.history_days)), now)
     print(f"bootstrapping with {len(history)} completed historical bars (no simulated trading)")
     bot.bootstrap(history)
@@ -174,7 +239,7 @@ def cmd_paper(args) -> int:
         feed.seed_last_timestamp(bot.store.last().timestamp)
     print(f"state={bot.state.value} model={bot.registry.current_version}; entering live loop (Ctrl-C to stop)")
     try:
-        run_live_loop(bot, feed, int(cfg.alpaca.poll_seconds), log=print)
+        run_live_loop(bot, feed, int(cfg.alpaca.poll_seconds), log=print, context_feed=context_feed)
     except KeyboardInterrupt:
         print("stopping")
     finally:
@@ -183,18 +248,41 @@ def cmd_paper(args) -> int:
     return 0
 
 
-def run_live_loop(bot, feed, poll_seconds: int, log=print, should_stop=None, sleep=time.sleep) -> None:
+def _context_feeds(cfg, bot, now, api_key=None, secret_key=None):
+    """Download the cross-asset context history into the bot and return polling feeds for it (or None)."""
+    from .data.feed import ContextFeeds
+
+    symbols = tuple(bot.context_symbols)
+    if not symbols:
+        return None
+    feeds = ContextFeeds(symbols, bot.calendar, cfg.alpaca.feed, int(cfg.market.bar_minutes), api_key, secret_key,
+                         str(cfg.alpaca.get("adjustment", "split")))
+    for sym, bars in feeds.fetch_history(now - timedelta(days=int(cfg.alpaca.history_days)), now).items():
+        for b in bars:
+            bot.on_context_bar(b)
+    feeds.seed(bot.context)
+    print(f"context history: " + ", ".join(f"{s} {len(bot.context.get(s, []))} bars" for s in symbols))
+    return feeds
+
+
+def run_live_loop(bot, feed, poll_seconds: int, log=print, should_stop=None, sleep=time.sleep, context_feed=None) -> None:
     """Shared paper-trading loop (CLI and dashboard).
 
     * every completed bar is processed; in a catch-up batch only the newest bar may queue orders,
     * a feed/API failure never kills the bot: it is audited, the data halt is armed (section 35) and
       polling resumes with back-off,
-    * a stale feed inside the session arms the data halt.
+    * a stale feed inside the session arms the data halt,
+    * cross-asset context bars (``context_feed``) are stored before the primary bar of the same poll so the
+      as-of join can only see context that had already closed.
     """
     backoff = poll_seconds
     while not (should_stop and should_stop()):
         now = datetime.now(timezone.utc)
         try:
+            if context_feed is not None:
+                for sym, bars in context_feed.poll_new_bars(now).items():
+                    for b in bars:
+                        bot.on_context_bar(b)
             new_bars = feed.poll_new_bars(now)
             backoff = poll_seconds
         except Exception as exc:  # transient network / API errors
@@ -227,10 +315,11 @@ def cmd_train(args) -> int:
     from .bot import TradingBot
 
     cfg = build_config(args)
-    bars = _load_bars(args, cfg)
+    bars, cfg = _represent(_load_bars(args, cfg), cfg)
     bot = TradingBot(cfg, run_id=args.run_id, artifacts_dir=args.artifacts, log=print)
     store = _validated_store(cfg, bars)
-    report = bot.trainer.retrain(store, print)
+    context = _load_context(args, cfg, bot.calendar) or None
+    report = bot.trainer.retrain(store, print, context=context)
     bot._apply_report(report)
     d = report.to_dict()
     d.pop("grid_results", None)
@@ -265,9 +354,16 @@ def cmd_diagnose(args) -> int:
 
 def _data_info(args, cfg) -> dict:
     if getattr(args, "synthetic", None):
-        return {"source": "synthetic", "seed": int(args.seed), "n_bars": int(args.synthetic), "memory_d": float(args.memory_d),
+        info = {"source": "synthetic", "seed": int(args.seed), "n_bars": int(args.synthetic), "memory_d": float(args.memory_d),
                 "amplitude": float(args.amplitude)}
-    return {"source": "csv", "path": str(Path(args.csv).resolve())}
+        market = getattr(args, "_synthetic_market", None)
+        if market is not None:
+            info.update({"generator": "hostile_market", "symbols": sorted(market.bars), "primary": market.primary})
+        return info
+    info = {"source": "csv", "path": str(Path(args.csv).resolve())}
+    if getattr(args, "context", None):
+        info["context"] = [str(c) for c in args.context]
+    return info
 
 
 def cmd_research(args) -> int:
@@ -276,7 +372,8 @@ def cmd_research(args) -> int:
     from .research.synthetic_ensemble import run_synthetic_ensemble
 
     cfg = build_config(args)
-    bars = _load_bars(args, cfg)
+    fine = _load_bars(args, cfg)
+    bars, cfg = _represent(fine, cfg)
     store = _validated_store(cfg, bars)
     kind = "synthetic" if getattr(args, "synthetic", None) else "real"
     quiet = {"grid ", "d* (", "fold-local", "holdout (d", "baseline {"}
@@ -288,7 +385,8 @@ def cmd_research(args) -> int:
                                              args.artifacts, log=log)
     run = ResearchRun(cfg, store, _data_info(args, cfg), args.artifacts, run_id=args.run_id, log=log, kind=kind,
                       stages=args.stages, open_holdout=args.open_holdout, full_reproducibility=args.repro_full,
-                      synthetic_summary=syn_summary, force_holdout=args.force_holdout)
+                      synthetic_summary=syn_summary, force_holdout=args.force_holdout, context=_load_context(args, cfg),
+                      fine_bars=fine)
     summary = run.execute()
     _print_gates(summary)
     print(f"run directory: {run.run_dir}")
@@ -381,10 +479,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     def data(sp):
         sp.add_argument("--csv", default=None, help="bar history CSV (from `download`)")
+        sp.add_argument("--context", action="append", metavar="SYMBOL=CSV", help="cross-asset context history (repeatable)")
         sp.add_argument("--synthetic", type=int, default=None, help="generate N synthetic bars instead of a CSV")
         sp.add_argument("--seed", type=int, default=0)
         sp.add_argument("--memory-d", type=float, default=0.40, help="synthetic long-memory order of the stationary component")
         sp.add_argument("--amplitude", type=float, default=3.0, help="synthetic long-memory component amplitude (0 = pure random walk)")
+        sp.add_argument("--hostile", action="store_true",
+                        help="synthetic: hostile multi-asset market (regimes, stochastic vol, jumps, gaps, fat tails, liquidity "
+                             "co-moving with stress, correlated context instruments with displayed quote sizes)")
 
     bt = sub.add_parser("backtest", help="event-driven simulation over stored or synthetic bars")
     common(bt); data(bt)

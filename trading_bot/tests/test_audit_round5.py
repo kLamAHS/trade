@@ -316,7 +316,7 @@ def test_inner_calibration_uses_its_own_d(fast_cfg, fractional):
     ds = tr.builder.build(store, 0.4)
     _, _, folds = tr._layout(len(ds))
     sets = tr.build_fold_sets(store, ds, folds)
-    A, Y, rows = tr._inner_calibration_set(sets[0], tr.grid[0], ds.feature_names)
+    A, Y, rows, _ = tr._inner_calibration_set(sets[0], tr.grid[0], ds.feature_names)
     train = folds[0].train
     split = int(len(train) * (1 - tr.inner_calibration_fraction))
     inner_train = train[: split - tr.purge]
@@ -328,7 +328,7 @@ def test_inner_calibration_uses_its_own_d(fast_cfg, fractional):
     store2 = BarStore("SYN", 30, mutated)
     ds2 = tr.builder.build(store2, 0.4)
     sets2 = tr.build_fold_sets(store2, ds2, folds)
-    A2, _, rows2 = tr._inner_calibration_set(sets2[0], tr.grid[0], ds.feature_names)
+    A2, _, rows2, _ = tr._inner_calibration_set(sets2[0], tr.grid[0], ds.feature_names)
     assert np.array_equal(rows, rows2)
     # the *models* saw identical data; only inputs at the mutated (calibration) rows differ, never the fit
     Xa = sets[0].dataset.X[inner_train]

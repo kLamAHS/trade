@@ -275,8 +275,9 @@ def write_run(run_dir: Path, manifest, summary: dict[str, Any], dev, hold, cfg, 
                     write_json(models / f"{mdl.version}.json", {**mdl.metadata.to_dict(), "fitted_model_hash": h,
                                                                 "segment": res.label, "window": w.window.index})
     diag = run_dir / "diagnostics"
-    for key in ("ablation", "baselines", "cost_curve", "timing", "parameter_perturbations", "d_perturbation", "bootstrap",
-                "monte_carlo", "multiple_testing", "regimes", "sanity", "leakage", "reproducibility", "gates", "synthetic_ensemble"):
+    for key in ("ablation", "baselines", "cost_curve", "execution_stress", "timing", "parameter_perturbations", "d_perturbation",
+                "families", "bootstrap", "monte_carlo", "multiple_testing", "regimes", "sanity", "leakage", "reproducibility",
+                "gates", "synthetic_ensemble", "production_policy"):
         if summary.get(key):
             write_json(diag / f"{key}.json", summary[key])
     (run_dir / "logs").mkdir(exist_ok=True)

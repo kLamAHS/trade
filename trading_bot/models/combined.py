@@ -56,7 +56,8 @@ def combine(M: np.ndarray, P: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 class CombinedModel:
     def __init__(self, regression: BoostedRegressor, direction: DirectionModel, calibration: Calibrator,
-                 feature_names, d_star: float, horizon: int, metadata: ModelMetadata | None = None):
+                 feature_names, d_star: float, horizon: int, metadata: ModelMetadata | None = None,
+                 components=None, execution_model=None, families=()):
         self.regression = regression
         self.direction = direction
         self.calibration = calibration
@@ -64,6 +65,9 @@ class CombinedModel:
         self.d_star = float(d_star)
         self.horizon = int(horizon)
         self.metadata = metadata
+        self.components = components            # fitted HMM / Kalman parameters the features were built with
+        self.execution_model = execution_model  # adverse-selection model fitted on out-of-fold forecasts
+        self.families = tuple(families)
 
     @property
     def version(self) -> str:

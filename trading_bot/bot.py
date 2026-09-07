@@ -25,7 +25,9 @@ from .data.store import BarStore
 from .data.validator import DataValidator, ValidationResult
 from .diagnostics.attribution import attribution_groups
 from .diagnostics.fractional_analysis import FractionalDiagnostics
+from .execution.estimator import ExecutionEstimator, exec_inputs_from_columns
 from .execution.simulator import AlpacaPaperBroker, ExecutionEngine, FillDeferred, LiveTradingNotSupported
+from .execution.calibration import ExecutionCalibration
 from .features.engine import FeatureEngine
 from .fractional.engine import FractionalEngine
 from .logging.audit import AuditLogger
@@ -62,6 +64,11 @@ class TradingBot:
         self.trainer = ModelTrainer(cfg, FeatureEngine(cfg, self.fractional, self.calendar), self.fractional,
                                     self.execution.cost_model)
         self.signal_engine = SignalEngine.from_config(cfg)
+        self.estimator = ExecutionEstimator.from_config(cfg, self.execution.cost_model, None)
+        self.execution_calibration = ExecutionCalibration(int(cfg.prediction.horizon_bars))
+        self._pending_estimates: dict[str, dict] = {}         # order id -> expected execution cost at decision time
+        self.context: dict[str, BarStore] = {}                 # cross-asset context stores (symbol -> bars)
+        self.context_symbols = tuple(self.feature_engine.families.cross_asset_symbols) if self.feature_engine.families.cross_asset else ()
         self.risk = RiskEngine.from_config(cfg)
         self.ledger = PortfolioLedger(float(cfg.portfolio.initial_capital), self.instrument)
         self.audit = AuditLogger(root / "audit", self.run_id, echo=self.log, on_event=on_event)
@@ -159,6 +166,10 @@ class TradingBot:
             prev_ctx = self._open_trade_context
             self.ledger.apply(fill)
             self.audit.record_fill(fill, self.ledger.state())
+            expected = self._pending_estimates.pop(order.order_id, None)
+            if expected is not None:
+                realised = self.execution_calibration.record(expected, order, fill, bar)
+                self.audit.event("EXECUTION_REALISED", **realised)
             if len(self.ledger.trades) > prev_trades:
                 trade = self.ledger.trades[-1]
                 ctx = dict(prev_ctx or {})
@@ -191,14 +202,30 @@ class TradingBot:
                 return None
             self.bars_since_retrain = 0
             snapshot = self.store.slice(0, len(self.store))
-            self._retrain_future = self._executor.submit(self.trainer.retrain, snapshot, self.log)
+            ctx = self._context_snapshot()
+            self._retrain_future = self._executor.submit(self.trainer.retrain, snapshot, self.log, ctx)
             self.audit.event("RETRAIN_STARTED", bars=len(self.store), mode="async")
             return None
         self.bars_since_retrain = 0
         self.audit.event("RETRAIN_STARTED", bars=len(self.store), mode="sync")
-        report = self.trainer.retrain(self.store, self.log)
+        report = self.trainer.retrain(self.store, self.log, self._context_snapshot())
         self._apply_report(report)
         return report
+
+    def _context_snapshot(self) -> Optional[dict[str, BarStore]]:
+        if not self.context:
+            return None
+        return {s: cs.slice(0, len(cs)) for s, cs in self.context.items()}
+
+    def on_context_bar(self, bar: Bar) -> None:
+        """Store a completed bar of a cross-asset context instrument (never traded, never validated
+        beyond ordering).  Features join it as-of the primary decision time (market-state spec section 22)."""
+        cs = self.context.get(bar.instrument)
+        if cs is None:
+            cs = self.context[bar.instrument] = BarStore(bar.instrument, bar.bar_minutes)
+        if len(cs) and bar.timestamp <= cs.last().timestamp:
+            return
+        cs.append(bar)
 
     def _apply_report(self, report: TrainingReport) -> None:
         self.retrain_count += 1
@@ -228,6 +255,9 @@ class TradingBot:
             with self._lock:
                 self.registry.promote(report.model)
                 self.feature_engine.set_adaptive_d(report.model.d_star)
+                self.feature_engine.set_components(getattr(report.model, "components", None))
+                self.estimator = ExecutionEstimator.from_config(self.cfg, self.execution.cost_model,
+                                                                getattr(report.model, "execution_model", None))
             self._seed_sigma_history()
             self.audit.event("MODEL_PROMOTED", model_id=report.model.version, d_star=report.model.d_star,
                              d_full=round(report.d_full, 4) if math.isfinite(report.d_full) else None,
@@ -326,7 +356,7 @@ class TradingBot:
             self._record(bar, validation=result, note="feature engine warming up")
             return
         with self._lock:
-            features = self.feature_engine.compute_latest(self.store)
+            features = self.feature_engine.compute_latest(self.store, context=self.context or None)
             model = self.model
         needed = list(model.feature_names) + ["sigma_h", "range_rel", "close"]
         if not features.is_finite(needed):
@@ -341,7 +371,11 @@ class TradingBot:
         # 5. prediction -> signal -> risk
         prediction = model.predict(features)
         cost = self.execution.estimate_cost(features)
-        signal = self.signal_engine.create(prediction, features, cost)
+        x_exec = exec_inputs_from_columns(lambda nm: (np.array([features.get(nm)]) if nm in features.values else None), 1,
+                                          self.execution.cost_model.default_spread)[0]
+        estimate = self.estimator.estimate(features.get("range_rel"), features.get("spread_rel"), x_exec,
+                                           prediction.expected_raw_return, prediction.model_confidence)
+        signal = self.signal_engine.create(prediction, features, estimate)
         decision = self.risk.evaluate(signal, self.ledger.state(), features, self.calendar.session_date(bar.timestamp))
         self._flush_events()
         self._refresh_state()
@@ -368,10 +402,14 @@ class TradingBot:
         if order is not None:
             self.execution.queue_for_next_bar(order)
             self._pending_signal_bar = bar
+            self._pending_estimates[order.order_id] = {**estimate.to_dict(), "direction": signal.direction,
+                                                       "decision_price": bar.close, "abs_er": abs(signal.expected_return),
+                                                       "target_exposure": decision.approved_exposure}
             if decision.new_entry:
                 self._pending_entry_context = self._entry_context(features, bar, signal)
             self._flush_events()
-        self._record(bar, features, prediction, signal, decision, order, cost, validation=result, note=blocked or "")
+        self._record(bar, features, prediction, signal, decision, order, cost, validation=result, note=blocked or "",
+                     estimate=estimate)
 
     def _apply_pending_reentry(self, bar: Bar) -> None:
         pending, self._pending_reentry = self._pending_reentry, None
@@ -429,8 +467,25 @@ class TradingBot:
         self._flush_events()
         self._record(bar, validation=result, note="rejected bar")
 
+    def _market_intelligence(self, features: Optional[FeatureVector]) -> Optional[dict]:
+        """Descriptive market-state panel (market-state spec sections 42-43): never a causal claim."""
+        if features is None:
+            return None
+        g = lambda n: (float(features.get(n)) if (n in features.values and math.isfinite(features.get(n))) else None)  # noqa: E731
+        regime = {k: g(k) for k in features.values if k.startswith("regime_p_")}
+        out = {"regime": {"probabilities": regime, "entropy": g("regime_entropy"), "most_likely": g("regime_most_likely"),
+                          "age": g("regime_age"), "stress_p": g("regime_stress_p"), "transition_prob": g("regime_transition_prob")},
+               "ofi": {"zscore": g("ofi_zscore"), "normalized": g("ofi_normalized"), "quote_imbalance": g("quote_imbalance"),
+                       "spread_z": g("ofi_spread_zscore")},
+               "kalman": {"innovation_z": g("kalman_innovation_z"), "velocity": g("kalman_velocity"), "price": g("kalman_price")},
+               "cross_asset": {k: g(k) for k in features.values if k.startswith("xa_") and k.endswith("_rel_return_1")},
+               "liquidity": {"spread_rel": g("spread_rel"), "range_z": g("range_z"), "volume_z": g("volume_z"), "vpin": g("vpin")},
+               "conventional": {"trend_state": g("trend_state"), "volatility_state": g("volatility_state")},
+               "families": list(self.model.families) if self.model is not None and getattr(self.model, "families", None) else []}
+        return out
+
     def _record(self, bar: Bar, features=None, prediction=None, signal=None, decision=None, order=None, cost=None,
-                validation=None, note: str = "") -> None:
+                validation=None, note: str = "", estimate=None) -> None:
         portfolio = self.ledger.state() if self.ledger.mark_time is not None else None
         self.last_record = {
             "timestamp": bar.timestamp.isoformat(), "close": bar.close, "state": self.state.value, "note": note,
@@ -438,13 +493,20 @@ class TradingBot:
             "risk": decision.to_dict() if decision else None, "order": order.to_dict() if order else None,
             "cost": cost.to_dict() if cost else None,
             "fractional_d": features.fractional_d if features else None,
+            "execution": estimate.to_dict() if estimate is not None else None,
+            "expected_net_edge_bps": (estimate.net_edge_bps if estimate is not None and math.isfinite(estimate.net_edge_bps) else None),
+            "policy": ({"trade": bool(signal.direction), "target_exposure": decision.approved_exposure if decision else signal.target_exposure,
+                        "reason": decision.reason if decision else "", **(dict(signal.policy) if signal.policy else {})} if signal else None),
+            "market": self._market_intelligence(features),
         }
         self.audit.record(bar, self.state.value, features, prediction, signal, decision, order, cost,
                           portfolio, self.registry.current_version,
                           validation.to_dict() if validation else None,
                           {"note": note, "bars_since_retrain": self.bars_since_retrain,
                            "risk_halt": self.risk.halt_reason(self.calendar.session_date(bar.timestamp)),
-                           "clean_bars_since_halt": self.risk.clean_bars_since_halt})
+                           "clean_bars_since_halt": self.risk.clean_bars_since_halt,
+                           "execution": self.last_record["execution"], "expected_net_edge_bps": self.last_record["expected_net_edge_bps"],
+                           "policy": self.last_record["policy"], "market": self.last_record["market"]})
 
     # ---------------------------------------------------------------- run
     def run(self, feed: Iterable[Bar], max_bars: int | None = None) -> dict:
@@ -474,6 +536,10 @@ class TradingBot:
                      "ablation_failures": self.risk.ablation_failures, "data_halted": self.risk.data_halted},
             "fractional_contribution": self.diagnostics.contribution,
             "mirror_reconciliation": mirror,
+            "execution_calibration": self.execution_calibration.summary(),
+            "decision_policy": self.signal_engine.policy.to_dict(),
+            "feature_families": list(self.model.families) if self.model is not None and getattr(self.model, "families", None) else [],
+            "data_tier": self.store.data_tier() if len(self.store) else None,
             "config": self.cfg.to_dict(), "config_digest": self.cfg.digest(),
         }
         (self.artifacts_dir / "audit").mkdir(parents=True, exist_ok=True)

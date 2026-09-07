@@ -16,6 +16,7 @@ data, configuration and software environment needed to reproduce it (spec sectio
 from __future__ import annotations
 
 import dataclasses
+import math
 import hashlib
 import itertools
 import json
@@ -32,6 +33,8 @@ import numpy as np
 from .. import __version__
 from ..data.store import BarStore
 from ..execution.cost_model import CostModel
+from ..execution.estimator import ExecutionModel
+from ..features.components import FittedComponents
 from ..features.engine import FeatureEngine
 from ..fractional.engine import FractionalEngine
 from ..fractional.stationarity import StationarityResult
@@ -54,6 +57,7 @@ class FoldSet:
     stationarity: Optional[StationarityResult] = None
     fixed: bool = False                       # diagnostics: d fixed by the caller, no fold-local estimation
     window: Optional[BarStore] = None         # the price history the fold was carved from
+    components: Optional[FittedComponents] = None   # HMM / Kalman parameters fitted on this fold's training block
 
 
 @dataclass
@@ -75,6 +79,9 @@ class CandidateEvaluation:
     aggregate: ValidationMetrics
     calibrator_fold: list[Calibrator]
     calibration_rows: list[np.ndarray]     # rows whose labels calibrated each fold (all strictly before its validation)
+    exec_models: list[ExecutionModel] = field(default_factory=list)   # adverse-selection model per fold (same rows as the calibrator)
+    fold_E: list[np.ndarray] = field(default_factory=list)
+    fold_adverse: list[np.ndarray] = field(default_factory=list)
 
     @property
     def fold_scores(self) -> list[float]:
@@ -93,6 +100,10 @@ class HoldoutEvaluation:
     A: np.ndarray
     E: np.ndarray
     train_rows: np.ndarray
+    components: Optional[FittedComponents] = None
+    exec_model: Optional[ExecutionModel] = None
+    P: Optional[np.ndarray] = None
+    adverse: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -229,6 +240,13 @@ def fitted_model_hash(model: CombinedModel) -> str:
     probe = np.linspace(-3.0, 3.0, 241)
     h.update(np.ascontiguousarray(cal.predict(probe), dtype=float).tobytes())
     h.update(f"d={model.d_star!r};H={model.horizon};names={list(model.feature_names)}".encode())
+    comp = getattr(model, "components", None)
+    if comp is not None:
+        h.update(comp.digest().encode())
+    ex = getattr(model, "execution_model", None)
+    if ex is not None and ex.fitted:
+        h.update(np.ascontiguousarray(ex.coef, dtype=float).tobytes())
+        h.update(f"{ex.intercept!r}|{ex.residual_std!r}".encode())
     return h.hexdigest()[:16]
 
 
@@ -286,6 +304,13 @@ class ModelTrainer:
         self.horizon = int(cfg.prediction.horizon_bars)
         self.software_version = software_version()
         self.environment = environment_info()
+        e = cfg.execution
+        self.exec_enabled = bool(e.get("adverse_selection_model", True))
+        self.uncertainty_z = float(e.get("uncertainty_z", 0.0))
+        self.exec_alpha = float(e.get("adverse_selection_ridge_alpha", 1.0))
+        self.adverse_floor = float(e.get("adverse_selection_floor_bps", 0.0)) / 1e4
+        self.fold_local_components = bool(t.get("fold_local_components", True))
+        self._context: Optional[dict[str, BarStore]] = None      # cross-asset stores for the current retrain
 
     # ------------------------------------------------------------- helpers
     def _params(self, combo: dict[str, Any]) -> RegressionParams:
@@ -306,10 +331,57 @@ class ModelTrainer:
         c = self.cfg.models.calibration
         return Calibrator(method=str(c.method), bins=int(c.bins), min_points=int(c.get("min_points", 10)))
 
-    def _simulate(self, ds: TrainingDataset, rows: np.ndarray, E: np.ndarray, M: np.ndarray | None = None) -> ValidationMetrics:
+    def _simulate(self, ds: TrainingDataset, rows: np.ndarray, E: np.ndarray, M: np.ndarray | None = None,
+                  adverse: np.ndarray | None = None, uncertainty: np.ndarray | None = None) -> ValidationMetrics:
+        stress = ds.stress_p[rows] if ds.stress_p is not None else None
         return simulate_validation(E, ds.y_norm[rows], ds.sigma[rows], ds.sigma_ref[rows], ds.cost_roundtrip[rows],
                                    ds.cost_side_exec[rows], ds.log_close[rows], ds.open_next[rows],
-                                   ds.open_next2[rows], self.sim_params, M=M)
+                                   ds.open_next2[rows], self.sim_params, M=M, adverse=adverse, uncertainty=uncertainty,
+                                   stress_p=stress)
+
+    # ------------------------------------------------------ components
+    @property
+    def _parametric_families(self) -> bool:
+        f = self.fe.families
+        return bool(f.regime or f.kalman or f.vpin)
+
+    def _components_for(self, window: BarStore, upto_bar: int, cache: dict) -> Optional[FittedComponents]:
+        """HMM / Kalman / VPIN parameters fitted on the window's bars up to and including ``upto_bar``."""
+        if not self._parametric_families:
+            return None
+        key = int(min(upto_bar, len(window) - 1))
+        if key not in cache:
+            cache[key] = self.fe.fit_components(window.slice(0, key + 1))
+        return cache[key]
+
+    def _context_for(self, window: BarStore) -> Optional[dict[str, BarStore]]:
+        """Cross-asset stores restricted to bars that closed no later than the window's last close."""
+        if not self._context:
+            return None
+        end = window[-1].close_time
+        out = {}
+        for sym, cs in self._context.items():
+            bars = [b for b in cs.bars if b.close_time <= end]
+            out[sym] = BarStore(sym, cs.bar_minutes, bars)
+        return out
+
+    # ------------------------------------------------ execution model
+    def _fit_exec_model(self, ds: TrainingDataset, rows: np.ndarray, E: np.ndarray, P: np.ndarray) -> Optional[ExecutionModel]:
+        """Adverse-selection model on out-of-fold forecasts of ``rows`` (fractions)."""
+        if not self.exec_enabled or ds.x_exec is None:
+            return None
+        abs_er = np.abs(E) * ds.sigma[rows] * math.sqrt(self.horizon)
+        conf = np.abs(2.0 * P - 1.0)
+        direction = np.sign(E)
+        return ExecutionModel(alpha=self.exec_alpha).fit(ds.x_exec[rows], abs_er, conf, direction, ds.r_fill[rows], self.horizon)
+
+    def _adverse_for(self, model: Optional[ExecutionModel], ds: TrainingDataset, rows: np.ndarray, E: np.ndarray,
+                     P: np.ndarray) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if model is None or not model.fitted:
+            return None, None
+        abs_er = np.abs(E) * ds.sigma[rows] * math.sqrt(self.horizon)
+        adv = np.maximum(model.predict(ds.x_exec[rows], abs_er, np.abs(2.0 * P - 1.0), np.sign(E)), self.adverse_floor)
+        return adv, np.full(len(rows), self.uncertainty_z * model.residual_std)
 
     def _estimate_d(self, window: BarStore, upto_bar: int) -> StationarityResult:
         """d* from the window's log prices up to and including bar ``upto_bar`` (nothing later)."""
@@ -324,7 +396,8 @@ class ModelTrainer:
         """One dataset per fold, built with d* estimated on that fold's training block only
         (or with ``fixed_d`` for diagnostics).  Rows must coincide with the reference dataset."""
         sets: list[FoldSet] = []
-        cache: dict[float, TrainingDataset] = {}
+        cache: dict = {}
+        comp_cache: dict = {}
         for fold in folds:
             if fixed_d is not None:
                 d, st = float(fixed_d), None
@@ -333,16 +406,26 @@ class ModelTrainer:
                 d = st.d_star
             else:
                 d, st = ds_ref.adaptive_d, None
-            sets.append(FoldSet(fold, self._dataset_for(window, ds_ref, d, cache), d, st, fixed_d is not None, window))
+            if self.fold_local_components and fixed_d is None:
+                comp = self._components_for(window, self._last_label_bar(ds_ref, int(fold.train[-1])), comp_cache)
+            else:
+                comp = self._ref_components
+            sets.append(FoldSet(fold, self._dataset_for(window, ds_ref, d, cache, comp), d, st, fixed_d is not None, window, comp))
         return sets
 
-    def _dataset_for(self, window: BarStore, ds_ref: TrainingDataset, d: float, cache: dict) -> TrainingDataset:
-        if d not in cache:
-            ds_i = ds_ref if d == ds_ref.adaptive_d else self.builder.build(window, d)
+    _ref_components: Optional[FittedComponents] = None   # components of the reference dataset (whole window)
+
+    def _dataset_for(self, window: BarStore, ds_ref: TrainingDataset, d: float, cache: dict,
+                     components: Optional[FittedComponents] = "ref") -> TrainingDataset:
+        comp = self._ref_components if components == "ref" else components
+        key = (round(float(d), 10), comp.key if comp is not None else "")
+        if key not in cache:
+            same = d == ds_ref.adaptive_d and (comp.key if comp is not None else "") == ds_ref.components_digest
+            ds_i = ds_ref if same else self.builder.build(window, d, components=comp, context=self._context_for(window))
             if not np.array_equal(ds_i.bar_index, ds_ref.bar_index):
                 raise ValueError("dataset rows differ from the reference dataset (kernel/warm-up mismatch)")
-            cache[d] = ds_i
-        return cache[d]
+            cache[key] = ds_i
+        return cache[key]
 
     def evaluate_candidate(self, fold_sets: list[FoldSet], combo: dict[str, Any], feature_names) -> CandidateEvaluation:
         names = tuple(feature_names)
@@ -361,30 +444,43 @@ class ModelTrainer:
         fold_metrics: list[ValidationMetrics] = []
         calibrators: list[Calibrator] = []
         calibration_rows: list[np.ndarray] = []
+        exec_models: list[ExecutionModel] = []
         E_all: list[np.ndarray] = []
         M_all: list[np.ndarray] = []
+        adv_all: list[np.ndarray] = []
+        unc_all: list[np.ndarray] = []
         rows_all: list[np.ndarray] = []
         first = fold_sets[0]
-        inner_A, inner_Y, inner_rows = self._inner_calibration_set(first, combo, names)
+        inner_A, inner_Y, inner_rows, inner_P = self._inner_calibration_set(first, combo, names)
         ref_ds = fold_sets[0].dataset          # labels / simulation inputs are identical across d
         for i, fp in enumerate(preds):
             earlier = [q for q in preds[:i] if q.rows[-1] < fp.rows[0]]
             cal_A = np.concatenate([inner_A] + [q.A for q in earlier])
             cal_Y = np.concatenate([inner_Y] + [ref_ds.y_norm[q.rows] for q in earlier])
             cal_rows = np.concatenate([inner_rows] + [q.rows for q in earlier])
+            cal_P = np.concatenate([inner_P] + [q.P for q in earlier])
             cal = self._calibrator().fit(cal_A, cal_Y)
             E = cal.predict(fp.A)
-            fold_metrics.append(self._simulate(ref_ds, fp.rows, E, fp.M))
+            # Execution model: same chronological rows as the calibrator (out of sample for this fold).
+            ex = self._fit_exec_model(ref_ds, cal_rows, cal.predict(cal_A), cal_P)
+            adv, unc = self._adverse_for(ex, ref_ds, fp.rows, E, fp.P)
+            fold_metrics.append(self._simulate(ref_ds, fp.rows, E, fp.M, adv, unc))
             calibrators.append(cal)
             calibration_rows.append(cal_rows)
+            exec_models.append(ex)
             E_all.append(E)
             M_all.append(fp.M)
+            adv_all.append(adv if adv is not None else np.zeros(len(fp.rows)))
+            unc_all.append(unc if unc is not None else np.zeros(len(fp.rows)))
             rows_all.append(fp.rows)
         rows_cat = np.concatenate(rows_all)
-        aggregate = self._simulate(ref_ds, rows_cat, np.concatenate(E_all), np.concatenate(M_all))
-        return CandidateEvaluation(dict(combo), preds, fold_metrics, aggregate, calibrators, calibration_rows)
+        use_adv = any(x is not None and x.fitted for x in exec_models)
+        aggregate = self._simulate(ref_ds, rows_cat, np.concatenate(E_all), np.concatenate(M_all),
+                                   np.concatenate(adv_all) if use_adv else None, np.concatenate(unc_all) if use_adv else None)
+        return CandidateEvaluation(dict(combo), preds, fold_metrics, aggregate, calibrators, calibration_rows, exec_models,
+                                   E_all, adv_all)
 
-    def _inner_calibration_set(self, first: FoldSet, combo: dict[str, Any], names) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _inner_calibration_set(self, first: FoldSet, combo: dict[str, Any], names) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Chronological inner split of the first fold's training block.  The models (and, with
         fold-local d, the adaptive order itself) are fitted on the earlier part only, so the (A, Y)
         pairs from the later part are out of sample in every respect."""
@@ -397,11 +493,15 @@ class ModelTrainer:
             raise ValueError("training block too small for an inner calibration split")
         if self.fold_local_d and not first.fixed and first.window is not None:
             st = self._estimate_d(first.window, self._last_label_bar(ds, int(inner_train[-1])))
-            ds = self._dataset_for(first.window, ds, st.d_star, {})
+            comp = first.components
+            if self.fold_local_components and self._parametric_families:
+                comp = self._components_for(first.window, self._last_label_bar(ds, int(inner_train[-1])), {})
+            ds = self._dataset_for(first.window, ds, st.d_star, {}, comp)
         Xall = ds.columns(tuple(names))
         reg, direction = self._fit_pair(Xall[inner_train], ds.y_norm[inner_train], ds.y_raw[inner_train], combo, names)
-        A, _ = combine(reg.predict(Xall[inner_cal]), direction.predict_proba_up(Xall[inner_cal]))
-        return A, ds.y_norm[inner_cal], inner_cal
+        P = direction.predict_proba_up(Xall[inner_cal])
+        A, _ = combine(reg.predict(Xall[inner_cal]), P)
+        return A, ds.y_norm[inner_cal], inner_cal, P
 
     def evaluate_holdout(self, window: BarStore, ds_ref: TrainingDataset, inner_rows: np.ndarray,
                          holdout_rows: np.ndarray, candidate: CandidateEvaluation, names) -> HoldoutEvaluation:
@@ -414,19 +514,24 @@ class ModelTrainer:
         # must never influence the deployed feature definition it is scoring.
         st = self._estimate_d(window, self._last_label_bar(ds_ref, int(inner_rows[-1])))
         d_h = st.d_star
-        ds_h = self._dataset_for(window, ds_ref, d_h, {})
+        comp_h = self._components_for(window, self._last_label_bar(ds_ref, int(inner_rows[-1])), {})
+        ds_h = self._dataset_for(window, ds_ref, d_h, {}, comp_h)
         X = ds_h.columns(tuple(names))
         reg, direction = self._fit_pair(X[inner_rows], ds_h.y_norm[inner_rows], ds_h.y_raw[inner_rows],
                                         candidate.params, names)
         pooled_A = np.concatenate([fp.A for fp in candidate.fold_predictions])
         pooled_Y = np.concatenate([ds_ref.y_norm[fp.rows] for fp in candidate.fold_predictions])
+        pooled_P = np.concatenate([fp.P for fp in candidate.fold_predictions])
+        pooled_rows = np.concatenate([fp.rows for fp in candidate.fold_predictions])
         cal = self._calibrator().fit(pooled_A, pooled_Y)
+        ex = self._fit_exec_model(ds_ref, pooled_rows, cal.predict(pooled_A), pooled_P)
         M = reg.predict(X[holdout_rows])
         P = direction.predict_proba_up(X[holdout_rows])
         A, _ = combine(M, P)
         E = cal.predict(A)
-        metrics = self._simulate(ds_ref, holdout_rows, E, M)
-        return HoldoutEvaluation(holdout_rows, d_h, metrics, A, E, inner_rows)
+        adv, unc = self._adverse_for(ex, ds_ref, holdout_rows, E, P)
+        metrics = self._simulate(ds_ref, holdout_rows, E, M, adv, unc)
+        return HoldoutEvaluation(holdout_rows, d_h, metrics, A, E, inner_rows, comp_h, ex, P, adv)
 
     def _metadata(self, ds: TrainingDataset, params: RegressionParams, names, validation: dict[str, Any],
                   direction: DirectionModel, is_baseline: bool, extra: dict[str, Any],
@@ -482,8 +587,10 @@ class ModelTrainer:
         window = history.last(self.window_bars)
         previous_d = self.fe.adaptive_d
         try:
-            ds = self.builder.build(window, float(d), label_offset_bars=int(label_offset_bars))
-            names = tuple(names)
+            comp = self._components_for(window, len(window) - 1, {})
+            ds = self.builder.build(window, float(d), label_offset_bars=int(label_offset_bars), components=comp,
+                                    context=self._context_for(window))
+            names = tuple(n for n in names if n in ds.feature_names)
             X = ds.columns(names)
             y_norm, y_raw = ds.y_norm.copy(), ds.y_raw.copy()
             rng = np.random.default_rng(self.seed if seed is None else int(seed))
@@ -501,16 +608,20 @@ class ModelTrainer:
             if len(fit_rows) < self.inner_min_fit or len(cal_rows) < self.inner_min_cal:
                 raise ValueError("window too small for a light refit")
             reg, direction = self._fit_pair(X[fit_rows], y_norm[fit_rows], y_raw[fit_rows], params, names)
-            A, _ = combine(reg.predict(X[cal_rows]), direction.predict_proba_up(X[cal_rows]))
+            P = direction.predict_proba_up(X[cal_rows])
+            A, _ = combine(reg.predict(X[cal_rows]), P)
             cal = self._calibrator().fit(A, y_norm[cal_rows])
-            return CombinedModel(reg, direction, cal, names, float(d), self.horizon, None)
+            ex = self._fit_exec_model(ds, cal_rows, cal.predict(A), P) if not (shuffle_labels or shuffle_features) else None
+            return CombinedModel(reg, direction, cal, names, float(d), self.horizon, None, components=comp,
+                                 execution_model=ex, families=ds.families)
         finally:
             self.fe.set_adaptive_d(previous_d)
 
     # -------------------------------------------------------------- retrain
-    def retrain(self, history: BarStore, log=None) -> TrainingReport:
+    def retrain(self, history: BarStore, log=None, context: Optional[dict[str, BarStore]] = None) -> TrainingReport:
         t0 = time.time()
         _log = log or (lambda *a, **k: None)
+        self._context = context
         window = history.last(self.window_bars)
         if len(window) < self.minimum_bars:
             return TrainingReport(None, False, None, None, {}, [], [], [], None, None, float("nan"), 0, None, None,
@@ -523,7 +634,12 @@ class ModelTrainer:
             stationarity = self.fractional.estimate_stationarity(window.log_close())
             d_full = stationarity.d_star
             _log(f"d* (whole window) = {d_full:.2f} ({stationarity.selected_by})")
-            ds = self.builder.build(window, d_full)
+            comp_full = self._components_for(window, len(window) - 1, {})
+            self._ref_components = comp_full
+            ds = self.builder.build(window, d_full, components=comp_full, context=self._context_for(window))
+            if comp_full is not None and comp_full.notes:
+                _log("components: " + "; ".join(comp_full.notes))
+            _log(f"feature families: {list(ds.families)} ({len(ds.feature_names)} inputs)")
             if len(ds) < self.min_dataset_rows:
                 raise ValueError(f"too few valid training rows: {len(ds)} < {self.min_dataset_rows}")
             inner_rows, holdout_rows, folds = self._layout(len(ds))
@@ -531,7 +647,8 @@ class ModelTrainer:
             fold_ds = [round(fs.d_star, 4) for fs in fold_sets]
             _log(f"fold-local d*: {fold_ds}; holdout rows: {len(holdout_rows)}")
             full_names = ds.feature_names
-            base_names = self.fe.schema.baseline_names
+            frac = set(self.fe.schema.fractional_names)
+            base_names = tuple(n for n in full_names if n not in frac)
 
             # Fixed, small hyperparameter search (section 41) on the inner folds, full feature set.
             evaluations = [self.evaluate_candidate(fold_sets, combo, full_names) for combo in self.grid]
@@ -575,15 +692,22 @@ class ModelTrainer:
             # channel is the one whose out-of-sample score was accepted.  Calibration pools every
             # out-of-fold prediction.  The whole-window d* is kept for diagnostics only.
             d_prod = holdout_full.d_star if holdout_full is not None else d_full
-            ds_prod = self._dataset_for(window, ds, d_prod, {})
+            comp_prod = holdout_full.components if holdout_full is not None else comp_full
+            ds_prod = self._dataset_for(window, ds, d_prod, {}, comp_prod)
             Xall = ds_prod.columns(full_names)
             reg, direction = self._fit_pair(Xall, ds_prod.y_norm, ds_prod.y_raw, best.params, full_names)
             pooled_A = [fp.A for fp in best.fold_predictions]
             pooled_Y = [ds.y_norm[fp.rows] for fp in best.fold_predictions]
+            pooled_P = [fp.P for fp in best.fold_predictions]
+            pooled_rows = [fp.rows for fp in best.fold_predictions]
             if holdout_full is not None:
                 pooled_A.append(holdout_full.A)
                 pooled_Y.append(ds.y_norm[holdout_full.rows])
+                pooled_P.append(holdout_full.P)
+                pooled_rows.append(holdout_full.rows)
             calibration = self._calibrator().fit(np.concatenate(pooled_A), np.concatenate(pooled_Y))
+            exec_final = self._fit_exec_model(ds, np.concatenate(pooled_rows), calibration.predict(np.concatenate(pooled_A)),
+                                              np.concatenate(pooled_P))
             params = self._params(best.params)
             validation_summary = {
                 "aggregate": best.aggregate.to_dict(), "fold_scores": best.fold_scores,
@@ -600,10 +724,15 @@ class ModelTrainer:
             extra = {"stationarity": stationarity.to_dict(), "baseline_feature_names": list(base_names),
                      "calibration_points": calibration.n_fit, "previous_adaptive_d": previous_d,
                      "config": self.cfg.to_dict(), "label_price": self.builder.label_price,
-                     "d_full": d_full, "d_production": d_prod}
+                     "d_full": d_full, "d_production": d_prod, "feature_families": list(ds.families),
+                     "components": comp_prod.to_dict() if comp_prod is not None else None,
+                     "components_digest": comp_prod.digest() if comp_prod is not None else None,
+                     "execution_model": exec_final.to_dict() if exec_final is not None else None,
+                     "data_tier": window.data_tier()}
             meta = self._metadata(ds_prod, params, full_names, validation_summary, direction, False, extra,
                                   reg.effective_params())
-            model = CombinedModel(reg, direction, calibration, full_names, d_prod, self.horizon, meta)
+            model = CombinedModel(reg, direction, calibration, full_names, d_prod, self.horizon, meta,
+                                  components=comp_prod, execution_model=exec_final, families=ds.families)
             baseline_model = None
             if self.fit_final_baseline:
                 # Same protocol for the conventional-feature baseline (research ablation, section 9).
@@ -619,7 +748,16 @@ class ModelTrainer:
                                         {"aggregate": baseline.aggregate.to_dict(), "fold_scores": baseline.fold_scores,
                                          "holdout": holdout_base.metrics.to_dict() if holdout_base else None},
                                         dir_b, True, {"d_production": d_prod}, reg_b.effective_params())
-                baseline_model = CombinedModel(reg_b, dir_b, cal_b, base_names, d_prod, self.horizon, meta_b)
+                pooled_Pb = [fp.P for fp in baseline.fold_predictions]
+                pooled_rb = [fp.rows for fp in baseline.fold_predictions]
+                if holdout_base is not None:
+                    pooled_Pb.append(holdout_base.P)
+                    pooled_rb.append(holdout_base.rows)
+                exec_b = self._fit_exec_model(ds, np.concatenate(pooled_rb), cal_b.predict(np.concatenate(pooled_Ab)),
+                                              np.concatenate(pooled_Pb))
+                baseline_model = CombinedModel(reg_b, dir_b, cal_b, base_names, d_prod, self.horizon, meta_b,
+                                               components=comp_prod, execution_model=exec_b,
+                                               families=tuple(f for f in ds.families if f != "FRACTIONAL"))
             holdout_span = None
             if holdout_full is not None:
                 holdout_span = (window[int(ds.bar_index[holdout_full.rows[0]])].timestamp,

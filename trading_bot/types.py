@@ -40,17 +40,30 @@ class Bar:
     ask: Optional[float] = None
     quote_timestamp: Optional[datetime] = None   # when bid/ask were observed (None => at the bar close)
     observed_at: Optional[datetime] = None       # when the bar was received (live feeds); None => at the close
+    bid_size: Optional[float] = None             # displayed size at the best bid (Tier B data), None when unknown
+    ask_size: Optional[float] = None
+    end_time: Optional[datetime] = None          # event bars: when the bar actually ended (None => start + bar_minutes)
+    dollar_volume: Optional[float] = None        # event bars: sum(price * size)
+    trade_count: Optional[int] = None
+    vwap: Optional[float] = None
+    bar_kind: str = "time"                       # time | volume | dollar | tick
+    bar_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Normalise numeric fields to plain Python floats so that persistence,
         # checksums and JSON serialisation are exact and backend independent.
         for name in ("open", "high", "low", "close", "volume"):
             object.__setattr__(self, name, float(getattr(self, name)))
-        for name in ("bid", "ask"):
+        for name in ("bid", "ask", "bid_size", "ask_size", "dollar_volume", "vwap"):
             v = getattr(self, name)
             object.__setattr__(self, name, None if v is None else float(v))
         if self.timestamp.tzinfo is None:
             raise ValueError("Bar.timestamp must be timezone-aware")
+        if self.end_time is not None:
+            if self.end_time.tzinfo is None:
+                raise ValueError("Bar.end_time must be timezone-aware")
+            if self.end_time < self.timestamp:
+                raise ValueError("Bar.end_time before Bar.timestamp")
 
     @property
     def latest_source_time(self) -> datetime:
@@ -65,7 +78,27 @@ class Bar:
 
     @property
     def close_time(self) -> datetime:
+        """When the bar's information is complete: its explicit end for event bars, else start + bar_minutes."""
+        if self.end_time is not None:
+            return self.end_time
         return self.timestamp + timedelta(minutes=self.bar_minutes)
+
+    @property
+    def duration_seconds(self) -> float:
+        return (self.close_time - self.timestamp).total_seconds()
+
+    @property
+    def available_at(self) -> datetime:
+        """Research-spec name for the newest information time of the bar (== latest_source_time)."""
+        return self.latest_source_time
+
+    @property
+    def quote_imbalance(self) -> Optional[float]:
+        """(bid size - ask size) / (bid size + ask size) at the close; None without displayed sizes (Tier B)."""
+        if self.bid_size is None or self.ask_size is None:
+            return None
+        tot = self.bid_size + self.ask_size
+        return (self.bid_size - self.ask_size) / tot if tot > 0 else 0.0
 
     @property
     def mid(self) -> Optional[float]:
@@ -85,6 +118,7 @@ class Bar:
         d["timestamp"] = self.timestamp.isoformat()
         d["quote_timestamp"] = self.quote_timestamp.isoformat() if self.quote_timestamp else None
         d["observed_at"] = self.observed_at.isoformat() if self.observed_at else None
+        d["end_time"] = self.end_time.isoformat() if self.end_time else None
         return d
 
 
@@ -177,6 +211,38 @@ class CostEstimate:
 
 
 @dataclass(frozen=True)
+class ExecutionEstimate:
+    """Expected execution cost decomposition for one decision, in basis points of notional
+    (market-state spec section 18).  ``gross_bps`` is the alpha forecast over the horizon; the net
+    edge is what the decision policy compares with the minimum required edge."""
+
+    spread_bps: float
+    slippage_bps: float
+    adverse_selection_bps: float
+    fee_bps: float
+    uncertainty_bps: float
+    gross_bps: float = math.nan
+    model_uncertainty_bps: float = 0.0        # part of uncertainty_bps that comes from the adverse-selection model
+    adverse_selection_source: str = "none"    # model | none
+
+    @property
+    def total_expected_bps(self) -> float:
+        return self.spread_bps + self.slippage_bps + self.adverse_selection_bps + self.fee_bps
+
+    @property
+    def net_edge_bps(self) -> float:
+        if not math.isfinite(self.gross_bps):
+            return -math.inf
+        return abs(self.gross_bps) - self.total_expected_bps - self.uncertainty_bps
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["total_expected_bps"] = self.total_expected_bps
+        d["net_edge_bps"] = self.net_edge_bps
+        return d
+
+
+@dataclass(frozen=True)
 class Signal:
     """Signal-engine output (spec section 49)."""
 
@@ -190,10 +256,14 @@ class Signal:
     volatility_multiplier: float = 1.0
     reference_volatility: float = math.nan
     current_volatility: float = math.nan
+    execution: Optional[Mapping[str, Any]] = None     # ExecutionEstimate.to_dict() when the net-edge policy is active
+    policy: Optional[Mapping[str, Any]] = None        # decision-policy record (mode, thresholds, regime adjustment)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["timestamp"] = self.timestamp.isoformat()
+        d["execution"] = dict(self.execution) if self.execution is not None else None
+        d["policy"] = dict(self.policy) if self.policy is not None else None
         return d
 
 
@@ -313,6 +383,6 @@ def dataclass_field_names(cls) -> list[str]:
 
 
 __all__ = [
-    "BotState", "Bar", "FeatureVector", "Prediction", "CostEstimate", "Signal",
+    "BotState", "Bar", "FeatureVector", "Prediction", "CostEstimate", "ExecutionEstimate", "Signal",
     "RiskDecision", "Order", "Fill", "PortfolioSnapshot", "dataclass_field_names", "field",
 ]
