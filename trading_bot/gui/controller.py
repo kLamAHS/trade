@@ -160,13 +160,28 @@ class BotController:
         from ..data.store import read_bars_csv
         from ..data.synthetic import generate_synthetic_bars
 
+        from ..data.representation import apply_representation
+        from ..data.synthetic import generate_synthetic_market
+
         s = self.settings
         if s.data_source == "csv":
             bars = read_bars_csv(s.csv_path, cfg.market.instrument, int(cfg.market.bar_minutes))
+            for sym, cs in self._context_stores(cfg, bot.context_symbols).items():
+                for b in cs.bars:
+                    bot.on_context_bar(b)
+        elif bot.context_symbols:
+            # synthetic primary plus correlated context instruments (with quote sizes: Tier B)
+            market = generate_synthetic_market(int(s.synthetic_bars), seed=int(s.synthetic_seed), calendar=bot.calendar,
+                                               symbols=(cfg.market.instrument,) + tuple(bot.context_symbols), primary=cfg.market.instrument)
+            bars = market.bars[cfg.market.instrument]
+            for sym in bot.context_symbols:
+                for b in market.bars[sym]:
+                    bot.on_context_bar(b)
         else:
             bars = generate_synthetic_bars(int(s.synthetic_bars), seed=int(s.synthetic_seed),
                                            instrument=cfg.market.instrument, calendar=bot.calendar)
-        feed = ReplayFeed(bars, bot.calendar)
+        bars, _ = apply_representation(bars, cfg, bot.calendar)
+        feed = ReplayFeed(bars, bot.calendar, regular_only=(cfg.get("market_representation", {}) or {}).get("bar_type", "time") == "time")
         self.message = f"backtest over {len(feed)} bars"
         self.log(self.message + " (internal simulator only: no orders are sent to Alpaca in backtest mode)")
         t0 = time.time()
@@ -189,6 +204,9 @@ class BotController:
                              adjustment=str(cfg.alpaca.get("adjustment", "split")))
         now = datetime.now(timezone.utc)
         self.message = "downloading history from Alpaca"
+        from ..main import _context_feeds
+
+        context_feed = _context_feeds(cfg, bot, now, s.api_key, s.secret_key)
         history = feed.fetch_history(now - timedelta(days=int(cfg.alpaca.history_days)), now)
         self.log(f"bootstrapping with {len(history)} completed historical bars")
         self.message = "bootstrapping and training"
@@ -201,7 +219,7 @@ class BotController:
 
         try:
             run_live_loop(bot, feed, int(cfg.alpaca.poll_seconds), log=self.log,
-                          should_stop=self._stop.is_set, sleep=self._wait)
+                          should_stop=self._stop.is_set, sleep=self._wait, context_feed=context_feed)
         finally:
             self.summary = bot.finalize()
 
@@ -292,10 +310,34 @@ class BotController:
         st = self.research_status
         st["stage"], st["message"], st["progress"] = stage, message, float(fraction)
 
+    @staticmethod
+    def _context_symbols(cfg) -> tuple[str, ...]:
+        ca = (cfg.get("features", {}) or {}).get("cross_asset", {}) or {}
+        if not ca.get("enabled", False):
+            return ()
+        return tuple(str(x).upper() for x in (ca.get("symbols") or []) if str(x).upper() != str(cfg.market.instrument).upper())
+
+    def _context_stores(self, cfg, symbols) -> dict[str, Any]:
+        """Cross-asset context histories from the ``context_paths`` setting for the configured symbols."""
+        from ..data.store import BarStore, read_bars_csv
+
+        files = self.settings.context_files()
+        out: dict[str, Any] = {}
+        for sym in symbols:
+            path = files.get(sym)
+            if not path:
+                self.log(f"cross-asset context {sym}: no CSV configured (Context CSVs setting); the family will be unavailable")
+                continue
+            if not Path(path).exists():
+                raise RuntimeError(f"context CSV for {sym} not found: {path!r}")
+            out[sym] = BarStore(sym, int(cfg.market.bar_minutes), read_bars_csv(path, sym, int(cfg.market.bar_minutes)))
+        return out
+
     def _run_research(self, options: dict[str, Any]) -> None:
         from ..data.calendar import SessionCalendar
+        from ..data.representation import apply_representation
         from ..data.store import BarStore, read_bars_csv
-        from ..data.synthetic import generate_synthetic_bars
+        from ..data.synthetic import generate_synthetic_bars, generate_synthetic_market
         from ..data.validator import DataValidator
         from ..research.runner import ResearchRun
         from ..research.synthetic_ensemble import run_synthetic_ensemble
@@ -311,12 +353,26 @@ class BotController:
             cfg = self.build_config()
             s = self.settings
             cal = SessionCalendar.from_config(cfg)
+            symbols = self._context_symbols(cfg)
+            context: dict[str, Any] = {}
             if s.data_source == "csv":
                 bars = read_bars_csv(s.csv_path, cfg.market.instrument, int(cfg.market.bar_minutes))
                 info, kind = {"source": "csv", "path": str(Path(s.csv_path).resolve())}, "real"
+                context = self._context_stores(cfg, symbols)
+                if context:
+                    info["context"] = {sym: str(Path(p).resolve()) for sym, p in s.context_files().items() if sym in context}
+            elif symbols:
+                market = generate_synthetic_market(int(s.synthetic_bars), seed=int(s.synthetic_seed), calendar=cal,
+                                                   symbols=(cfg.market.instrument,) + symbols, primary=cfg.market.instrument)
+                bars = market.bars[cfg.market.instrument]
+                context = {sym: BarStore(sym, int(cfg.market.bar_minutes), market.bars[sym]) for sym in symbols}
+                info, kind = {"source": "synthetic", "seed": int(s.synthetic_seed), "n_bars": int(s.synthetic_bars),
+                              "generator": "hostile_market", "symbols": [cfg.market.instrument, *symbols]}, "synthetic"
             else:
                 bars = generate_synthetic_bars(int(s.synthetic_bars), seed=int(s.synthetic_seed), instrument=cfg.market.instrument, calendar=cal)
                 info, kind = {"source": "synthetic", "seed": int(s.synthetic_seed), "n_bars": int(s.synthetic_bars)}, "synthetic"
+            fine = bars
+            bars, cfg = apply_representation(bars, cfg, cal)
             validator = DataValidator.from_config(cfg)
             store = BarStore(cfg.market.instrument, int(cfg.market.bar_minutes))
             for b in bars:
@@ -333,7 +389,8 @@ class BotController:
             run = ResearchRun(cfg, store, info, s.artifacts_dir, log=log, kind=kind, stages=options.get("stages") or "full",
                               open_holdout=bool(options.get("open_holdout")), force_holdout=bool(options.get("force_holdout")),
                               on_progress=self._research_progress,
-                              should_stop=self._research_stop.is_set, synthetic_summary=syn_summary)
+                              should_stop=self._research_stop.is_set, synthetic_summary=syn_summary,
+                              context=context or None, fine_bars=fine)
             st["run_id"] = run.run_id
             summary = run.execute()
             st["classification"] = summary["gates"]["classification"]
@@ -484,6 +541,12 @@ class BotController:
             "fractional_contribution": bot.diagnostics.contribution[-40:],
             "events": events,
             "summary": self.summary["metrics"] if self.summary else None,
+            "execution_calibration": bot.execution_calibration.summary(),
+            "recent_executions": bot.execution_calibration.recent(20),
+            "policy": bot.signal_engine.policy.to_dict(),
+            "feature_families": list(bot.model.families) if bot.model is not None and getattr(bot.model, "families", None) else [],
+            "data_tier": bot.store.data_tier() if len(bot.store) else None,
+            "context_symbols": list(bot.context_symbols),
         }
         return out
 

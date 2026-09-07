@@ -28,7 +28,8 @@ from typing import Any, Optional
 import numpy as np
 
 from ..risk.limits import apply_position_rules, stop_triggered
-from ..strategy.sizing import confidence_from_edge, direction_from_edge, raw_exposure, volatility_multiplier
+from ..strategy.policy import DecisionPolicy
+from ..strategy.sizing import raw_exposure, volatility_multiplier
 
 
 @dataclass
@@ -49,6 +50,9 @@ class SimInputs:
     timestamps: Optional[list] = None           # decision timestamps (bar close) per row
     exec_timestamps: Optional[list] = None      # execution timestamps (next bar open) per row
     model_ids: Optional[list] = None            # model id per row
+    adverse: Optional[np.ndarray] = None        # expected adverse selection per row (fraction; execution model)
+    uncertainty: Optional[np.ndarray] = None    # model uncertainty per row (fraction)
+    stress_p: Optional[np.ndarray] = None       # filtered stress-regime probability per row
 
     @classmethod
     def from_dataset(cls, ds, rows: np.ndarray, E: np.ndarray, M: np.ndarray | None = None,
@@ -142,6 +146,11 @@ def simulate_strategy(inp: SimInputs, params, cost_scale: float = 1.0, cost_bps:
     dd_halt_window = None
     current_window = None
     usable = n - delay if delay > 0 else n
+    policy = params.policy
+    if policy.cost_multiplier != params.cost_multiplier or policy.confidence_cost_multiplier != params.confidence_cost_multiplier:
+        policy = DecisionPolicy(policy.mode, params.cost_multiplier, params.confidence_cost_multiplier, policy.minimum_net_edge,
+                                policy.uncertainty_buffer, policy.fee_roundtrip, policy.regime, params.eps, policy.extra_fee)
+    net_edges = np.full(n, np.nan)
     for i in range(usable):
         j = i + delay                                 # execution row
         # session / window bookkeeping
@@ -162,16 +171,21 @@ def simulate_strategy(inp: SimInputs, params, cost_scale: float = 1.0, cost_bps:
             pos_ret = entry_dir * (inp.log_close[i] - math.log(entry_price))
             stop_hit = stop_triggered(pos_ret, entry_sigma, H, params.stop_sigma_multiple)
         er = inp.E[i] * inp.sigma[i] * math.sqrt(H)
-        direction = direction_from_edge(er, cost_rt[i], params.cost_multiplier)
+        dec = policy.decide(er, cost_rt[i], 0.0, inp.adverse[i] if inp.adverse is not None else 0.0,
+                            inp.uncertainty[i] if inp.uncertainty is not None else 0.0,
+                            inp.stress_p[i] if inp.stress_p is not None else math.nan, fees=policy.extra_fee)
+        direction = dec.direction
         conf = 0.0
+        net_edge_i = dec.net_edge
         if direction:
             n_signals += 1
-            conf = confidence_from_edge(er, cost_rt[i], params.confidence_cost_multiplier, params.eps)
+            conf = dec.confidence
             vm = volatility_multiplier(inp.sigma_ref[i], inp.sigma[i], params.vol_multiplier_min, params.vol_multiplier_max)
-            q_raw = raw_exposure(direction, conf, vm, params.max_abs_exposure)
+            q_raw = raw_exposure(direction, conf, vm, params.max_abs_exposure * dec.exposure_cap_multiplier)
         else:
             q_raw = 0.0
         targets[i] = q_raw
+        net_edges[i] = net_edge_i
         # portfolio circuit breakers (evaluated on mark-to-market equity known at the decision)
         force_flat = False
         if daily_loss_limit is not None:
@@ -235,7 +249,9 @@ def simulate_strategy(inp: SimInputs, params, cost_scale: float = 1.0, cost_bps:
                 open_trade = {
                     "trade_id": len(trades) + 1, "entry_row": int(i), "decision_timestamp": _ts(inp.timestamps, i),
                     "execution_timestamp": _ts(inp.exec_timestamps, j), "model_id": (model_ids[i] if model_ids else None),
-                    "forecast": float(inp.E[i]), "expected_return": float(er),
+                    "forecast": float(inp.E[i]), "expected_return": float(er), "net_edge": float(net_edge_i),
+                    "adverse_selection": float(inp.adverse[i]) if inp.adverse is not None else 0.0,
+                    "stress_p": float(inp.stress_p[i]) if inp.stress_p is not None else None,
                     "probability_up": float(inp.P[i]) if inp.P is not None else None,
                     "confidence": float(conf), "target_exposure": float(q_raw), "approved_exposure": float(q_new),
                     "direction": 1 if q_new > 0 else -1, "entry_price": float(inp.open_next[j]),
@@ -271,8 +287,10 @@ def simulate_strategy(inp: SimInputs, params, cost_scale: float = 1.0, cost_bps:
         trades.append(open_trade)
     if usable < n:
         curve[usable + 1:] = curve[usable]
-    return SimResult(bar_pnl, gross_bar, cost_bar, curve, exposures, targets, halted, trades, n_signals, n_fills,
-                     delay, cost_scale, cost_bps, capital)
+    res = SimResult(bar_pnl, gross_bar, cost_bar, curve, exposures, targets, halted, trades, n_signals, n_fills,
+                    delay, cost_scale, cost_bps, capital)
+    res.net_edges = net_edges
+    return res
 
 
 def _ts(seq, i):

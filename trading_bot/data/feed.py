@@ -148,6 +148,11 @@ class AlpacaBarFeed:
         return self._to_bars(raw, horizon)
 
     def latest_quote(self) -> tuple[Optional[float], Optional[float], Optional[datetime]]:
+        bid, ask, qts, _, _ = self.latest_quote_with_sizes()
+        return bid, ask, qts
+
+    def latest_quote_with_sizes(self):
+        """(bid, ask, quote time, bid size, ask size) of the standing NBBO; sizes are Tier B inputs (OFI)."""
         try:
             from alpaca.data.enums import DataFeed
             from alpaca.data.requests import StockLatestQuoteRequest
@@ -159,11 +164,15 @@ class AlpacaBarFeed:
             qts = getattr(quote, "timestamp", None)
             if qts is not None and qts.tzinfo is None:
                 qts = qts.replace(tzinfo=timezone.utc)
+            bs = getattr(quote, "bid_size", None)
+            asz = getattr(quote, "ask_size", None)
+            bs = float(bs) if bs is not None else None
+            asz = float(asz) if asz is not None else None
             if bid > 0 and ask > 0 and ask >= bid:
-                return bid, ask, qts
+                return bid, ask, qts, bs, asz
         except Exception:  # pragma: no cover - network dependent
             pass
-        return None, None, None
+        return None, None, None, None, None
 
     def poll_new_bars(self, now: datetime | None = None) -> list[Bar]:
         """Return completed regular-session bars newer than the polling cursor and advance it."""
@@ -180,13 +189,13 @@ class AlpacaBarFeed:
         completed = [Bar(b.instrument, b.timestamp, b.open, b.high, b.low, b.close, b.volume, b.bar_minutes,
                          observed_at=now) for b in completed]
         last = completed[-1]
-        bid, ask, qts = self.latest_quote()
+        bid, ask, qts, bs, asz = self.latest_quote_with_sizes()
         if bid is not None:
             # The latest NBBO is the *standing* quote at fetch time: its observation time is now, even if
             # the exchange timestamp of the last update is older.
             completed[-1] = Bar(last.instrument, last.timestamp, last.open, last.high, last.low, last.close,
                                 last.volume, last.bar_minutes, bid, ask, quote_timestamp=max(qts or now, now),
-                                observed_at=now)
+                                observed_at=now, bid_size=bs, ask_size=asz)
         return completed
 
     def __iter__(self) -> Iterator[Bar]:  # pragma: no cover - long-running live loop
@@ -196,4 +205,24 @@ class AlpacaBarFeed:
             time.sleep(self.poll_seconds)
 
 
-__all__ = ["MarketDataFeed", "ReplayFeed", "AlpacaBarFeed"]
+class ContextFeeds:
+    """Historical download and polling for cross-asset context instruments (never traded)."""
+
+    def __init__(self, symbols, calendar: SessionCalendar, feed: str = "iex", bar_minutes: int = 30, api_key=None,
+                 secret_key=None, adjustment: str = "split", data_client=None, clock: Callable[[], datetime] = _utcnow):
+        self.feeds = {s: AlpacaBarFeed(s, calendar, api_key, secret_key, feed, bar_minutes, data_client=data_client, clock=clock,
+                                       adjustment=adjustment) for s in symbols}
+
+    def fetch_history(self, start: datetime, end: datetime | None = None) -> dict[str, list[Bar]]:
+        return {s: f.fetch_history(start, end) for s, f in self.feeds.items()}
+
+    def poll_new_bars(self, now: datetime | None = None) -> dict[str, list[Bar]]:
+        return {s: f.poll_new_bars(now) for s, f in self.feeds.items()}
+
+    def seed(self, stores) -> None:
+        for s, f in self.feeds.items():
+            if s in stores and len(stores[s]):
+                f.seed_last_timestamp(stores[s].last().timestamp)
+
+
+__all__ = ["MarketDataFeed", "ReplayFeed", "AlpacaBarFeed", "ContextFeeds"]

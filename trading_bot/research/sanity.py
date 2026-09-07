@@ -119,13 +119,14 @@ def forward_mutation_check(runner, result, n_samples: int = 4, log=None) -> dict
     for k in picks:
         wr = windows[k]
         w = wr.window
-        ds, mask, offset = runner._oos_dataset(w, wr.model.d_star, {})
+        comp = getattr(wr.model, "components", None)
+        ds, mask, offset = runner._oos_dataset(w, wr.model.d_star, {}, components=comp)
         rows = np.flatnonzero(mask)
         cut = rows[len(rows) // 2]                                   # decision bar in the middle of the block
         cut_bar = int(ds.bar_index[cut] + offset)
         E_ref = runner._forecast(wr.model, ds, mask)["E"]
         mutated = _mutated_store(runner.store, cut_bar + 1, seed=k)  # everything after the decision bar changes
-        ds_m, mask_m, offset_m = runner._oos_dataset(w, wr.model.d_star, {}, store=mutated)
+        ds_m, mask_m, offset_m = runner._oos_dataset(w, wr.model.d_star, {}, store=mutated, components=comp)
         E_mut = runner._forecast(wr.model, ds_m, mask_m)["E"]
         rows_m = np.flatnonzero(mask_m)
         upto = int(np.sum((ds.bar_index[rows] + offset) <= cut_bar))

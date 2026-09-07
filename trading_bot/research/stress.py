@@ -83,6 +83,43 @@ def cost_curve(runner, oos, levels_bps=(0, 1, 2, 5, 10), scales=(1.0, 2.0, 3.0),
                     "joint rows move both"}
 
 
+def execution_stress(runner, oos, multipliers=(0.5, 1.0, 1.5, 2.0, 3.0), delays=(0, 1, 2, 3)) -> dict[str, Any]:
+    """The three separate execution experiments of market-state spec section 20:
+
+    * adaptive   -- the strategy *knows* the tested cost level (decisions and fills both at k x cost):
+                    how would it behave if it expected that environment?
+    * frozen     -- signals and trades generated once at the modelled cost, then the identical orders
+                    replayed at k x realised cost: how much execution degradation can it survive?
+    * delay      -- the same signal executed 0, +1, +2, +3 bars later.
+    """
+    ref = _row(runner, oos, runner.simulate(oos, "full"), "reference", mode="reference", multiplier=1.0)
+    adaptive = [_row(runner, oos, runner.simulate(oos, "full", cost_scale=float(k)), f"adaptive_x{k:g}", mode="adaptive", multiplier=float(k))
+                for k in multipliers]
+    frozen = [_row(runner, oos, runner.simulate(oos, "full", exec_cost_scale=float(k)), f"frozen_x{k:g}", mode="frozen", multiplier=float(k))
+              for k in multipliers]
+    delay = [_row(runner, oos, runner.simulate(oos, "full", delay=int(d)), f"delay_{d}", mode="delay", delay=int(d)) for d in delays]
+    for r in frozen:
+        r["decisions_frozen"] = True
+        r["signals_equal_reference"] = bool(r["n_signals"] == ref["n_signals"])
+    def _survives(rows, key, val):
+        r = next((x for x in rows if x.get(key) == val), None)
+        return bool(r is not None and r["total_return"] > 0 and r["sharpe"] > 0)
+    return {"reference": ref, "adaptive": adaptive, "frozen": frozen, "delay": delay,
+            "frozen_survives_2x": _survives(frozen, "multiplier", 2.0), "frozen_survives_3x": _survives(frozen, "multiplier", 3.0),
+            "adaptive_survives_2x": _survives(adaptive, "multiplier", 2.0), "delay_survives_plus_1": _survives(delay, "delay", 1),
+            "delay_survives_plus_2": _survives(delay, "delay", 2),
+            "frozen_breakeven_multiplier": _breakeven([(r["multiplier"], r["total_return"]) for r in frozen]),
+            "adaptive_breakeven_multiplier": _breakeven([(r["multiplier"], r["total_return"]) for r in adaptive])}
+
+
+def _breakeven(points) -> float | None:
+    pts = sorted(points)
+    for (a, ra), (b, rb) in zip(pts[:-1], pts[1:]):
+        if ra > 0 >= rb and ra != rb:
+            return float(a + (b - a) * ra / (ra - rb))
+    return float("inf") if pts and pts[-1][1] > 0 else (0.0 if pts and pts[0][1] <= 0 else None)
+
+
 def timing_delays(runner, oos, delays=(0, 1, 2)) -> dict[str, Any]:
     rows = [_row(runner, oos, runner.simulate(oos, "full", delay=int(d)), f"delay_{d}", delay=int(d)) for d in delays]
     ref = rows[0]
@@ -129,19 +166,20 @@ def light_refit_series(runner, windows, d_of: Callable[[Any], float], names_of=N
     parts = []
     for wr in windows:
         w = wr.window
+        r = getattr(wr, "runner", None) or runner       # representation research: each window knows its bars
         d = float(d_of(wr))
-        names = names_of(wr) if names_of else (wr.model.feature_names if wr.model is not None else runner.trainer.fe.schema.model_names)
-        history = runner.store.slice(w.train_start, w.train_end)
-        params = wr.best_params or runner.trainer.grid[0]
+        names = names_of(wr) if names_of else (wr.model.feature_names if wr.model is not None else r.trainer.fe.schema.model_names)
+        history = r.store.slice(w.train_start, w.train_end)
+        params = wr.best_params or r.trainer.grid[0]
         try:
-            model = runner.trainer.light_refit(history, d, params, names, **refit_kwargs)
+            model = r.trainer.light_refit(history, d, params, names, **refit_kwargs)
         except ValueError as exc:
             if log:
                 log(f"light refit window {w.index} failed: {exc}")
             parts.append(np.zeros(wr.n_oos_rows))
             continue
-        ds, mask, _ = runner._oos_dataset(w, d, {})
-        parts.append(runner._forecast(model, ds, mask)["E"])
+        ds, mask, _ = r._oos_dataset(w, d, {}, components=getattr(model, "components", None))
+        parts.append(r._forecast(model, ds, mask)["E"])
     return np.concatenate(parts)
 
 
@@ -168,4 +206,5 @@ def d_perturbation(runner, result, steps=(-2, -1, 0, 1, 2), log=None) -> dict[st
             "min_sharpe": float(min(r["sharpe"] for r in non_ref)) if non_ref else None}
 
 
-__all__ = ["cost_curve", "timing_delays", "parameter_perturbations", "d_perturbation", "light_refit_series", "PERTURBATIONS"]
+__all__ = ["cost_curve", "timing_delays", "parameter_perturbations", "d_perturbation", "light_refit_series", "PERTURBATIONS",
+           "execution_stress"]

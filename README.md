@@ -66,6 +66,15 @@ python -m trading_bot.main research --csv artifacts/data/SPY_30m.csv         # d
 python -m trading_bot.main research --csv artifacts/data/SPY_30m.csv --open-holdout   # once, at the end
 python -m trading_bot.main research-runs --compare RUN_A RUN_B               # identical manifest -> identical results
 
+# 6. Market-state / microstructure / execution intelligence (docs/MARKET_STATE_UPDATE.md): optional feature
+#    families (regime HMM, OFI, Kalman, cross-asset, VPIN), the net-edge decision policy, execution stress and
+#    the feature-family ablation matrix, on the hostile multi-asset synthetic market or real context CSVs
+python -m trading_bot.main research --synthetic 4000 --hostile --symbol SYN --fast \
+    --set features.regime.enabled=true --set features.ofi.enabled=true \
+    --set features.cross_asset.enabled=true --set features.cross_asset.symbols=[QQQ,IWM]
+python -m trading_bot.main research --csv artifacts/data/SPY_30m.csv --context QQQ=artifacts/data/QQQ_30m.csv \
+    --set features.cross_asset.enabled=true --set features.cross_asset.symbols=[QQQ]
+
 pytest            # unit, numerical, leakage, execution, risk and end-to-end tests
 ```
 
@@ -100,9 +109,13 @@ the spec-mandated `trading_bot/logging` package must never shadow the standard l
 MarketDataFeed (data/feed.py: ReplayFeed | AlpacaBarFeed)
   -> DataValidator (data/validator.py)     reject corrupt bars / halt on gaps & jumps
   -> BarStore (data/store.py)              append-only, checksummed
-  -> FeatureEngine (features/engine.py)    FractionalEngine + VolatilityEngine + MarketStateEngine
+  -> FeatureEngine (features/engine.py)    feature families: PRICE / VOLATILITY / VOLUME / FRACTIONAL (+ optional
+                                           REGIME hmm.py, OFI ofi.py, KALMAN kalman.py, CROSS_ASSET cross_asset.py,
+                                           TOXICITY toxicity.py; fitted components frozen per training window)
   -> ModelEngine (models/combined.py)      boosted magnitude x logistic direction -> isotonic calibration
-  -> SignalEngine (strategy/signal.py)     cost threshold, confidence, volatility scaling
+  -> ExecutionEstimator (execution/estimator.py)  spread + slippage + adverse selection + fees + uncertainty
+  -> DecisionPolicy (strategy/policy.py)   trade only if expected net edge > minimum required edge, else ABSTAIN
+  -> SignalEngine (strategy/signal.py)     confidence, volatility scaling, regime-aware exposure cap
   -> RiskEngine (risk/manager.py)          turnover suppression, max holding, stop, daily / drawdown halts
   -> ExecutionEngine (execution/)          next-open fills with spread + slippage, Alpaca mirror
   -> PortfolioLedger (portfolio/ledger.py) -> AuditLogger (logging/audit.py)
@@ -122,8 +135,9 @@ The orchestrator is `trading_bot/bot.py` (`TradingBot.on_bar`, the five-state ma
    implementation and are tested to be identical).
 4. `M_t` (boosted regression) and `P_t^+` (logistic) are combined into `A_t = M_t |2P_t^+ - 1|`
    (zero on disagreement) and calibrated, `E_t = g(A_t)`; `ER_t = E_t sigma_50 sqrt(H)`.
-5. Trade only when `|ER_t| > 3 Cost_t`; `Confidence = min(1, |ER|/(6 Cost))`;
-   `VM = clip(sigma_ref / sigma_50, 0.25, 1.5)`; `Q = Direction x Confidence x VM`.
+5. Trade only when the expected net edge `|ER_t| - spread - slippage - adverse selection - fees - uncertainty`
+   exceeds `execution.minimum_net_edge_bps` (`execution.decision_policy: legacy` restores `|ER_t| > 3 Cost_t`);
+   `Confidence = min(1, |ER|/(6 Cost))`; `VM = clip(sigma_ref / sigma_50, 0.25, 1.5)`; `Q = Direction x Confidence x VM`.
 6. Risk: emergency stop at `-4 sigma sqrt(H)`, max holding 12 bars, rebalance threshold 0.15,
    daily loss halt at -2.5 %, drawdown halt at -10 % (until an accepted retrain).
 7. An exposure-change order is queued for the next bar and everything is written to the audit log.
@@ -163,6 +177,33 @@ disprove the strategy:
 
 Runs are written to `artifacts/runs/<run_id>/` (`manifest.yaml`, `summary.json`, `equity.csv`,
 `trades.csv`, `fills.csv`, `decisions.csv`, `retrains.csv`, `models/`, `diagnostics/`, `plots/`, `logs/`).
+
+## Market state, microstructure and execution intelligence
+
+`docs/MARKET_STATE_UPDATE.md` describes the causal, regime-aware, execution-aware extension:
+
+* **Feature families** that must each earn their place: a causal Gaussian HMM regime filter (filtered
+  probabilities only; the smoother is provably leaky and is never a feature), Cont-style order-flow
+  imbalance from bar-close NBBO snapshots with displayed sizes (Tier B data only, never manufactured from
+  OHLCV), a local-linear-trend Kalman filter (no smoothing), cross-asset context joined strictly as-of the
+  decision time with staleness limits, and experimental VPIN that disables itself when the bulk-volume
+  classification is not confident. Missing inputs make a family *unavailable*, never approximated.
+* **Execution intelligence**: an out-of-fold adverse-selection model, an explicit
+  `expected_net_edge = gross - spread - slippage - adverse - fees - uncertainty` decision with ABSTAIN as a
+  first-class outcome, the cost the strategy *believes* kept separate from the cost the simulator *charges*,
+  regime-aware exposure caps, and an expected-vs-realised execution calibration (mean / median / P90 / P95 /
+  worst, share inside the expected P95) that compares the model with Alpaca's paper fills.
+* **Market representation**: time, volume, dollar or tick bars that never straddle a session, with an
+  in-training representation selection when `market_representation.candidates` is set.
+* **Research**: three separate execution stress modes (adaptive cost, frozen decisions ×0.5–×3 with
+  break-even, +0..+3 bar delay), a feature-family ablation matrix (Base / Base+F / Full−F / Full with
+  ΔSharpe, Δreturn, Δdrawdown, Δturnover, Δcost, Δcalibration), conditional contribution by regime,
+  sabotage failure tests, a complexity budget and per-family acceptance gates with special conditions
+  for OFI, REGIME and CROSS_ASSET (`ACCEPTED` / `REJECTED` / `RESEARCH ONLY`).
+* **Hostile synthetic market** (`--hostile`): regimes, stochastic volatility, jumps, gaps, fat tails,
+  liquidity that co-moves with stress, correlated instruments whose correlation breaks down, lead / lag.
+* **Dashboards**: Expected-edge waterfall, Market intelligence and Execution (expected vs realised) panels
+  on the Trading tab; Feature families and Execution stress on the Validation tab.
 
 ## Artifacts
 
@@ -238,7 +279,8 @@ artifacts/
   halt new orders; open positions are flattened at the next clean bar and trading resumes after
   `data.halt_recovery_bars` consecutive clean bars.
 * **Synthetic data** (`--synthetic`) is a random walk plus a stationary ARFIMA(0, d, 0) component
-  with U-shaped intraday volatility; it exists for tests and demos only.
+  with U-shaped intraday volatility; `--hostile` (automatic when cross-asset context symbols are configured)
+  switches to the multi-asset hostile market generator. Both exist for tests and demos only.
 
 ## Reproducibility and CI
 
@@ -261,4 +303,12 @@ batch/streaming feature equality and formula spot checks; **future-bar mutation*
 fill model, order builder, state-consistent execution, ledger accounting; sizing arithmetic,
 position rules, daily/drawdown/ablation halts, validator circuit breakers, state-machine transitions,
 trainer reproducibility (same seed -> identical artifact id and predictions), registry round trip
-and an end-to-end audit-trail check.
+and an end-to-end audit-trail check. `test_market_state.py` covers the market-state update: the hostile
+synthetic market and its planted structure, quote sizes and event-bar fields in the store, event-bar
+session boundaries, HMM filter prefix-invariance versus the (leaky) smoother, Kalman filter causality,
+the OFI formula and its Tier B requirement, the causal as-of join and staleness, prefix-invariance of
+every feature family, the VPIN confidence gate, the net-edge policy (and its bit-exact legacy mode),
+the adverse-selection target and estimator, simulator parity under the net-edge policy, a full bot run
+with every family (audit records, execution calibration, model hash coverage), the execution-stress and
+family research stages (sabotage protocol parity, self-consistent verdicts), the causal lead / lag
+signal in the cross-asset family, the representation selector and the dashboard snapshot.

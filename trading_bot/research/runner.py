@@ -28,14 +28,15 @@ from .manifest import RunManifest, results_hash
 from .metrics import summarize_distribution
 from .regimes import regime_attribution, tag_regimes
 from .sanity import run_leakage, run_sanity
-from .stress import cost_curve, d_perturbation, parameter_perturbations, timing_delays
+from .families import (ablation_matrix, complexity_budget, conditional_contribution, failure_tests, family_gates)
+from .stress import cost_curve, d_perturbation, execution_stress, parameter_perturbations, timing_delays
 from .walkforward import WalkForwardResult, WalkForwardRunner, plan_schedule
 
-STAGES = ["walkforward", "ablation", "baselines", "regimes", "cost", "timing", "perturbation", "d_perturbation",
-          "sanity", "leakage", "bootstrap", "reproducibility", "holdout", "gates"]
-QUICK_STAGES = ["walkforward", "ablation", "baselines", "regimes", "cost", "timing", "perturbation", "bootstrap", "leakage",
-                "reproducibility", "gates"]
-SYNTHETIC_STAGES = ["walkforward", "ablation", "cost", "timing", "perturbation", "bootstrap", "leakage", "gates"]
+STAGES = ["walkforward", "ablation", "baselines", "regimes", "cost", "execution_stress", "timing", "perturbation",
+          "d_perturbation", "families", "sanity", "leakage", "bootstrap", "reproducibility", "holdout", "gates"]
+QUICK_STAGES = ["walkforward", "ablation", "baselines", "regimes", "cost", "execution_stress", "timing", "perturbation", "bootstrap",
+                "leakage", "reproducibility", "gates"]
+SYNTHETIC_STAGES = ["walkforward", "ablation", "cost", "execution_stress", "timing", "perturbation", "bootstrap", "leakage", "gates"]
 
 
 def resolve_stages(spec: str | list[str] | None, open_holdout: bool = False) -> list[str]:
@@ -67,7 +68,7 @@ class ResearchRun:
                  kind: str = "real", stages: str | list[str] | None = None, open_holdout: bool = False,
                  on_progress: Callable[[str, str, float], None] | None = None, should_stop: Callable[[], bool] | None = None,
                  full_reproducibility: bool = False, synthetic_summary: dict[str, Any] | None = None,
-                 force_holdout: bool = False):
+                 force_holdout: bool = False, context: dict[str, BarStore] | None = None, fine_bars=None):
         self.cfg = cfg
         self.store = store
         self.data_info = dict(data_info or {})
@@ -83,7 +84,9 @@ class ResearchRun:
         self.lines: list[str] = []
         self._log_cb = log or (lambda *_: None)
         self.r = (cfg.get("research", {}) or {})
-        self.runner = WalkForwardRunner(cfg, store, log=self.log)
+        self.context = dict(context or {})
+        self.fine_bars = list(fine_bars) if fine_bars is not None else None      # raw time bars for representation candidates
+        self.runner = WalkForwardRunner(cfg, store, log=self.log, context=self.context or None)
         self.manifest = RunManifest.create(cfg, store, self.data_info, self.runner.schedule().to_dict(), self.stages,
                                            kind=kind, run_id=run_id)
         self.run_id = self.manifest.run_id
@@ -148,7 +151,25 @@ class ResearchRun:
             self._check_stop()
             self.on_progress("walkforward", f"walk-forward window {wr.window.index + 1}/{n}", 0.05 + 0.45 * (wr.window.index + 1) / max(1, n))
 
-        self.dev = self.runner.run(on_window=on_window)
+        rep = self.cfg.get("market_representation", {}) or {}
+        candidates = list(rep.get("candidates") or [])
+        if candidates and self.fine_bars is not None:
+            from .representation import RepresentationSelector, candidate_stores
+            from ..data.representation import representation_spec
+
+            spec = representation_spec(self.cfg)
+            stores = candidate_stores(self.fine_bars, candidates, self.runner.calendar)
+            if spec["name"] not in stores:
+                stores[spec["name"]] = self.store
+            selector = RepresentationSelector(self.cfg, stores, spec["name"], log=self.log, context=self.context or None)
+            self.dev = selector.run(on_window=on_window)
+            self.summary["representation"] = {"candidates": list(stores), "reference": spec["name"],
+                                              "selection": getattr(self.dev, "representation_selection", []),
+                                              "chosen_counts": getattr(self.dev, "representation_counts", {}),
+                                              "note": "chosen per window by inner-fold score before the OOS block was seen"}
+            self.log(f"representation selection: {self.summary['representation']['chosen_counts']}")
+        else:
+            self.dev = self.runner.run(on_window=on_window)
         dev = self.dev.summary()
         s = self.summary
         s["development"] = dev
@@ -261,6 +282,35 @@ class ResearchRun:
         self.log(f"cost curve: mean model round trip {out['mean_model_roundtrip_bps']:.2f} bps; decisions frozen: break-even flat "
                  f"cost {out['breakeven_flat_bps']} bps, profitable at 2x realised cost {out['profitable_at_2x_cost']}; "
                  f"joint (strategy told 2x): profitable {out['profitable_at_2x_joint_cost']}")
+
+    def stage_execution_stress(self) -> None:
+        ex = self._sub("execution_stress")
+        out = execution_stress(self.runner, self.dev.oos, tuple(float(x) for x in ex.get("multipliers", (0.5, 1.0, 1.5, 2.0, 3.0))),
+                               tuple(int(x) for x in ex.get("delays", (0, 1, 2, 3))))
+        self.summary["execution_stress"] = out
+        self.log("execution stress: frozen " + ", ".join(f"x{r['multiplier']:g} Sharpe {r['sharpe']:.2f}" for r in out["frozen"])
+                 + f"; break-even x{out['frozen_breakeven_multiplier']}; delay " + ", ".join(f"+{r['delay']} {r['sharpe']:.2f}" for r in out["delay"]))
+
+    def stage_families(self) -> None:
+        fam = self._sub("families")
+        seed = int(self._sub("bootstrap").get("seed", 0))
+        matrix = ablation_matrix(self.runner, self.dev, log=self.log, n_boot=int(fam.get("n_boot", 1000)), seed=seed)
+        cond = conditional_contribution(self.runner, self.dev, matrix, log=self.log) if matrix.get("present") else {}
+        fails = (failure_tests(self.runner, self.dev, matrix.get("present", []), log=self.log, seed=seed,
+                               n_seeds=int(fam.get("sabotage_seeds", 3))) if matrix.get("present") else {"families": {}})
+        gates = family_gates(self.runner, self.dev, matrix, fails, self.summary.get("timing"), self.summary.get("cost_curve"),
+                             dict(fam.get("gates", {}) or {}), log=self.log) if matrix.get("present") else {}
+        budget = complexity_budget(self.runner, self.dev, matrix, fails) if matrix.get("present") else []
+        attribution = {f: (matrix["families"][f]["marginal"]["delta_sharpe"]) for f in matrix.get("present", [])}
+        self.summary["families"] = {"matrix": matrix, "conditional": cond, "failure_tests": fails, "gates": gates,
+                                    "complexity_budget": budget, "attribution_delta_sharpe": attribution,
+                                    "present": matrix.get("present", []),
+                                    "verdict": {f: g["status"] for f, g in gates.items()}}
+        if attribution:
+            self.log("OOS ΔSharpe by feature family (marginal): " + ", ".join(f"{f} {v:+.2f}" for f, v in attribution.items() if v is not None))
+            self.log("family verdicts: " + ", ".join(f"{f}={s}" for f, s in self.summary["families"]["verdict"].items()))
+        else:
+            self.log("families: no optional feature family enabled (nothing to ablate beyond FRACTIONAL vs baseline)")
 
     def stage_timing(self) -> None:
         t = self._sub("timing")

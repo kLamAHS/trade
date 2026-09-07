@@ -85,6 +85,10 @@ class DataValidator:
                 reasons.append("crossed quote: ask < bid")
         if bar.timestamp.tzinfo is None:
             reasons.append("naive timestamp")
+        elif bar.bar_kind != "time":
+            # event bars start at arbitrary times inside the session and never straddle sessions
+            if not self.calendar.in_session(bar.timestamp) or bar.end_time is None or bar.end_time < bar.timestamp:
+                reasons.append("event bar outside regular session or without an end time")
         elif not self.calendar.is_regular_session_bar(bar.timestamp):
             reasons.append("bar outside regular session")
         return reasons
@@ -98,6 +102,13 @@ class DataValidator:
             return reject, halt
         if bar.timestamp < prev.timestamp:
             reject.append("timestamp moved backward")
+            return reject, halt
+        if bar.bar_kind != "time" or prev.bar_kind != "time":
+            # event bars: only ordering, session monotonicity and the jump breaker apply
+            if bar.timestamp < prev.close_time:
+                reject.append("event bar overlaps the previous bar")
+            if prev.close > 0 and bar.close > 0 and abs(math.log(bar.close / prev.close)) > self.max_abs_log_jump:
+                halt.append(f"extreme price jump: |log return| = {abs(math.log(bar.close / prev.close)):.4f}")
             return reject, halt
         expected = self.calendar.expected_next_start(prev.timestamp)
         if expected is not None:

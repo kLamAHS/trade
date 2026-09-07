@@ -44,6 +44,30 @@ fractional:
   min_observations: 50         # transformed observations required before a candidate d is testable
 
 features:
+  # ---- optional feature families (market-state spec sections 8-31).  Every family must earn its place
+  # through the research ablation matrix; all are off by default except FRACTIONAL.  Nothing is ever
+  # approximated from missing data: a family whose inputs are absent is reported as unavailable.
+  fractional:
+    enabled: true
+  regime:                      # causal Gaussian HMM (filtered probabilities only; smoothing is never a feature)
+    enabled: false
+    states: 3
+    causal_filter_only: true
+  ofi:                         # order-flow imbalance from bar-close NBBO snapshots with displayed sizes (Tier B)
+    enabled: false
+    normalization: displayed_depth
+  kalman:                      # local-linear-trend filter (level + velocity), parameters fitted per training block
+    enabled: false
+    subset: full               # full | latent_price | innovation (ablation, section 27)
+  cross_asset:                 # correlated instruments joined strictly as-of the decision time
+    enabled: false
+    symbols: []                # e.g. [QQQ, IWM]
+    max_staleness_seconds: 1800
+  vpin:                        # experimental flow toxicity (bulk volume classification); disabled unless confident
+    enabled: false
+    bucket_bars: 5
+    n_buckets: 50
+    min_classification_confidence: 0.15
   robust_z_window: 250         # N for rolling median / MAD (spec section 9)
   volume_z_window: 50          # N for the volume robust z-score (spec section 16)
   ewma_lambda: 0.94            # exponentially smoothed realized variance (spec section 8)
@@ -57,6 +81,17 @@ features:
   frac_regime_floor: 0.1
   slope_lags: [1, 4]
   use_raw_fractional_levels: false   # raw D^d p levels are recorded but only z-scored levels feed the models
+
+market_representation:
+  # Which bars the strategy sees (market-state spec section 6).  Event bars are built from the feed's time
+  # bars; features then carry duration_seconds and per-unit-time normalisations.  market.bars_per_day is
+  # replaced by the empirical bars per session for event bars.
+  bar_type: time               # time | volume | dollar | tick
+  target_minutes: 30
+  target_shares: 500000        # volume bars
+  target_dollar_volume: 250000000   # dollar bars
+  target_ticks: 20             # tick bars (fine bars per bar when built from a bar feed)
+  candidates: []               # research mode (section 7): e.g. [time_30m, volume_500k, dollar_250m]; selected inside training only
 
 prediction:
   horizon_bars: 4              # H bars
@@ -96,6 +131,7 @@ training:
   min_dataset_rows: 200        # minimum valid (feature, label) rows for a training cycle
   outer_holdout_fraction: 0.15 # newest rows never used for selection; acceptance and the ablation score are read there (0 disables)
   fold_local_d: true           # estimate d* per fold from that fold's training block only (false: whole-window d* everywhere)
+  fold_local_components: true  # fit HMM / Kalman / VPIN parameters per fold from its training block only
   # Fixed, small hyperparameter search space (spec section 41).  The identical
   # candidates are evaluated on every retraining cycle.
   hyperparameter_grid:
@@ -126,6 +162,12 @@ signal:
   vol_multiplier_max: 1.5
 
 risk:
+  regime_adjustment:           # market-state spec section 11: regime state modifies sizing, never the algorithm
+    enabled: false
+    stress_probability_threshold: 0.70
+    exposure_multiplier: 0.40  # max exposure x this when P(stress) exceeds the threshold
+    edge_multiplier: 1.5       # required net edge x this
+    confidence_multiplier: 1.0
   max_absolute_exposure: 1.0
   maximum_holding_bars: 12
   stop_sigma_multiple: 4.0
@@ -133,6 +175,16 @@ risk:
   drawdown_halt: 0.10
 
 execution:
+  # ---- decision policy (market-state spec section 3): trade only when the expected gross return survives
+  # spread + slippage + adverse selection + fees + an uncertainty buffer by at least minimum_net_edge_bps.
+  decision_policy: net_edge    # net_edge | legacy (|ER| > signal.cost_multiplier x round-trip cost)
+  minimum_net_edge_bps: 8
+  uncertainty_buffer_bps: 3
+  uncertainty_z: 0.0           # extra buffer = z x the adverse-selection model's residual std (0 disables)
+  fee_bps: 0.0                 # regulatory / venue fees not in the cost model (round trip)
+  adverse_selection_model: true      # ridge model of the post-fill adverse move beyond the forecast (fitted on OOF rows)
+  adverse_selection_floor_bps: 0.0   # the execution model can add cost, never edge
+  adverse_selection_ridge_alpha: 1.0
   commission_per_side: 0.0     # relative (fraction of notional); Alpaca equities are commission free
   default_spread: 0.0001       # relative full spread used when bid/ask are unavailable
   slippage_range_fraction: 0.05
@@ -193,6 +245,13 @@ research:
     seeds: 5
     n_bars: 4000
     master_seed: 0
+  families:                    # feature-family ablation matrix, sabotage failure tests and gates (market-state spec 32-47)
+    n_boot: 1000               # bootstrap draws for the per-window delta-Sharpe CI of each family
+    sabotage_seeds: 3          # stochastic sabotages (shuffle / random) are averaged over this many draws
+    gates:
+      min_median_delta_sharpe: 0.0   # marginal contribution (Full vs Full-F) median across windows
+      min_positive_fraction: 0.55    # windows in which the family helps
+      max_dominance: 0.5             # share of the total delta-Sharpe a single window may carry
   gates:                       # promotion thresholds (research spec section 30)
     min_windows: 20
     min_trades: 200

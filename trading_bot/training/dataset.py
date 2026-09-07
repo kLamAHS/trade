@@ -20,8 +20,12 @@ from datetime import datetime
 
 import numpy as np
 
+from typing import Optional
+
 from ..data.store import BarStore
 from ..execution.cost_model import CostModel
+from ..execution.estimator import EXEC_INPUT_NAMES, exec_inputs_from_columns
+from ..features.components import FittedComponents
 from ..features.engine import FeatureEngine, FeatureMatrix
 from ..features.rolling import rolling_median
 
@@ -47,6 +51,11 @@ class TrainingDataset:
     window_checksum: str
     window_start: datetime
     window_end: datetime
+    r_fill: np.ndarray = None            # (C_{t+1} - O_{t+1}) / O_{t+1}: realised first-bar move after the fill
+    x_exec: np.ndarray = None            # execution-model inputs per row (EXEC_INPUT_NAMES)
+    stress_p: np.ndarray = None          # filtered stress-regime probability (0 when the REGIME family is off)
+    families: tuple[str, ...] = ()       # feature families available in this dataset
+    components_digest: str = ""
 
     def __len__(self) -> int:
         return len(self.y_norm)
@@ -96,11 +105,16 @@ class TrainingDatasetBuilder:
                    int(cfg.signal.vol_reference_days) * int(cfg.market.bars_per_day), cfg.features.epsilon,
                    cfg.execution.slippage_reference, str(cfg.prediction.get("label_price", "open")))
 
-    def build(self, window: BarStore, adaptive_d: float, label_offset_bars: int = 0) -> TrainingDataset:
+    def build(self, window: BarStore, adaptive_d: float, label_offset_bars: int = 0,
+              components: Optional[FittedComponents] = None, context: Optional[dict[str, BarStore]] = None) -> TrainingDataset:
         """``label_offset_bars`` > 0 shifts the label ``off`` bars into the future (leakage test, research
-        section 23): Y_t = log P_{t+1+off+H} - log P_{t+1+off}.  Production always uses 0."""
+        section 23): Y_t = log P_{t+1+off+H} - log P_{t+1+off}.  Production always uses 0.
+        ``components`` are the fitted HMM / Kalman parameters to use (frozen); ``context`` the
+        cross-asset stores.  Model inputs are the enabled families the data actually supports."""
         self.fe.set_adaptive_d(adaptive_d)
-        fm: FeatureMatrix = self.fe.compute_matrix(window)
+        if components is not None or self.fe.families.regime or self.fe.families.kalman or self.fe.families.vpin:
+            self.fe.set_components(components)
+        fm: FeatureMatrix = self.fe.compute_matrix(window, context=context)
         n = len(window)
         arrays = window.arrays()
         log_close = np.log(arrays["close"])
@@ -134,18 +148,25 @@ class TrainingDatasetBuilder:
         close_next[:-1] = arrays["close"][1:]
         sigma_ref = reference_sigma(sigma, self.vol_reference_bars)
 
-        model_names = self.fe.schema.model_names
+        model_names = self.fe.schema.names_for(fm.families_available)
         valid = fm.valid_mask(model_names) & np.isfinite(y_norm) & np.isfinite(open_next2) & np.isfinite(cost_side_exec)
         rows = np.flatnonzero(valid)
         X = fm.values[:, [fm.names.index(nm) for nm in model_names]][rows]
         ts = tuple(fm.close_times[i] for i in rows)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            r_fill = (close_next - open_next) / open_next
+        x_exec = exec_inputs_from_columns(lambda nm: (fm.column(nm) if nm in fm.names else None), n, self.cost_model.default_spread)
+        stress = fm.column("regime_stress_p") if "regime_stress_p" in fm.names else np.full(n, np.nan)
+        stress = np.where(np.isfinite(stress), stress, 0.0)
         return TrainingDataset(
             feature_names=tuple(model_names), X=X, y_norm=y_norm[rows], y_raw=y_raw[rows], sigma=sigma[rows],
             sigma_ref=sigma_ref[rows], cost_roundtrip=cost_rt[rows], cost_side_exec=cost_side_exec[rows],
             log_close=log_close[rows], open_next=open_next[rows], open_next2=open_next2[rows],
             close_next=close_next[rows], close_times=ts, bar_index=rows, adaptive_d=fm.adaptive_d,
             kernel_size=fm.kernel_size, window_checksum=window.checksum(),
-            window_start=window[0].timestamp, window_end=window[-1].timestamp)
+            window_start=window[0].timestamp, window_end=window[-1].timestamp,
+            r_fill=r_fill[rows], x_exec=x_exec[rows], stress_p=stress[rows], families=fm.families_available,
+            components_digest=fm.components_digest)
 
 
 __all__ = ["TrainingDataset", "TrainingDatasetBuilder", "reference_sigma"]
