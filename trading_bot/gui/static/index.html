@@ -167,6 +167,14 @@
       <div class="hint">Artifacts (audit trail, models, diagnostics) are written under <code id="artifactsDir">artifacts/</code>.</div>
     </section>
 
+    <section class="card" id="retrainCard" style="display:none">
+      <h2>Model status</h2>
+      <div id="retrainVerdict" class="hint" style="margin-bottom:8px"></div>
+      <div id="retrainPanel" class="kv"></div>
+      <div class="scroll" style="max-height:150px;margin-top:8px"><table id="retrainChecks"><thead><tr><th>Acceptance check</th><th>Value</th><th></th></tr></thead><tbody></tbody></table></div>
+      <div class="hint">Until a retraining cycle passes every check the bot holds no position and places no orders. A rejected model is a verdict about the data, not a stall.</div>
+    </section>
+
     <section class="card">
       <h2>Last decision</h2>
       <div id="decision" class="kv"><div class="muted">no bar processed yet</div><div></div></div>
@@ -523,7 +531,12 @@
     setText("tExposure", fmtNum(b.exposure, 3), signClass(b.exposure)); setText("tExposureSub", (b.units ? b.units.toFixed(2) + " units" : "flat") + (b.holding_bars ? " · held " + b.holding_bars + " bars" : ""));
     setText("tDrawdown", fmtPct(b.drawdown), b.drawdown < 0 ? "neg" : ""); setText("tDrawdownSub", "peak " + fmtMoney(b.equity_peak));
     setText("tDaily", fmtPct(b.daily_return), signClass(b.daily_return)); setText("tDailySub", "realised " + fmtMoney(b.realized_pnl) + " · unrealised " + fmtMoney(b.unrealized_pnl));
-    setText("tModel", b.model_version === "none" ? "training…" : b.model_version); setText("tModelSub", (b.adaptive_d != null ? "d* = " + Number(b.adaptive_d).toFixed(2) + " · " : "") + b.retrains + " retrain" + (b.retrains === 1 ? "" : "s") + " · next in " + Math.max(0, b.retrain_every - b.bars_since_retrain));
+    const rt = b.last_retrain || {};
+    const modelLabel = b.model_version !== "none" ? b.model_version
+      : (rt.status === "rejected" ? "none · rejected" : (rt.status === "failed" ? "none · error" : "training…"));
+    setText("tModel", modelLabel, b.model_version === "none" && rt.status === "rejected" ? "neg" : "");
+    setText("tModelSub", (b.adaptive_d != null ? "d* = " + Number(b.adaptive_d).toFixed(2) + " · " : "") + b.retrains + " retrain" + (b.retrains === 1 ? "" : "s") + " · next in " + Math.max(0, b.retrain_every - b.bars_since_retrain));
+    renderRetrain(b);
     setText("tBars", b.bars_stored.toLocaleString()); setText("tBarsSub", b.rejected_bars + " rejected · " + b.halted_bars + " gaps" + (b.bars_stored < b.minimum_bars ? " · need " + b.minimum_bars : ""));
     setText("tTrades", b.n_trades); setText("tTradesSub", b.n_fills + " fills");
     setText("tLast", b.last_bar ? fmtTime(b.last_bar.timestamp) : "–"); setText("tLastSub", b.last_bar ? "close " + b.last_bar.close.toFixed(2) : "");
@@ -806,6 +819,34 @@
   }
 
   // ---------------------------------------------- market-state panels
+  function renderRetrain(b) {
+    const rt = b.last_retrain || {}, card = $("retrainCard");
+    const show = b.model_version === "none" || rt.status === "rejected" || rt.status === "failed";
+    card.style.display = show ? "" : "none";
+    if (!show) return;
+    const d = rt.diagnosis || {};
+    const v = $("retrainVerdict"); v.innerHTML = "";
+    const head = document.createElement("b");
+    if (rt.status === "accepted") { head.textContent = "Model accepted"; head.className = "gate-pass"; }
+    else if (rt.status === "rejected") { head.textContent = "No model: the last retrain was rejected"; head.className = "gate-fail"; }
+    else if (rt.status === "failed") { head.textContent = "No model: the last retrain raised an error"; head.className = "gate-fail"; }
+    else { head.textContent = "No model yet: waiting for the first retraining cycle"; head.className = "warn"; }
+    v.appendChild(head);
+    if (rt.detail) { v.appendChild(document.createElement("br")); v.appendChild(document.createTextNode(rt.detail)); }
+    const rows = [];
+    rows.push(["retrains run", String(rt.retrains == null ? 0 : rt.retrains) + (rt.elapsed_seconds ? " · last took " + rt.elapsed_seconds + "s" : "")]);
+    if (rt.status === "none yet") rows.push(["bars stored", (rt.bars_stored || 0).toLocaleString() + " of " + (rt.minimum_bars || 0).toLocaleString() + " needed"]);
+    if (d.rows != null) rows.push(["acceptance sample", d.rows + " rows · " + d.n_signals + " signals · " + d.n_trades + " trades"]);
+    if (rt.fold_signals && rt.fold_signals.length) rows.push(["validation folds", "signals " + rt.fold_signals.join(" / ") + " · trades " + rt.fold_trades.join(" / ")]);
+    if (d.median_abs_edge_bps != null) rows.push(["forecast vs threshold", "|ER| median " + fmtNum(d.median_abs_edge_bps, 1) + " · p90 " + fmtNum(d.p90_abs_edge_bps, 1) + " · max " + fmtNum(d.max_abs_edge_bps, 1) + " bp vs required " + fmtNum(d.median_required_bps, 1) + " bp (" + d.policy + ")"]);
+    if (d.share_clearing_threshold != null) rows.push(["rows clearing the threshold", fmtNum(100 * d.share_clearing_threshold, 1) + "% of the acceptance sample"]);
+    if (d.calibration_correlation != null) rows.push(["calibration relation", "corr " + fmtNum(d.calibration_correlation, 4) + " over " + (d.calibration_rows || 0) + " out-of-fold rows · " + d.forecast_distinct_values + " distinct forecast values"]);
+    if (rt.bars_until_next_retrain != null) rows.push(["next retrain", rt.bars_until_next_retrain + " bars (about " + fmtNum(rt.sessions_until_next_retrain, 1) + " sessions)"]);
+    kv("retrainPanel", rows);
+    const checks = rt.checks || {}, values = rt.values || {};
+    tableRows("retrainChecks", Object.keys(checks).map(k => ({ cells: [k, values[k] == null ? "–" : fmtNum(values[k], 4),
+      { text: checks[k] ? "pass" : "FAIL", cls: checks[k] ? "gate-pass" : "gate-fail" }] })));
+  }
   function renderEdge(d) {
     const canvas = $("edgeChart"), g = setupCanvas(canvas); const el = $("edgeText");
     if (!g) return; const { ctx, w, h } = g; ctx.clearRect(0, 0, w, h);

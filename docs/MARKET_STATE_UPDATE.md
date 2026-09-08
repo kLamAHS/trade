@@ -227,7 +227,29 @@ Model metadata records `feature_families`, `components` (HMM / Kalman parameters
 `data_tier` of the training data; all of them enter the fitted-model hash used by the
 reproducibility check.
 
-## 10. Known limits
+## 10. Why a retrain is rejected, and how to read it
+
+A rejected model leaves the bot in `INITIALIZING` with no position and no orders. That is the designed
+behaviour, but with no explanation it is indistinguishable from a stall, so every retraining cycle now
+records **why** its acceptance sample did or did not trade (`TrainingReport.holdout_diagnosis`,
+`TradingBot.retrain_status()`, the *Model status* card, and `last_retrain` in the run summary).
+
+An acceptance sample that takes no trades produces a row of zeros: net P&L exactly 0, profit factor
+exactly 0, and an ablation delta of exactly 0 because the full and baseline models both score 0.000.
+Four acceptance checks then fail for what is really one reason. The diagnosis separates the two causes:
+
+* **The calibrator collapsed to a constant.** Isotonic calibration is monotone by construction, so when
+  the pooled out-of-fold predictions carry no increasing relation to the label it fits a constant. Every
+  bar then gets the same expected return, and no decision policy can produce a signal. This is the honest
+  verdict of a model without edge, not a numerical failure; the diagnosis reports the calibration
+  correlation and the number of distinct forecast values behind it.
+* **The forecasts are real but never clear the trade threshold.** Reported as the |ER| distribution
+  (median, p90, max, in bps) against the required edge in bps, plus the share of rows that clear it.
+
+Both are visible before the acceptance table, so the numbers say whether the strategy has no signal or
+a signal too small to pay for its own execution.
+
+## 11. Known limits
 
 * Intrabar quote updates are not observed: OFI and quote imbalance are computed from
   bar-close NBBO snapshots, which the OFI special gate states explicitly.

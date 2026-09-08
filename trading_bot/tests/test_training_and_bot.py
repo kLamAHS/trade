@@ -162,3 +162,47 @@ def test_bot_halts_on_corrupt_bar(fast_cfg, tmp_path):
     events = [json.loads(l) for l in (tmp_path / "audit" / "halt_events.jsonl").read_text().splitlines()]
     assert any(e["event"] == "DATA_HALT" for e in events)
     assert any(e["event"] == "DATA_HALT_CLEARED" for e in events)
+
+
+def test_rejected_retrain_explains_itself(fast_cfg, tmp_path):
+    """A rejected model leaves the bot in INITIALIZING with no orders.  That is the designed behaviour,
+    but it must be distinguishable from a stall: the report carries a diagnosis naming the cause."""
+    strict = fast_cfg.with_overrides({"training": {"acceptance": {"min_accuracy": 0.99, "min_correlation": 0.99,
+                                                                  "min_net_pnl": 1.0, "min_profit_factor": 99.0,
+                                                                  "min_folds_beating_baseline": 5,
+                                                                  "require_holdout_edge": True}}})
+    bars = generate_synthetic_bars(1800, seed=5, instrument="SYN")
+    bot = TradingBot(strict, run_id="reject", artifacts_dir=tmp_path, log=None)
+    bot.run(ReplayFeed(bars, bot.calendar))
+
+    assert bot.model is None and bot.state == BotState.INITIALIZING and len(bot.ledger.trades) == 0
+    st = bot.retrain_status()
+    assert st["status"] == "rejected" and st["has_model"] is False and st["reasons"]
+    assert st["bars_until_next_retrain"] >= 0 and st["sessions_until_next_retrain"] >= 0
+    d = st["diagnosis"]
+    # the diagnosis says what the acceptance sample actually did and how far the forecasts were from trading
+    assert d["rows"] > 0 and d["n_signals"] >= 0 and d["policy"] in ("net_edge", "legacy")
+    assert d["median_required_bps"] > 0 and math.isfinite(d["median_abs_edge_bps"])
+    assert 0.0 <= d["share_clearing_threshold"] <= 1.0
+    assert st["detail"] and st["detail"] == d["reason"]
+    if d["n_signals"] == 0:
+        # exactly one of the two causes is named, and it is the one the numbers support
+        collapsed = d["forecast_distinct_values"] <= 2 or d["forecast_std"] < 1e-12
+        assert ("calibrator collapsed" in d["reason"]) == collapsed
+        assert ("never clear the trade threshold" in d["reason"]) != collapsed
+    else:
+        assert "signals" in d["reason"]
+    summary = json.loads((tmp_path / "audit" / "reject_summary.json").read_text())
+    assert summary["last_retrain"]["status"] == "rejected"
+
+
+def test_calibrator_collapses_when_the_signal_has_no_monotone_relation():
+    """The isotonic calibrator is the mechanism that turns 'no edge' into 'no forecast': with a
+    non-increasing (A, Y) relation it is a constant, so every bar gets the same expected return and
+    no policy can produce a signal.  The diagnosis above must be able to detect that."""
+    rng = np.random.default_rng(0)
+    A = rng.normal(size=2000)
+    healthy = Calibrator().fit(A, 0.3 * A + rng.normal(size=2000)).predict(A)
+    collapsed = Calibrator().fit(A, -0.3 * A + rng.normal(size=2000)).predict(A)
+    assert len(np.unique(np.round(healthy, 12))) > 10 and np.std(healthy) > 0.1
+    assert len(np.unique(np.round(collapsed, 12))) <= 2
