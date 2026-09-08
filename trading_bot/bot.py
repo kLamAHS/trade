@@ -227,6 +227,40 @@ class TradingBot:
             return
         cs.append(bar)
 
+    def retrain_status(self) -> dict:
+        """What the last retraining cycle decided and why, for the dashboard and the run summary.
+
+        A rejected model leaves the bot in INITIALIZING with no position and no orders: that is the
+        designed behaviour, but without this record it is indistinguishable from a bot that is stuck.
+        """
+        r = self.last_report
+        bars_to_retry = max(0, self.retrain_every - self.bars_since_retrain)
+        out: dict = {"retrains": self.retrain_count, "has_model": self.model is not None,
+                     "model_version": self.registry.current_version,
+                     "bars_until_next_retrain": bars_to_retry,
+                     "sessions_until_next_retrain": round(bars_to_retry / max(1, int(self.cfg.market.bars_per_day)), 1),
+                     "minimum_bars": self.minimum_bars, "bars_stored": len(self.store)}
+        if r is None:
+            out.update({"status": "none yet", "reasons": [], "diagnosis": None,
+                        "detail": "no retraining cycle has run yet"})
+            return out
+        if r.error:
+            out.update({"status": "failed", "reasons": [r.error], "diagnosis": None, "detail": r.error})
+            return out
+        checks = dict(r.acceptance.checks) if r.acceptance else {}
+        diag = dict(r.holdout_diagnosis or {})
+        out.update({
+            "status": "accepted" if r.accepted else "rejected",
+            "reasons": list(r.acceptance.reasons) if r.acceptance else [],
+            "checks": checks, "values": dict(r.acceptance.values) if r.acceptance else {},
+            "diagnosis": diag, "detail": diag.get("reason", ""),
+            "holdout_rows": r.holdout_rows, "delta_score": r.delta_score,
+            "fold_signals": [m.n_signals for m in r.full_fold_metrics],
+            "fold_trades": [m.n_trades for m in r.full_fold_metrics],
+            "elapsed_seconds": round(r.elapsed_seconds, 1),
+        })
+        return out
+
     def _apply_report(self, report: TrainingReport) -> None:
         self.retrain_count += 1
         self.last_report = report
@@ -538,6 +572,7 @@ class TradingBot:
             "mirror_reconciliation": mirror,
             "execution_calibration": self.execution_calibration.summary(),
             "decision_policy": self.signal_engine.policy.to_dict(),
+            "last_retrain": self.retrain_status(),
             "feature_families": list(self.model.families) if self.model is not None and getattr(self.model, "families", None) else [],
             "data_tier": self.store.data_tier() if len(self.store) else None,
             "config": self.cfg.to_dict(), "config_digest": self.cfg.digest(),

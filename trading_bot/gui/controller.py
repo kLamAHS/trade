@@ -541,6 +541,7 @@ class BotController:
             "fractional_contribution": bot.diagnostics.contribution[-40:],
             "events": events,
             "summary": self.summary["metrics"] if self.summary else None,
+            "last_retrain": bot.retrain_status(),
             "execution_calibration": bot.execution_calibration.summary(),
             "recent_executions": bot.execution_calibration.recent(20),
             "policy": bot.signal_engine.policy.to_dict(),

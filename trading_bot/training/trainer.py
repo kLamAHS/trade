@@ -43,7 +43,8 @@ from ..models.combined import CombinedModel, ModelMetadata, combine
 from ..models.direction import DirectionModel
 from ..models.regression import BoostedRegressor, RegressionParams
 from .dataset import TrainingDataset, TrainingDatasetBuilder
-from .validation import (AcceptanceResult, ModelValidator, SimulationParams, ValidationMetrics, simulate_validation)
+from .validation import (AcceptanceResult, ModelValidator, SimulationParams, ValidationMetrics, _safe_corr,
+                         simulate_validation)
 from .walkforward import Fold, walk_forward_folds
 
 
@@ -104,6 +105,7 @@ class HoldoutEvaluation:
     exec_model: Optional[ExecutionModel] = None
     P: Optional[np.ndarray] = None
     adverse: Optional[np.ndarray] = None
+    diagnosis: dict[str, Any] = field(default_factory=dict)   # why this block traded, or did not
 
 
 @dataclass
@@ -131,6 +133,7 @@ class TrainingReport:
     holdout_d_star: float = float("nan")
     holdout_metrics: Optional[ValidationMetrics] = None
     baseline_holdout_metrics: Optional[ValidationMetrics] = None
+    holdout_diagnosis: dict[str, Any] = field(default_factory=dict)   # why the acceptance sample traded, or did not
     holdout_rows: int = 0
     holdout_span: Optional[tuple[datetime, datetime]] = None   # first/last bar timestamps of the holdout rows
     d_full: float = float("nan")                                # whole-window d* (diagnostics only)
@@ -330,6 +333,55 @@ class ModelTrainer:
     def _calibrator(self) -> Calibrator:
         c = self.cfg.models.calibration
         return Calibrator(method=str(c.method), bins=int(c.bins), min_points=int(c.get("min_points", 10)))
+
+    def forecast_diagnosis(self, ds: TrainingDataset, rows: np.ndarray, E: np.ndarray, metrics: ValidationMetrics,
+                           adverse: np.ndarray | None = None, uncertainty: np.ndarray | None = None,
+                           calibration_corr: float = float("nan"), calibration_rows: int = 0) -> dict[str, Any]:
+        """Why did this block of rows trade, or not?  A rejected retrain otherwise reports a row of zeros
+        (no trades -> no P&L, no profit factor, no ablation delta), which says nothing about the cause.
+        The two causes that matter are distinguishable: a calibrator that collapsed to a constant because
+        the out-of-fold forecasts carried no monotone relation to the label, and forecasts that are real
+        but too small to clear the trade threshold."""
+        pol = self.sim_params.policy
+        er = np.abs(np.asarray(E, dtype=float)) * ds.sigma[rows] * math.sqrt(self.horizon)
+        cost = ds.cost_roundtrip[rows]
+        adv = np.zeros(len(rows)) if adverse is None else np.asarray(adverse, dtype=float)
+        unc = np.zeros(len(rows)) if uncertainty is None else np.asarray(uncertainty, dtype=float)
+        if pol.mode == "legacy":
+            required = pol.cost_multiplier * cost
+        else:
+            required = cost + adv + unc + pol.uncertainty_buffer + pol.minimum_net_edge
+        ok = np.isfinite(er) & np.isfinite(required)
+        bps = lambda v: float(v * 1e4)  # noqa: E731
+        out: dict[str, Any] = {
+            "rows": int(len(rows)), "n_signals": int(metrics.n_signals), "n_trades": int(metrics.n_trades),
+            "policy": pol.mode, "forecast_distinct_values": int(len(np.unique(np.round(np.asarray(E, dtype=float), 12)))),
+            "forecast_std": float(np.std(E)) if len(E) else 0.0,
+            "calibration_correlation": float(calibration_corr), "calibration_rows": int(calibration_rows),
+            "median_abs_edge_bps": bps(np.median(er[ok])) if ok.any() else 0.0,
+            "p90_abs_edge_bps": bps(np.percentile(er[ok], 90)) if ok.any() else 0.0,
+            "max_abs_edge_bps": bps(np.max(er[ok])) if ok.any() else 0.0,
+            "median_required_bps": bps(np.median(required[ok])) if ok.any() else 0.0,
+            "share_clearing_threshold": float(np.mean(er[ok] > required[ok])) if ok.any() else 0.0,
+        }
+        out["reason"] = self._diagnosis_text(out)
+        return out
+
+    @staticmethod
+    def _diagnosis_text(d: dict[str, Any]) -> str:
+        if d["n_signals"] > 0:
+            return (f"{d['n_signals']} signals and {d['n_trades']} trades from {d['rows']} rows "
+                    f"(median |ER| {d['median_abs_edge_bps']:.1f} bps vs required {d['median_required_bps']:.1f} bps)")
+        if d["forecast_distinct_values"] <= 2 or d["forecast_std"] < 1e-12:
+            corr = d["calibration_correlation"]
+            corr_txt = f"{corr:+.4f}" if math.isfinite(corr) else "n/a"
+            return ("the calibrator collapsed to a constant forecast, so no bar can produce a signal: the "
+                    f"out-of-fold predictions had no monotone relation to the label (corr {corr_txt} over "
+                    f"{d['calibration_rows']} rows). The model found no edge; this is a verdict, not a fault")
+        return ("forecasts are real but never clear the trade threshold: |ER| median "
+                f"{d['median_abs_edge_bps']:.1f} bps, p90 {d['p90_abs_edge_bps']:.1f} bps, max "
+                f"{d['max_abs_edge_bps']:.1f} bps against a required {d['median_required_bps']:.1f} bps "
+                f"({d['policy']} policy)")
 
     def _simulate(self, ds: TrainingDataset, rows: np.ndarray, E: np.ndarray, M: np.ndarray | None = None,
                   adverse: np.ndarray | None = None, uncertainty: np.ndarray | None = None) -> ValidationMetrics:
@@ -531,7 +583,9 @@ class ModelTrainer:
         E = cal.predict(A)
         adv, unc = self._adverse_for(ex, ds_ref, holdout_rows, E, P)
         metrics = self._simulate(ds_ref, holdout_rows, E, M, adv, unc)
-        return HoldoutEvaluation(holdout_rows, d_h, metrics, A, E, inner_rows, comp_h, ex, P, adv)
+        cal_corr = _safe_corr(pooled_A, pooled_Y)      # the relation isotonic calibration had to work with
+        diag = self.forecast_diagnosis(ds_ref, holdout_rows, E, metrics, adv, unc, cal_corr, len(pooled_A))
+        return HoldoutEvaluation(holdout_rows, d_h, metrics, A, E, inner_rows, comp_h, ex, P, adv, diag)
 
     def _metadata(self, ds: TrainingDataset, params: RegressionParams, names, validation: dict[str, Any],
                   direction: DirectionModel, is_baseline: bool, extra: dict[str, Any],
@@ -670,8 +724,10 @@ class ModelTrainer:
                 holdout_base = self.evaluate_holdout(window, ds, inner_rows, holdout_rows, baseline, base_names)
                 acceptance_sample = holdout_full.metrics
                 delta = holdout_full.metrics.score - holdout_base.metrics.score
-                _log(f"holdout (d*={holdout_full.d_star:.2f}): full score={holdout_full.metrics.score:.3f} "
-                     f"baseline score={holdout_base.metrics.score:.3f} delta={delta:.3f}")
+                _log(f"holdout (d*={holdout_full.d_star:.2f}, {len(holdout_rows)} rows): "
+                     f"full score={holdout_full.metrics.score:.3f} baseline score={holdout_base.metrics.score:.3f} "
+                     f"delta={delta:.3f}")
+                _log(f"holdout verdict: {holdout_full.diagnosis.get('reason', '')}")
             else:
                 acceptance_sample = best.aggregate
                 delta = best.mean_score - baseline.mean_score
@@ -771,7 +827,10 @@ class ModelTrainer:
                                   holdout_metrics=holdout_full.metrics if holdout_full else None,
                                   baseline_holdout_metrics=holdout_base.metrics if holdout_base else None,
                                   holdout_rows=int(len(holdout_rows)), holdout_span=holdout_span, d_full=d_full,
-                                  baseline_model=baseline_model)
+                                  baseline_model=baseline_model,
+                                  holdout_diagnosis=dict(holdout_full.diagnosis) if holdout_full else
+                                  self.forecast_diagnosis(ds, np.concatenate([fp.rows for fp in best.fold_predictions]),
+                                                          np.concatenate(best.fold_E), best.aggregate))
         except Exception as exc:
             return TrainingReport(None, False, None, stationarity, {}, [], [], [], None, None, float("nan"), 0,
                                   window[0].timestamp, window[-1].timestamp, time.time() - t0,
