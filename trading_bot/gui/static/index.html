@@ -154,6 +154,8 @@
         <div id="downloadHint" class="hint"></div>
         <label for="context_paths">Context CSVs (cross-asset instruments, <code>SYMBOL=path.csv</code> per line; synthetic runs generate them)</label>
         <textarea id="context_paths" style="min-height:48px" placeholder="QQQ=artifacts/data/QQQ_30m.csv&#10;IWM=artifacts/data/IWM_30m.csv"></textarea>
+        <label for="panel_paths">Panel CSVs (pooled <em>training</em> instruments, <code>SYMBOL=path.csv</code> per line; never traded)</label>
+        <textarea id="panel_paths" style="min-height:48px" placeholder="QQQ=artifacts/data/QQQ_30m.csv&#10;DIA=artifacts/data/DIA_30m.csv"></textarea>
       </div>
       <div class="row">
         <div><label for="history_days">History days (Alpaca)</label><input type="number" id="history_days" value="1200" min="200" step="50"></div>
@@ -358,7 +360,7 @@
 <script>
 (function () {
   const $ = (id) => document.getElementById(id);
-  const fields = ["api_key", "symbol", "mode", "data_source", "csv_path", "context_paths", "synthetic_bars", "history_days", "initial_capital", "overrides", "fast", "mirror_orders"];
+  const fields = ["api_key", "symbol", "mode", "data_source", "csv_path", "context_paths", "panel_paths", "synthetic_bars", "history_days", "initial_capital", "overrides", "fast", "mirror_orders"];
   let logSeq = 0, lastStatus = null, equityTableOpen = false;
 
   const fmtMoney = (v) => (v == null || isNaN(v)) ? "–" : v.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
@@ -603,7 +605,7 @@
         (p.meets_min_windows ? `That meets the ${p.min_windows}-window gate.` : `The ${p.min_windows}-window gate needs about ${p.bars_needed_for_min_windows.toLocaleString()} bars (${p.sessions_needed_for_min_windows.toLocaleString()} sessions).`);
     } catch (e) { $("vPlan").textContent = "schedule preview unavailable: " + e.message; }
   }
-  ["synthetic_bars", "csv_path", "context_paths", "data_source", "fast", "overrides"].forEach(id => $(id).addEventListener("change", () => { if ($("tabValidation").style.display !== "none") loadPlan(); }));
+  ["synthetic_bars", "csv_path", "context_paths", "panel_paths", "data_source", "fast", "overrides"].forEach(id => $(id).addEventListener("change", () => { if ($("tabValidation").style.display !== "none") loadPlan(); }));
 
   function renderResearchStatus(r) {
     if (!r) return;
@@ -841,6 +843,12 @@
     if (d.median_abs_edge_bps != null) rows.push(["forecast vs threshold", "|ER| median " + fmtNum(d.median_abs_edge_bps, 1) + " · p90 " + fmtNum(d.p90_abs_edge_bps, 1) + " · max " + fmtNum(d.max_abs_edge_bps, 1) + " bp vs required " + fmtNum(d.median_required_bps, 1) + " bp (" + d.policy + ")"]);
     if (d.share_clearing_threshold != null) rows.push(["rows clearing the threshold", fmtNum(100 * d.share_clearing_threshold, 1) + "% of the acceptance sample"]);
     if (d.calibration_correlation != null) rows.push(["calibration relation", "corr " + fmtNum(d.calibration_correlation, 4) + " over " + (d.calibration_rows || 0) + " out-of-fold rows · " + d.forecast_distinct_values + " distinct forecast values"]);
+    const pn = rt.panel || {};
+    if (pn.enabled) {
+      rows.push(["training panel", (pn.symbols || []).join(", ") + " · " + (pn.rows_in_final_fit || 0).toLocaleString() + " pooled rows joined " + (pn.primary_rows_in_final_fit || 0).toLocaleString() + " primary rows" + (pn.aligned ? " (aligned)" : "")]);
+      const po = pn.out_of_sample;
+      if (po) rows.push(["panel out of sample", po.rows.toLocaleString() + " rows across " + Object.keys(po.symbols || {}).length + " instruments · correlation " + fmtNum(po.correlation, 4) + " · accuracy " + fmtPct(po.accuracy).replace("+", "")]);
+    }
     if (rt.bars_until_next_retrain != null) rows.push(["next retrain", rt.bars_until_next_retrain + " bars (about " + fmtNum(rt.sessions_until_next_retrain, 1) + " sessions)"]);
     kv("retrainPanel", rows);
     const checks = rt.checks || {}, values = rt.values || {};

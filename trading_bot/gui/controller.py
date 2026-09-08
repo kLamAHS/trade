@@ -164,19 +164,27 @@ class BotController:
         from ..data.synthetic import generate_synthetic_market
 
         s = self.settings
+        extra = tuple(dict.fromkeys(tuple(bot.context_symbols) + tuple(bot.panel_symbols)))
         if s.data_source == "csv":
             bars = read_bars_csv(s.csv_path, cfg.market.instrument, int(cfg.market.bar_minutes))
             for sym, cs in self._context_stores(cfg, bot.context_symbols).items():
                 for b in cs.bars:
                     bot.on_context_bar(b)
-        elif bot.context_symbols:
-            # synthetic primary plus correlated context instruments (with quote sizes: Tier B)
+            for sym, ps in self._panel_stores(cfg, bot.panel_symbols).items():
+                for b in ps.bars:
+                    bot.on_panel_bar(b)
+        elif extra:
+            # synthetic primary plus correlated instruments (with quote sizes: Tier B).  Context symbols
+            # feed features; panel symbols only enlarge the training sample.
             market = generate_synthetic_market(int(s.synthetic_bars), seed=int(s.synthetic_seed), calendar=bot.calendar,
-                                               symbols=(cfg.market.instrument,) + tuple(bot.context_symbols), primary=cfg.market.instrument)
+                                               symbols=(cfg.market.instrument,) + extra, primary=cfg.market.instrument)
             bars = market.bars[cfg.market.instrument]
             for sym in bot.context_symbols:
                 for b in market.bars[sym]:
                     bot.on_context_bar(b)
+            for sym in bot.panel_symbols:
+                for b in market.bars[sym]:
+                    bot.on_panel_bar(b)
         else:
             bars = generate_synthetic_bars(int(s.synthetic_bars), seed=int(s.synthetic_seed),
                                            instrument=cfg.market.instrument, calendar=bot.calendar)
@@ -319,17 +327,30 @@ class BotController:
 
     def _context_stores(self, cfg, symbols) -> dict[str, Any]:
         """Cross-asset context histories from the ``context_paths`` setting for the configured symbols."""
+        return self._symbol_stores(cfg, symbols, self.settings.context_files(), "cross-asset context", "Context CSVs")
+
+    @staticmethod
+    def _panel_symbols(cfg) -> tuple[str, ...]:
+        p = ((cfg.get("training", {}) or {}).get("panel", {}) or {})
+        if not p.get("enabled", False):
+            return ()
+        return tuple(str(x).upper() for x in (p.get("symbols") or []) if str(x).upper() != str(cfg.market.instrument).upper())
+
+    def _panel_stores(self, cfg, symbols) -> dict[str, Any]:
+        """Pooled training histories from the ``panel_paths`` setting.  These instruments are never traded."""
+        return self._symbol_stores(cfg, symbols, self.settings.panel_files(), "training panel", "Panel CSVs")
+
+    def _symbol_stores(self, cfg, symbols, files: dict[str, str], role: str, setting: str) -> dict[str, Any]:
         from ..data.store import BarStore, read_bars_csv
 
-        files = self.settings.context_files()
         out: dict[str, Any] = {}
         for sym in symbols:
             path = files.get(sym)
             if not path:
-                self.log(f"cross-asset context {sym}: no CSV configured (Context CSVs setting); the family will be unavailable")
+                self.log(f"{role} {sym}: no CSV configured ({setting} setting); it will be skipped")
                 continue
             if not Path(path).exists():
-                raise RuntimeError(f"context CSV for {sym} not found: {path!r}")
+                raise RuntimeError(f"{role} CSV for {sym} not found: {path!r}")
             out[sym] = BarStore(sym, int(cfg.market.bar_minutes), read_bars_csv(path, sym, int(cfg.market.bar_minutes)))
         return out
 
@@ -542,6 +563,7 @@ class BotController:
             "events": events,
             "summary": self.summary["metrics"] if self.summary else None,
             "last_retrain": bot.retrain_status(),
+            "panel_symbols": list(bot.panel),
             "execution_calibration": bot.execution_calibration.summary(),
             "recent_executions": bot.execution_calibration.recent(20),
             "policy": bot.signal_engine.policy.to_dict(),

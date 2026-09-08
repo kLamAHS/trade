@@ -41,6 +41,7 @@ from ..fractional.stationarity import StationarityResult
 from ..models.calibration import Calibrator
 from ..models.combined import CombinedModel, ModelMetadata, combine
 from ..models.direction import DirectionModel
+from .panel import TrainingPanel, build_panel_rows, panel_forecast_quality
 from ..models.regression import BoostedRegressor, RegressionParams
 from .dataset import TrainingDataset, TrainingDatasetBuilder
 from .validation import (AcceptanceResult, ModelValidator, SimulationParams, ValidationMetrics, _safe_corr,
@@ -106,6 +107,7 @@ class HoldoutEvaluation:
     P: Optional[np.ndarray] = None
     adverse: Optional[np.ndarray] = None
     diagnosis: dict[str, Any] = field(default_factory=dict)   # why this block traded, or did not
+    panel: dict[str, Any] = field(default_factory=dict)       # the same model's forecasts on the other instruments
 
 
 @dataclass
@@ -134,6 +136,7 @@ class TrainingReport:
     holdout_metrics: Optional[ValidationMetrics] = None
     baseline_holdout_metrics: Optional[ValidationMetrics] = None
     holdout_diagnosis: dict[str, Any] = field(default_factory=dict)   # why the acceptance sample traded, or did not
+    panel_diagnosis: dict[str, Any] = field(default_factory=dict)     # pooled training rows and their out-of-sample forecast quality
     holdout_rows: int = 0
     holdout_span: Optional[tuple[datetime, datetime]] = None   # first/last bar timestamps of the holdout rows
     d_full: float = float("nan")                                # whole-window d* (diagnostics only)
@@ -314,6 +317,14 @@ class ModelTrainer:
         self.adverse_floor = float(e.get("adverse_selection_floor_bps", 0.0)) / 1e4
         self.fold_local_components = bool(t.get("fold_local_components", True))
         self._context: Optional[dict[str, BarStore]] = None      # cross-asset stores for the current retrain
+        p = t.get("panel", {}) or {}                             # pooled training rows from other instruments
+        self.panel_enabled = bool(p.get("enabled", False))
+        self.panel_symbols = tuple(str(s).upper() for s in (p.get("symbols") or []))
+        self.panel_align = bool(p.get("align_features", True))
+        self.panel_max_symbols = int(p.get("max_symbols", 20))
+        self.panel_max_rows = int(p.get("max_rows_per_fit", 0))
+        self._panel_stores: dict[str, BarStore] = {}
+        self._panel_cache: dict = {}
 
     # ------------------------------------------------------------- helpers
     def _params(self, combo: dict[str, Any]) -> RegressionParams:
@@ -324,11 +335,115 @@ class ModelTrainer:
         return dataclasses.replace(base, **extra) if extra else base
 
     def _fit_pair(self, X: np.ndarray, y_norm: np.ndarray, y_raw: np.ndarray, combo: dict[str, Any],
-                  names) -> tuple[BoostedRegressor, DirectionModel]:
-        reg = BoostedRegressor(self._params(combo)).fit(X, y_norm, names)
+                  names, extra: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+                  ) -> tuple[BoostedRegressor, DirectionModel]:
+        """``extra`` are pooled rows from the training panel (other instruments).  They enlarge the fit
+        only: the primary's rows are passed through unchanged and every evaluation downstream still
+        reads the primary alone."""
+        if extra is not None and len(extra[0]):
+            Xf = np.concatenate([X, extra[0]])
+            yn = np.concatenate([y_norm, extra[1]])
+            yr = np.concatenate([y_raw, extra[2]])
+        else:
+            Xf, yn, yr = X, y_norm, y_raw
+        reg = BoostedRegressor(self._params(combo)).fit(Xf, yn, names)
         d = self.cfg.models.direction
-        direction = DirectionModel(C=float(d.C), max_iter=int(d.max_iter), seed=self.seed).fit(X, y_raw)
+        direction = DirectionModel(C=float(d.C), max_iter=int(d.max_iter), seed=self.seed).fit(Xf, yr)
         return reg, direction
+
+    # ------------------------------------------------------ training panel
+    def set_panel(self, stores: Optional[dict[str, BarStore]]) -> None:
+        """Secondary instruments whose rows join every fit.  Cleared between retrains."""
+        self._panel_stores = dict(stores or {})
+        self._panel_cache = {}
+
+    def _panel_for(self, window: BarStore, d: float, names: tuple[str, ...],
+                   cutoff: Optional[datetime] = None) -> Optional[TrainingPanel]:
+        """The panel built with the primary's feature definition ``d`` for this fit.
+
+        Each secondary instrument gets its own fitted components (its HMM / Kalman parameters describe
+        its own history) but the *same* fractional order as the primary, so a pooled column means the
+        same transformation everywhere.
+
+        Feature columns are causal within each symbol, so rows may be filtered by label completion
+        afterwards.  Fitted components are not: parameters estimated over a symbol's whole history would
+        carry its future into every pooled row.  When any parametric family is enabled each symbol's
+        history is therefore truncated at ``cutoff`` before it is built, and the panel is cached per
+        cutoff; with no parametric families the build is cutoff-independent and cached once.
+        """
+        if not getattr(self, "_panel_stores", None) or not self.panel_enabled:
+            return None
+        parametric = self._parametric_families
+        key = (round(float(d), 10), names, cutoff.isoformat() if (parametric and cutoff is not None) else "")
+        cached = self._panel_cache.get(key)
+        if cached is not None:
+            return cached
+        rows = []
+        for sym, store in list(self._panel_stores.items())[: self.panel_max_symbols]:
+            src = self._truncate(store, cutoff) if (parametric and cutoff is not None) else store
+            if len(src) < self.min_dataset_rows:
+                continue
+            try:
+                comp = self._components_for(src, len(src) - 1, {}) if parametric else None
+                ds_s = self.builder.build(src, float(d), components=comp, context=self._context_for(src))
+                pr = build_panel_rows(sym, ds_s, src, self.horizon, names)
+            except Exception:
+                pr = None                      # a symbol that cannot produce the primary's columns is skipped
+            if pr is not None:
+                rows.append(pr)
+        panel = TrainingPanel(rows, align=self.panel_align, max_rows_per_fit=self.panel_max_rows)
+        self._panel_cache[key] = panel
+        return panel
+
+    @staticmethod
+    def _truncate(store: BarStore, cutoff: datetime) -> BarStore:
+        """The prefix of ``store`` that had closed by ``cutoff``."""
+        n = len(store)
+        lo, hi = 0, n
+        while lo < hi:                                   # bars are chronological: binary search the cutoff
+            mid = (lo + hi) // 2
+            if store[mid].close_time <= cutoff:
+                lo = mid + 1
+            else:
+                hi = mid
+        return store if lo == n else store.slice(0, lo)
+
+    def _panel_out_of_sample(self, window: BarStore, ds: TrainingDataset, inner_rows: np.ndarray,
+                             holdout_rows: np.ndarray, d: float, model) -> dict[str, Any]:
+        """The holdout question asked of the instruments the bot will *not* trade.
+
+        The model was fitted on the inner block only, so its forecasts over the holdout span are out of
+        sample for every symbol.  One instrument gives one experiment; a pooled correlation near zero
+        beside a healthy primary correlation is the signature of a result that will not repeat.
+        """
+        last = len(window) - 1
+        start = window[min(self._last_label_bar(ds, int(inner_rows[-1])), last)].close_time
+        end = window[min(self._last_label_bar(ds, int(holdout_rows[-1])), last)].close_time
+        panel = self._panel_for(window, d, tuple(model.feature_names), start)   # fitted only on the inner block
+        if panel is None or not len(panel):
+            return {}
+        rows = panel.out_of_sample(start, end)
+        if not rows:
+            return {}
+        out = panel_forecast_quality(model, rows)
+        out["span"] = [start.isoformat(), end.isoformat()]
+        return out
+
+    def _pooled(self, window: BarStore, ds: TrainingDataset, rows: np.ndarray, d: float,
+                names: tuple[str, ...], primary_X: np.ndarray):
+        """Pooled rows eligible for a fit whose primary rows end at ``rows[-1]``.
+
+        The cutoff is the close of the newest bar entering that row's label: a panel row may join only
+        once its own label is complete by then, so no fit ever sees a label the primary could not.
+        """
+        if not len(rows):
+            return None
+        idx = min(self._last_label_bar(ds, int(rows[-1])), len(window) - 1)
+        cutoff = window[idx].close_time
+        panel = self._panel_for(window, d, names, cutoff)
+        if panel is None or not len(panel):
+            return None
+        return panel.eligible(cutoff, primary_X)
 
     def _calibrator(self) -> Calibrator:
         c = self.cfg.models.calibration
@@ -485,7 +600,9 @@ class ModelTrainer:
         for fs in fold_sets:
             fold, ds = fs.fold, fs.dataset
             X = ds.columns(names)
-            reg, direction = self._fit_pair(X[fold.train], ds.y_norm[fold.train], ds.y_raw[fold.train], combo, names)
+            pooled = self._pooled(fs.window, ds, fold.train, fs.d_star, names, X[fold.train]) if fs.window is not None else None
+            reg, direction = self._fit_pair(X[fold.train], ds.y_norm[fold.train], ds.y_raw[fold.train], combo, names,
+                                            extra=pooled)
             M = reg.predict(X[fold.validate])
             P = direction.predict_proba_up(X[fold.validate])
             A, _ = combine(M, P)
@@ -550,7 +667,10 @@ class ModelTrainer:
                 comp = self._components_for(first.window, self._last_label_bar(ds, int(inner_train[-1])), {})
             ds = self._dataset_for(first.window, ds, st.d_star, {}, comp)
         Xall = ds.columns(tuple(names))
-        reg, direction = self._fit_pair(Xall[inner_train], ds.y_norm[inner_train], ds.y_raw[inner_train], combo, names)
+        pooled = (self._pooled(first.window, ds, inner_train, ds.adaptive_d, tuple(names), Xall[inner_train])
+                  if first.window is not None else None)
+        reg, direction = self._fit_pair(Xall[inner_train], ds.y_norm[inner_train], ds.y_raw[inner_train], combo, names,
+                                        extra=pooled)
         P = direction.predict_proba_up(Xall[inner_cal])
         A, _ = combine(reg.predict(Xall[inner_cal]), P)
         return A, ds.y_norm[inner_cal], inner_cal, P
@@ -569,8 +689,9 @@ class ModelTrainer:
         comp_h = self._components_for(window, self._last_label_bar(ds_ref, int(inner_rows[-1])), {})
         ds_h = self._dataset_for(window, ds_ref, d_h, {}, comp_h)
         X = ds_h.columns(tuple(names))
+        pooled = self._pooled(window, ds_h, inner_rows, d_h, tuple(names), X[inner_rows])
         reg, direction = self._fit_pair(X[inner_rows], ds_h.y_norm[inner_rows], ds_h.y_raw[inner_rows],
-                                        candidate.params, names)
+                                        candidate.params, names, extra=pooled)
         pooled_A = np.concatenate([fp.A for fp in candidate.fold_predictions])
         pooled_Y = np.concatenate([ds_ref.y_norm[fp.rows] for fp in candidate.fold_predictions])
         pooled_P = np.concatenate([fp.P for fp in candidate.fold_predictions])
@@ -585,7 +706,10 @@ class ModelTrainer:
         metrics = self._simulate(ds_ref, holdout_rows, E, M, adv, unc)
         cal_corr = _safe_corr(pooled_A, pooled_Y)      # the relation isotonic calibration had to work with
         diag = self.forecast_diagnosis(ds_ref, holdout_rows, E, metrics, adv, unc, cal_corr, len(pooled_A))
-        return HoldoutEvaluation(holdout_rows, d_h, metrics, A, E, inner_rows, comp_h, ex, P, adv, diag)
+        panel = self._panel_out_of_sample(window, ds_ref, inner_rows, holdout_rows, d_h,
+                                          CombinedModel(reg, direction, cal, tuple(names), float(d_h), self.horizon,
+                                                        None, components=comp_h, families=ds_h.families))
+        return HoldoutEvaluation(holdout_rows, d_h, metrics, A, E, inner_rows, comp_h, ex, P, adv, diag, panel)
 
     def _metadata(self, ds: TrainingDataset, params: RegressionParams, names, validation: dict[str, Any],
                   direction: DirectionModel, is_baseline: bool, extra: dict[str, Any],
@@ -661,7 +785,10 @@ class ModelTrainer:
             cal_rows = np.arange(min(n, split + self.embargo), n)
             if len(fit_rows) < self.inner_min_fit or len(cal_rows) < self.inner_min_cal:
                 raise ValueError("window too small for a light refit")
-            reg, direction = self._fit_pair(X[fit_rows], y_norm[fit_rows], y_raw[fit_rows], params, names)
+            # A sabotaged refit must stay sabotaged: real pooled rows would undo the shuffle.
+            pooled = (None if (shuffle_labels or shuffle_features)
+                      else self._pooled(window, ds, fit_rows, float(d), names, X[fit_rows]))
+            reg, direction = self._fit_pair(X[fit_rows], y_norm[fit_rows], y_raw[fit_rows], params, names, extra=pooled)
             P = direction.predict_proba_up(X[cal_rows])
             A, _ = combine(reg.predict(X[cal_rows]), P)
             cal = self._calibrator().fit(A, y_norm[cal_rows])
@@ -672,10 +799,15 @@ class ModelTrainer:
             self.fe.set_adaptive_d(previous_d)
 
     # -------------------------------------------------------------- retrain
-    def retrain(self, history: BarStore, log=None, context: Optional[dict[str, BarStore]] = None) -> TrainingReport:
+    def retrain(self, history: BarStore, log=None, context: Optional[dict[str, BarStore]] = None,
+                panel: Optional[dict[str, BarStore]] = None) -> TrainingReport:
+        """``panel`` are secondary instruments whose rows join every model fit (pooled training).  They
+        never enter a fold's validation block, the holdout, the acceptance metrics or the simulated
+        P&L: what is accepted remains a statement about the instrument the bot trades."""
         t0 = time.time()
         _log = log or (lambda *a, **k: None)
         self._context = context
+        self.set_panel(panel)
         window = history.last(self.window_bars)
         if len(window) < self.minimum_bars:
             return TrainingReport(None, False, None, None, {}, [], [], [], None, None, float("nan"), 0, None, None,
@@ -751,7 +883,10 @@ class ModelTrainer:
             comp_prod = holdout_full.components if holdout_full is not None else comp_full
             ds_prod = self._dataset_for(window, ds, d_prod, {}, comp_prod)
             Xall = ds_prod.columns(full_names)
-            reg, direction = self._fit_pair(Xall, ds_prod.y_norm, ds_prod.y_raw, best.params, full_names)
+            all_rows = np.arange(len(ds_prod))
+            pooled_prod = self._pooled(window, ds_prod, all_rows, d_prod, full_names, Xall)
+            reg, direction = self._fit_pair(Xall, ds_prod.y_norm, ds_prod.y_raw, best.params, full_names,
+                                            extra=pooled_prod)
             pooled_A = [fp.A for fp in best.fold_predictions]
             pooled_Y = [ds.y_norm[fp.rows] for fp in best.fold_predictions]
             pooled_P = [fp.P for fp in best.fold_predictions]
@@ -793,7 +928,8 @@ class ModelTrainer:
             if self.fit_final_baseline:
                 # Same protocol for the conventional-feature baseline (research ablation, section 9).
                 Xb = ds_prod.columns(base_names)
-                reg_b, dir_b = self._fit_pair(Xb, ds_prod.y_norm, ds_prod.y_raw, baseline.params, base_names)
+                reg_b, dir_b = self._fit_pair(Xb, ds_prod.y_norm, ds_prod.y_raw, baseline.params, base_names,
+                                              extra=self._pooled(window, ds_prod, all_rows, d_prod, base_names, Xb))
                 pooled_Ab = [fp.A for fp in baseline.fold_predictions]
                 pooled_Yb = [ds.y_norm[fp.rows] for fp in baseline.fold_predictions]
                 if holdout_base is not None:
@@ -815,6 +951,24 @@ class ModelTrainer:
                                                components=comp_prod, execution_model=exec_b,
                                                families=tuple(f for f in ds.families if f != "FRACTIONAL"))
             holdout_span = None
+            prod_cutoff = window[min(self._last_label_bar(ds_prod, len(ds_prod) - 1), len(window) - 1)].close_time
+            panel_ref = self._panel_for(window, d_prod, full_names, prod_cutoff)
+            panel_diag: dict[str, Any] = {
+                "enabled": bool(self.panel_enabled), "symbols": list(panel_ref.symbols) if panel_ref else [],
+                "pooled_rows": len(panel_ref) if panel_ref else 0,
+                "rows_in_final_fit": int(len(pooled_prod[1])) if pooled_prod is not None else 0,
+                "primary_rows_in_final_fit": int(len(ds_prod)), "aligned": bool(self.panel_align),
+            }
+            if holdout_full is not None and holdout_full.panel:
+                panel_diag["out_of_sample"] = holdout_full.panel
+                p = holdout_full.panel
+                head = f"panel out of sample: {p['rows']} rows across {len(p.get('symbols', {}))} instruments, "
+                _log(head + ("no forecast (the calibrator is constant on them too)" if p.get("forecast_constant")
+                             else f"correlation {p['correlation']:+.4f}, accuracy {p['accuracy']:.3f}"))
+            if panel_diag["pooled_rows"]:
+                _log(f"training panel: {panel_diag['rows_in_final_fit']} pooled rows from "
+                     f"{len(panel_diag['symbols'])} instruments joined the final fit of "
+                     f"{panel_diag['primary_rows_in_final_fit']} primary rows")
             if holdout_full is not None:
                 holdout_span = (window[int(ds.bar_index[holdout_full.rows[0]])].timestamp,
                                 window[int(ds.bar_index[holdout_full.rows[-1]])].timestamp)
@@ -830,7 +984,8 @@ class ModelTrainer:
                                   baseline_model=baseline_model,
                                   holdout_diagnosis=dict(holdout_full.diagnosis) if holdout_full else
                                   self.forecast_diagnosis(ds, np.concatenate([fp.rows for fp in best.fold_predictions]),
-                                                          np.concatenate(best.fold_E), best.aggregate))
+                                                          np.concatenate(best.fold_E), best.aggregate),
+                                  panel_diagnosis=panel_diag)
         except Exception as exc:
             return TrainingReport(None, False, None, stationarity, {}, [], [], [], None, None, float("nan"), 0,
                                   window[0].timestamp, window[-1].timestamp, time.time() - t0,

@@ -132,6 +132,17 @@ training:
   outer_holdout_fraction: 0.15 # newest rows never used for selection; acceptance and the ablation score are read there (0 disables)
   fold_local_d: true           # estimate d* per fold from that fold's training block only (false: whole-window d* everywhere)
   fold_local_components: true  # fit HMM / Kalman / VPIN parameters per fold from its training block only
+  panel:                       # pooled training rows from other instruments (the bot still trades one symbol)
+    # One instrument gives one experiment.  Panel symbols add rows to every model *fit* only: folds, the
+    # outer holdout, the acceptance criteria and the simulated P&L stay on the traded instrument, so what
+    # is accepted is still a statement about it.  The label is already scale free (returns in units of the
+    # symbol's own volatility); level-dependent features are mapped onto the primary's training
+    # distribution so a tree cannot split on "which symbol is this".
+    enabled: false
+    symbols: []                # e.g. [QQQ, IWM, DIA, MDY]
+    align_features: true       # map each panel symbol's feature distribution onto the primary's
+    max_symbols: 20
+    max_rows_per_fit: 0        # 0 = no cap; otherwise thin the pooled rows deterministically
   # Fixed, small hyperparameter search space (spec section 41).  The identical
   # candidates are evaluated on every retraining cycle.
   hyperparameter_grid:

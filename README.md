@@ -178,6 +178,25 @@ disprove the strategy:
 Runs are written to `artifacts/runs/<run_id>/` (`manifest.yaml`, `summary.json`, `equity.csv`,
 `trades.csv`, `fills.csv`, `decisions.csv`, `retrains.csv`, `models/`, `diagnostics/`, `plots/`, `logs/`).
 
+## Pooled training across instruments (the training panel)
+
+The bot trades one instrument. `docs/TRAINING_PANEL.md` describes the optional **training panel**, which
+adds rows from other symbols to every model *fit* while folds, the outer holdout, the acceptance criteria
+and the simulated P&L stay on the traded instrument. Panel symbols are never traded, sized or held.
+
+```bash
+python -m trading_bot.main backtest --csv artifacts/data/SPY_30m.csv --symbol SPY \
+    --panel QQQ=artifacts/data/QQQ_30m.csv --panel IWM=artifacts/data/IWM_30m.csv \
+    --set training.panel.enabled=true --set training.panel.symbols=[QQQ,IWM]
+```
+
+One instrument gives one experiment. Pooling enlarges a thin sample (a 4000-bar window with overlapping
+labels feeding a 39-feature model), and, more importantly, lets the holdout model be scored on
+instruments it will not trade: a healthy primary correlation beside a flat pooled correlation is the
+signature of a result that will not repeat. Rows join causally (a panel row is refused until its own
+label is complete by the primary's training cutoff) and level-dependent features are mapped onto the
+primary's training distribution, while the primary's own rows are never rescaled.
+
 ## Market state, microstructure and execution intelligence
 
 `docs/MARKET_STATE_UPDATE.md` describes the causal, regime-aware, execution-aware extension:

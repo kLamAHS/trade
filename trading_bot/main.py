@@ -89,6 +89,35 @@ def _load_bars(args, cfg):
     raise SystemExit("provide --csv PATH or --synthetic N")
 
 
+def _panel_symbols(cfg) -> tuple[str, ...]:
+    p = ((cfg.get("training", {}) or {}).get("panel", {}) or {})
+    if not p.get("enabled", False):
+        return ()
+    return tuple(str(s).upper() for s in (p.get("symbols") or []) if str(s).upper() != str(cfg.market.instrument).upper())
+
+
+def _load_panel(args, cfg, calendar=None) -> dict:
+    """Pooled training instruments: ``--panel SYMBOL=path.csv`` entries, or the synthetic market's other
+    instruments when the primary is synthetic and ``training.panel.symbols`` is set.  Never traded."""
+    from .data.calendar import SessionCalendar
+    from .data.store import BarStore, read_bars_csv
+
+    cal = calendar or SessionCalendar.from_config(cfg)
+    out = {}
+    market = _synthetic_market(args, cfg, cal)
+    if market is not None:
+        for sym in _panel_symbols(cfg):
+            if sym in market.bars:
+                out[sym] = BarStore(sym, int(cfg.market.bar_minutes), market.bars[sym])
+    for item in getattr(args, "panel", None) or []:
+        if "=" not in item:
+            raise SystemExit(f"--panel expects SYMBOL=path.csv, got {item!r}")
+        sym, path = item.split("=", 1)
+        sym = sym.upper()
+        out[sym] = BarStore(sym, int(cfg.market.bar_minutes), read_bars_csv(path, sym, int(cfg.market.bar_minutes)))
+    return out
+
+
 def _context_symbols(cfg) -> tuple[str, ...]:
     ca = (cfg.get("features", {}) or {}).get("cross_asset", {}) or {}
     if not ca.get("enabled", False):
@@ -104,7 +133,7 @@ def _synthetic_market(args, cfg, calendar):
 
     if not getattr(args, "synthetic", None):
         return None
-    symbols = _context_symbols(cfg)
+    symbols = tuple(dict.fromkeys(_context_symbols(cfg) + _panel_symbols(cfg)))
     if not (getattr(args, "hostile", False) or symbols):
         return None
     cached = getattr(args, "_synthetic_market", None)
@@ -175,6 +204,11 @@ def cmd_backtest(args) -> int:
     for sym, cs in _load_context(args, cfg, bot.calendar).items():
         for b in cs.bars:
             bot.on_context_bar(b)
+    for sym, ps in _load_panel(args, cfg, bot.calendar).items():
+        for b in ps.bars:
+            bot.on_panel_bar(b)
+    if bot.panel:
+        print(f"training panel: {', '.join(f'{s} ({len(v)} bars)' for s, v in bot.panel.items())} (pooled into fits, never traded)")
     feed = ReplayFeed(bars, bot.calendar)
     print(f"backtest: {len(feed)} bars of {cfg.market.instrument}, config digest {cfg.digest()}")
     summary = bot.run(feed, max_bars=args.max_bars)
@@ -319,7 +353,7 @@ def cmd_train(args) -> int:
     bot = TradingBot(cfg, run_id=args.run_id, artifacts_dir=args.artifacts, log=print)
     store = _validated_store(cfg, bars)
     context = _load_context(args, cfg, bot.calendar) or None
-    report = bot.trainer.retrain(store, print, context=context)
+    report = bot.trainer.retrain(store, print, context=context, panel=_load_panel(args, cfg, bot.calendar) or None)
     bot._apply_report(report)
     d = report.to_dict()
     d.pop("grid_results", None)
@@ -480,6 +514,8 @@ def build_parser() -> argparse.ArgumentParser:
     def data(sp):
         sp.add_argument("--csv", default=None, help="bar history CSV (from `download`)")
         sp.add_argument("--context", action="append", metavar="SYMBOL=CSV", help="cross-asset context history (repeatable)")
+        sp.add_argument("--panel", action="append", metavar="SYMBOL=CSV",
+                        help="pooled training instrument: its rows join every model fit, it is never traded (repeatable)")
         sp.add_argument("--synthetic", type=int, default=None, help="generate N synthetic bars instead of a CSV")
         sp.add_argument("--seed", type=int, default=0)
         sp.add_argument("--memory-d", type=float, default=0.40, help="synthetic long-memory order of the stationary component")

@@ -38,6 +38,22 @@ jobs:
           assert meta["validation_metrics"]["holdout_rows"] > 0
           print("artifact ok:", meta["model_id"], meta["environment"]["git_commit"][:12])
           PY
+      - name: Pooled training smoke run (panel instruments join the fit, are never traded)
+        run: |
+          python -m trading_bot.main backtest --synthetic 2600 --seed 11 --fast --symbol SPY --quiet \
+            --set training.panel.enabled=true --set training.panel.symbols=[QQQ,IWM] \
+            --set training.window_bars=2000 --set training.minimum_bars=1700 --artifacts /tmp/ci-panel
+          python - <<'PY'
+          import glob, json
+          s = json.load(open(sorted(glob.glob("/tmp/ci-panel/audit/*_summary.json"))[-1]))
+          p = s["last_retrain"]["panel"]
+          assert p["enabled"] and sorted(p["symbols"]) == ["IWM", "QQQ"], p
+          assert p["rows_in_final_fit"] > p["primary_rows_in_final_fit"] > 0, p
+          for f in s.get("fills", []):
+              assert f["instrument"] == "SPY", f
+          print("panel ok:", p["rows_in_final_fit"], "pooled rows joined", p["primary_rows_in_final_fit"], "primary rows")
+          PY
+
       - name: Research pipeline smoke run (synthetic, quick stages, must be reproducible and leak-free)
         run: |
           python -m trading_bot.main research --synthetic 2600 --seed 21 --memory-d 0.45 --amplitude 6 --symbol SYN --fast \

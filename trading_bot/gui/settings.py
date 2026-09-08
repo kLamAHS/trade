@@ -35,10 +35,11 @@ class GuiSettings:
     overrides: str = ""               # one "dotted.key=value" per line
     config_path: str = ""             # optional alternative strategy YAML
     context_paths: str = ""           # cross-asset context histories, one "SYMBOL=path.csv" per line (CSV data source)
+    panel_paths: str = ""             # pooled training instruments, one "SYMBOL=path.csv" per line (never traded)
 
     PUBLIC_FIELDS = ("api_key", "symbol", "mode", "data_source", "csv_path", "synthetic_bars", "synthetic_seed",
                      "fast", "mirror_orders", "history_days", "artifacts_dir", "initial_capital",
-                     "overrides", "config_path", "context_paths")
+                     "overrides", "config_path", "context_paths", "panel_paths")
 
     # ------------------------------------------------------------ persistence
     @classmethod
@@ -111,17 +112,13 @@ class GuiSettings:
         if self.secret_key:
             os.environ["APCA_API_SECRET_KEY"] = self.secret_key
 
+    def panel_files(self) -> dict[str, str]:
+        """``SYMBOL=path.csv`` lines of ``panel_paths`` -> {SYMBOL: path}."""
+        return _symbol_paths(self.panel_paths)
+
     def context_files(self) -> dict[str, str]:
         """``SYMBOL=path.csv`` lines of ``context_paths`` -> {SYMBOL: path}."""
-        out: dict[str, str] = {}
-        for line in (self.context_paths or "").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            sym, path = line.split("=", 1)
-            if sym.strip() and path.strip():
-                out[sym.strip().upper()] = path.strip()
-        return out
+        return _symbol_paths(self.context_paths)
 
     def override_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -138,6 +135,19 @@ class GuiSettings:
 
             node[parts[-1]] = parse_scalar(value)
         return out
+
+
+def _symbol_paths(text: str) -> dict[str, str]:
+    """Parse ``SYMBOL=path.csv`` lines (blank lines and ``#`` comments ignored)."""
+    out: dict[str, str] = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        sym, path = line.split("=", 1)
+        if sym.strip() and path.strip():
+            out[sym.strip().upper()] = path.strip()
+    return out
 
 
 __all__ = ["GuiSettings"]

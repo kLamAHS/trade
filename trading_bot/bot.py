@@ -68,6 +68,7 @@ class TradingBot:
         self.execution_calibration = ExecutionCalibration(int(cfg.prediction.horizon_bars))
         self._pending_estimates: dict[str, dict] = {}         # order id -> expected execution cost at decision time
         self.context: dict[str, BarStore] = {}                 # cross-asset context stores (symbol -> bars)
+        self.panel: dict[str, BarStore] = {}                   # pooled training instruments (never traded)
         self.context_symbols = tuple(self.feature_engine.families.cross_asset_symbols) if self.feature_engine.families.cross_asset else ()
         self.risk = RiskEngine.from_config(cfg)
         self.ledger = PortfolioLedger(float(cfg.portfolio.initial_capital), self.instrument)
@@ -203,12 +204,13 @@ class TradingBot:
             self.bars_since_retrain = 0
             snapshot = self.store.slice(0, len(self.store))
             ctx = self._context_snapshot()
-            self._retrain_future = self._executor.submit(self.trainer.retrain, snapshot, self.log, ctx)
+            self._retrain_future = self._executor.submit(self.trainer.retrain, snapshot, self.log, ctx,
+                                                         self._panel_snapshot())
             self.audit.event("RETRAIN_STARTED", bars=len(self.store), mode="async")
             return None
         self.bars_since_retrain = 0
         self.audit.event("RETRAIN_STARTED", bars=len(self.store), mode="sync")
-        report = self.trainer.retrain(self.store, self.log, self._context_snapshot())
+        report = self.trainer.retrain(self.store, self.log, self._context_snapshot(), self._panel_snapshot())
         self._apply_report(report)
         return report
 
@@ -216,6 +218,27 @@ class TradingBot:
         if not self.context:
             return None
         return {s: cs.slice(0, len(cs)) for s, cs in self.context.items()}
+
+    def _panel_snapshot(self) -> Optional[dict[str, BarStore]]:
+        """Copies of the pooled training instruments, so a background retrain reads a frozen history."""
+        if not self.panel:
+            return None
+        return {s: ps.slice(0, len(ps)) for s, ps in self.panel.items()}
+
+    @property
+    def panel_symbols(self) -> tuple[str, ...]:
+        return tuple(self.trainer.panel_symbols) if self.trainer.panel_enabled else ()
+
+    def on_panel_bar(self, bar: Bar) -> None:
+        """Store a completed bar of a pooled *training* instrument.  It is never traded, never sized and
+        never enters an acceptance metric: its only role is to enlarge the sample the models are fitted
+        on (training.panel)."""
+        ps = self.panel.get(bar.instrument)
+        if ps is None:
+            ps = self.panel[bar.instrument] = BarStore(bar.instrument, bar.bar_minutes)
+        if len(ps) and bar.timestamp <= ps.last().timestamp:
+            return
+        ps.append(bar)
 
     def on_context_bar(self, bar: Bar) -> None:
         """Store a completed bar of a cross-asset context instrument (never traded, never validated
@@ -249,6 +272,7 @@ class TradingBot:
             return out
         checks = dict(r.acceptance.checks) if r.acceptance else {}
         diag = dict(r.holdout_diagnosis or {})
+        out["panel"] = dict(r.panel_diagnosis or {})
         out.update({
             "status": "accepted" if r.accepted else "rejected",
             "reasons": list(r.acceptance.reasons) if r.acceptance else [],
